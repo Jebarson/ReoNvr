@@ -36,7 +36,6 @@ import {
   type CameraDraft,
   type CameraTestResult,
   type EventType,
-	type HistoricalImport,
 	type Recording,
   type RecordingControl,
   type RecordingSource,
@@ -65,7 +64,7 @@ const emptyDraft: CameraDraft = {
   archiveStream: 'Main',
   recordingSource: 'CameraStorage',
   recordingMode: 'Events',
-  historicalImport: 'NewOnly',
+  historicalImport: 'AllAvailable',
   preEventSeconds: 10,
   postEventSeconds: 15,
   eventTypes: ['Motion', 'Person', 'Vehicle', 'Animal'],
@@ -570,14 +569,13 @@ function App() {
                       {draft.archiveEnabled && <>{testResult && <>
                         <div className="fieldBlock"><span className="fieldLabel">Recording quality</span><div className="choiceGrid">{(['Main', 'Sub'] as ArchiveStream[]).map((stream) => <label className={`choice ${draft.archiveStream === stream ? 'selected' : ''}`} key={stream}><input type="radio" checked={draft.archiveStream === stream} onChange={() => updateDraft('archiveStream', stream)} /><span><strong>{stream} stream</strong><small>{stream === 'Main' ? 'Original highest quality' : 'Lower bandwidth profile'}</small></span></label>)}</div></div>
                         <div className="fieldBlock"><span className="fieldLabel">Recording source</span><div className="choiceGrid">
-                          <label className={`choice ${draft.recordingSource === 'CameraStorage' ? 'selected' : ''} ${!testResult.storageAvailable ? 'disabled' : ''}`}><input type="radio" checked={draft.recordingSource === 'CameraStorage'} disabled={!testResult.storageAvailable} onChange={() => updateDraft('recordingSource', 'CameraStorage')} /><span><strong>Camera storage</strong><small>{testResult.storageAvailable ? 'Copy native camera recordings' : 'Mounted, formatted storage unavailable'}</small></span></label>
+                          <label className={`choice ${draft.recordingSource === 'CameraStorage' ? 'selected' : ''} ${!testResult.storageAvailable ? 'disabled' : ''}`}><input type="radio" checked={draft.recordingSource === 'CameraStorage'} disabled={!testResult.storageAvailable} onChange={() => updateDraft('recordingSource', 'CameraStorage')} /><span><strong>Camera storage</strong><small>{testResult.storageAvailable ? 'Copy matching SD-card recordings, newest first' : 'Mounted, formatted storage unavailable'}</small></span></label>
                           <label className={`choice ${draft.recordingSource === 'Rtsp' ? 'selected' : ''} ${!testResult.rtspAvailable ? 'disabled' : ''}`}><input type="radio" checked={draft.recordingSource === 'Rtsp'} disabled={!testResult.rtspAvailable} onChange={() => updateDraft('recordingSource', 'Rtsp')} /><span><strong>RTSP stream</strong><small>{testResult.rtspAvailable ? 'Record the selected live stream' : 'Selected stream unavailable over RTSP'}</small></span></label>
                         </div></div>
                         <div className="fieldBlock"><span className="fieldLabel">Recording mode</span><div className="choiceGrid">
                           <label className={`choice ${draft.recordingMode === 'Events' ? 'selected' : ''}`}><input type="radio" checked={draft.recordingMode === 'Events'} onChange={() => updateDraft('recordingMode', 'Events')} /><span><strong>Events</strong><small>Keep selected event windows</small></span></label>
                           <label className={`choice ${draft.recordingMode === 'Continuous' ? 'selected' : ''} ${draft.recordingSource === 'CameraStorage' && !testResult.continuousAvailable ? 'disabled' : ''}`}><input type="radio" checked={draft.recordingMode === 'Continuous'} disabled={draft.recordingSource === 'CameraStorage' && !testResult.continuousAvailable} onChange={() => updateDraft('recordingMode', 'Continuous')} /><span><strong>Continuous</strong><small>{draft.recordingSource === 'CameraStorage' && !testResult.continuousAvailable ? 'No continuous camera schedule detected' : 'Keep every video segment'}</small></span></label>
                         </div></div>
-                        {draft.recordingSource === 'CameraStorage' && <div className="fieldBlock"><label>Historical import<select value={draft.historicalImport} onChange={(event) => updateDraft('historicalImport', event.target.value as HistoricalImport)}><option value="NewOnly">New recordings only</option><option value="Last24Hours">Last 24 hours</option><option value="Last48Hours">Last 48 hours</option><option value="Last7Days">Last 7 days</option><option value="AllAvailable">All available recordings</option></select></label></div>}
                         {draft.recordingSource === 'Rtsp' && draft.recordingMode === 'Events' && <div className="fieldBlock durationGrid"><label>Pre-event seconds<input type="number" min="0" max="300" value={draft.preEventSeconds} onChange={(event) => updateDraft('preEventSeconds', Number(event.target.value))} /></label><label>Post-event seconds<input type="number" min="0" max="300" value={draft.postEventSeconds} onChange={(event) => updateDraft('postEventSeconds', Number(event.target.value))} /></label></div>}
                         <div className="fieldBlock"><span className="fieldLabel">Event types</span><div className="choiceGrid">{(Object.keys(eventLabels) as EventType[]).map((eventType) => { const supported = supportedEvents.includes(eventType); return <label className={`choice ${draft.eventTypes.includes(eventType) ? 'selected' : ''} ${!supported ? 'disabled' : ''}`} key={eventType}><input type="checkbox" checked={draft.eventTypes.includes(eventType)} disabled={!supported} onChange={() => toggleEvent(eventType)} /><span><strong>{eventLabels[eventType]}</strong><small>{supported ? (draft.recordingMode === 'Events' ? 'Retain matching video' : 'Index event markers') : 'Not supported by camera'}</small></span></label> })}</div></div>
                         {draft.recordingSource === 'Rtsp' && <div className="policyNote resourceNote"><Video /><div><strong>Live stream recording</strong><p>Continuously uses camera network bandwidth and local disk. ReoNvr preserves the original H.264 or H.265 stream without conversion.</p></div></div>}

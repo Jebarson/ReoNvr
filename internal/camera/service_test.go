@@ -58,6 +58,9 @@ func TestRegistrationRequiresReceiptAndRetainsCredentialForPolicyEdit(t *testing
 	if created.Timezone != "America/Los_Angeles" {
 		t.Fatalf("camera did not use its detected timezone: %#v", created)
 	}
+	if created.HistoricalImport != domain.HistoricalImportAll || created.ArchiveFromUtc != nil {
+		t.Fatalf("camera storage did not enable automatic historical import: %#v", created)
+	}
 	credentialBefore, err := store.GetCredential(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)

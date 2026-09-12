@@ -14,15 +14,18 @@ import (
 )
 
 const (
-	initialSearchWindow = 48 * time.Hour
-	searchOverlap       = 5 * time.Minute
-	earliestArchiveYear = 2000
+	initialSearchWindow      = 48 * time.Hour
+	emptyBackfillWindow      = 30 * 24 * time.Hour
+	maxBackfillWindowsPerRun = 4
+	searchOverlap            = 5 * time.Minute
+	earliestArchiveYear      = 2000
 )
 
 type Store interface {
 	GetCamera(context.Context, string) (domain.Camera, error)
 	GetCredential(context.Context, string) (domain.EncryptedCredential, error)
 	GetSearchWatermark(context.Context, string) (*time.Time, error)
+	GetBackfillCursor(context.Context, string) (*time.Time, int, error)
 	SaveReconciliation(context.Context, domain.IngestionRun, []domain.Recording, time.Time) error
 	ListRecordings(context.Context, string, int) ([]domain.Recording, error)
 }
@@ -72,8 +75,6 @@ func (service *Service) Reconcile(ctx context.Context, cameraID string) error {
 	from := now.Add(-initialSearchWindow)
 	if camera.ArchiveFromUtc != nil {
 		from = camera.ArchiveFromUtc.UTC()
-	} else if camera.HistoricalImport == domain.HistoricalImportAll {
-		from = time.Date(earliestArchiveYear, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
 	kind := "Startup"
 	watermark, err := service.store.GetSearchWatermark(ctx, cameraID)
@@ -90,17 +91,64 @@ func (service *Service) Reconcile(ctx context.Context, cameraID string) error {
 	if !from.Before(now) {
 		from = now.Add(-time.Second)
 	}
-	items, searchErr := service.searcher.SearchRecordings(ctx, reolink.Connection{
+	connection := reolink.Connection{
 		Host: camera.Host, Port: camera.Port, Channel: camera.Channel, Stream: camera.ArchiveStream, Timezone: camera.Timezone,
 		Username: credential.Username, Password: password,
-	}, camera.ArchiveStream, from, now)
-	password = ""
-	if searchErr != nil {
-		return searchErr
 	}
+	password = ""
 	selected := make(map[domain.EventType]bool, len(camera.EventTypes))
 	for _, eventType := range camera.EventTypes {
 		selected[eventType] = true
+	}
+	if _, err := service.reconcileWindow(ctx, camera, connection, selected, from, now, kind, now); err != nil {
+		return err
+	}
+	if camera.HistoricalImport != domain.HistoricalImportAll {
+		return nil
+	}
+	cursor, previousCount, err := service.store.GetBackfillCursor(ctx, cameraID)
+	if err != nil {
+		return err
+	}
+	backfillTo := now.Add(-initialSearchWindow)
+	if cursor != nil && cursor.Before(backfillTo) {
+		backfillTo = cursor.UTC()
+	}
+	earliest := time.Date(earliestArchiveYear, 1, 1, 0, 0, 0, 0, time.UTC)
+	for range maxBackfillWindowsPerRun {
+		if !backfillTo.After(earliest) {
+			break
+		}
+		window := initialSearchWindow
+		if cursor != nil && previousCount == 0 {
+			window = emptyBackfillWindow
+		}
+		backfillFrom := backfillTo.Add(-window)
+		if backfillFrom.Before(earliest) {
+			backfillFrom = earliest
+		}
+		count, err := service.reconcileWindow(ctx, camera, connection, selected, backfillFrom, backfillTo, "Backfill", now)
+		if err != nil && window != initialSearchWindow {
+			backfillFrom = backfillTo.Add(-initialSearchWindow)
+			if backfillFrom.Before(earliest) {
+				backfillFrom = earliest
+			}
+			count, err = service.reconcileWindow(ctx, camera, connection, selected, backfillFrom, backfillTo, "Backfill", now)
+		}
+		if err != nil {
+			return err
+		}
+		backfillTo = backfillFrom
+		previousCount = count
+		cursor = &backfillFrom
+	}
+	return nil
+}
+
+func (service *Service) reconcileWindow(ctx context.Context, camera domain.Camera, connection reolink.Connection, selected map[domain.EventType]bool, from, to time.Time, kind string, now time.Time) (int, error) {
+	items, err := service.searcher.SearchRecordings(ctx, connection, camera.ArchiveStream, from, to)
+	if err != nil {
+		return 0, err
 	}
 	recordings := make([]domain.Recording, 0, len(items))
 	for _, item := range items {
@@ -116,7 +164,7 @@ func (service *Service) Reconcile(ctx context.Context, cameraID string) error {
 			state = domain.RecordingQueued
 		}
 		recordings = append(recordings, domain.Recording{
-			ID: recordingID(cameraID, item.NativeName), CameraID: cameraID,
+			ID: recordingID(camera.ID, item.NativeName), CameraID: camera.ID,
 			NativeName: item.NativeName, Source: domain.RecordingSourceCameraStorage,
 			Stream: item.Stream, StartAtUtc: item.StartAtUtc,
 			EndAtUtc: item.EndAtUtc, SizeBytes: item.SizeBytes,
@@ -128,14 +176,17 @@ func (service *Service) Reconcile(ctx context.Context, cameraID string) error {
 	completed := now
 	runID, err := randomID()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	run := domain.IngestionRun{
-		ID: runID, CameraID: cameraID, Kind: kind, WindowStartUtc: from,
-		WindowEndUtc: now, Status: "Complete", DiscoveredCount: len(recordings),
+		ID: runID, CameraID: camera.ID, Kind: kind, WindowStartUtc: from,
+		WindowEndUtc: to, Status: "Complete", DiscoveredCount: len(recordings),
 		StartedAtUtc: now, CompletedAtUtc: &completed,
 	}
-	return service.store.SaveReconciliation(ctx, run, recordings, now)
+	if err := service.store.SaveReconciliation(ctx, run, recordings, now); err != nil {
+		return 0, err
+	}
+	return len(recordings), nil
 }
 
 func (service *Service) ListRecordings(ctx context.Context, cameraID string, limit int) ([]domain.Recording, error) {

@@ -176,8 +176,8 @@ func verifyRecording(filePath string, expectedBytes int64) (int64, string, error
 	if err != nil {
 		return 0, "", fmt.Errorf("inspect recording: %w", err)
 	}
-	if expectedBytes > 0 && info.Size() != expectedBytes {
-		return 0, "", fmt.Errorf("recording length mismatch: expected %d bytes, received %d", expectedBytes, info.Size())
+	if expectedBytes > 0 && info.Size() < expectedBytes {
+		return 0, "", fmt.Errorf("recording is shorter than expected: expected at least %d bytes, received %d", expectedBytes, info.Size())
 	}
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {

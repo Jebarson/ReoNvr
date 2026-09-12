@@ -173,16 +173,14 @@ func TestOpenMigratesRecordingPoliciesAndUnstartedQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	var source, mode, historicalImport, archiveFrom string
+	var source, mode, historicalImport string
+	var archiveFrom sql.NullString
 	if err := store.db.QueryRowContext(ctx, `SELECT RecordingSource, RecordingMode, HistoricalImport, ArchiveFromUtc FROM Cameras WHERE Id = 'camera-one'`).Scan(
 		&source, &mode, &historicalImport, &archiveFrom); err != nil {
 		t.Fatal(err)
 	}
-	if source != "CameraStorage" || mode != "Events" || historicalImport != "NewOnly" {
+	if source != "CameraStorage" || mode != "Events" || historicalImport != "AllAvailable" || archiveFrom.Valid {
 		t.Fatalf("unexpected migrated policy: %s %s %s", source, mode, historicalImport)
-	}
-	if _, err := time.Parse(time.RFC3339Nano, archiveFrom); err != nil {
-		t.Fatalf("archive boundary is not RFC3339: %q", archiveFrom)
 	}
 	var queuedState, completeState string
 	if err := store.db.QueryRowContext(ctx, `SELECT State FROM Recordings WHERE Id = 'queued'`).Scan(&queuedState); err != nil {
@@ -193,6 +191,71 @@ func TestOpenMigratesRecordingPoliciesAndUnstartedQueue(t *testing.T) {
 	}
 	if queuedState != "Discovered" || completeState != "Complete" {
 		t.Fatalf("unexpected migrated states: queued=%s complete=%s", queuedState, completeState)
+	}
+}
+
+func TestOpenMigratesCameraStorageMetadataToAutomaticImport(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "automatic-camera-storage.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	camera := domain.Camera{
+		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000, Timezone: "UTC",
+		Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
+		RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
+		HistoricalImport: domain.HistoricalImportNewOnly, EventTypes: []domain.EventType{domain.EventPerson},
+		Capabilities: &domain.CameraCapabilities{SupportedEventTypes: []domain.EventType{domain.EventPerson, domain.EventVehicle}},
+		CreatedAtUtc: now, UpdatedAtUtc: now,
+	}
+	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	if err := store.CreateCamera(ctx, camera, credential, camera.Capabilities.SupportedEventTypes); err != nil {
+		t.Fatal(err)
+	}
+	recordings := []domain.Recording{
+		{ID: "matching", CameraID: camera.ID, NativeName: "person.mp4", Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain, StartAtUtc: now.Add(-time.Hour), EndAtUtc: now.Add(-59 * time.Minute), State: domain.RecordingDiscovered, EventTypes: []domain.EventType{domain.EventPerson}, RawMetadata: json.RawMessage(`{}`), DiscoveredAtUtc: now, UpdatedAtUtc: now},
+		{ID: "excluded", CameraID: camera.ID, NativeName: "vehicle.mp4", Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain, StartAtUtc: now.Add(-time.Minute), EndAtUtc: now, State: domain.RecordingDiscovered, EventTypes: []domain.EventType{domain.EventVehicle}, RawMetadata: json.RawMessage(`{}`), DiscoveredAtUtc: now, UpdatedAtUtc: now},
+	}
+	completed := now
+	run := domain.IngestionRun{ID: "run-one", CameraID: camera.ID, Kind: "Startup", WindowStartUtc: now.Add(-time.Hour), WindowEndUtc: now, Status: "Complete", DiscoveredCount: len(recordings), StartedAtUtc: now, CompletedAtUtc: &completed}
+	if err := store.SaveReconciliation(ctx, run, recordings, now); err != nil {
+		t.Fatal(err)
+	}
+	boundary := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	if _, err := store.db.ExecContext(ctx, `UPDATE Cameras SET HistoricalImport = 'NewOnly', ArchiveFromUtc = ?, LastSearchWatermarkAtUtc = ? WHERE Id = ?`, boundary, boundary, camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM SchemaMigrations WHERE Version = 6`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var historicalImport string
+	var archiveFrom, watermark sql.NullString
+	if err := store.db.QueryRowContext(ctx, `SELECT HistoricalImport, ArchiveFromUtc, LastSearchWatermarkAtUtc FROM Cameras WHERE Id = ?`, camera.ID).Scan(&historicalImport, &archiveFrom, &watermark); err != nil {
+		t.Fatal(err)
+	}
+	if historicalImport != "AllAvailable" || archiveFrom.Valid || watermark.Valid {
+		t.Fatalf("camera-storage policy was not migrated: %s %v %v", historicalImport, archiveFrom, watermark)
+	}
+	var matchingState, excludedState string
+	if err := store.db.QueryRowContext(ctx, `SELECT State FROM Recordings WHERE Id = 'matching'`).Scan(&matchingState); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT State FROM Recordings WHERE Id = 'excluded'`).Scan(&excludedState); err != nil {
+		t.Fatal(err)
+	}
+	if matchingState != "Queued" || excludedState != "Discovered" {
+		t.Fatalf("unexpected migrated recording states: matching=%s excluded=%s", matchingState, excludedState)
 	}
 }
 
@@ -368,6 +431,14 @@ func TestUpdateCameraPolicyChangeResetsSearchWatermark(t *testing.T) {
 	if err := store.SaveReconciliation(ctx, run, nil, now); err != nil {
 		t.Fatal(err)
 	}
+	backfill := domain.IngestionRun{ID: "backfill-one", CameraID: camera.ID, Kind: "Backfill", WindowStartUtc: now.Add(-72 * time.Hour), WindowEndUtc: now.Add(-48 * time.Hour), Status: "Complete", DiscoveredCount: 3, StartedAtUtc: now, CompletedAtUtc: &completed}
+	if err := store.SaveReconciliation(ctx, backfill, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	cursor, discoveredCount, err := store.GetBackfillCursor(ctx, camera.ID)
+	if err != nil || cursor == nil || !cursor.Equal(backfill.WindowStartUtc) || discoveredCount != 3 {
+		t.Fatalf("unexpected backfill cursor: %v %d %v", cursor, discoveredCount, err)
+	}
 	camera.Name = "Front renamed"
 	camera.UpdatedAtUtc = now.Add(time.Minute)
 	if err := store.UpdateCamera(ctx, camera, nil, camera.Capabilities.SupportedEventTypes); err != nil {
@@ -377,9 +448,7 @@ func TestUpdateCameraPolicyChangeResetsSearchWatermark(t *testing.T) {
 	if err != nil || watermark == nil || !watermark.Equal(now) {
 		t.Fatalf("non-policy update reset watermark: %v %v", watermark, err)
 	}
-	camera.HistoricalImport = domain.HistoricalImportLast24Hours
-	boundary := now.Add(-24 * time.Hour)
-	camera.ArchiveFromUtc = &boundary
+	camera.EventTypes = []domain.EventType{domain.EventPerson}
 	camera.UpdatedAtUtc = now.Add(2 * time.Minute)
 	if err := store.UpdateCamera(ctx, camera, nil, camera.Capabilities.SupportedEventTypes); err != nil {
 		t.Fatal(err)
@@ -387,6 +456,10 @@ func TestUpdateCameraPolicyChangeResetsSearchWatermark(t *testing.T) {
 	watermark, err = store.GetSearchWatermark(ctx, camera.ID)
 	if err != nil || watermark != nil {
 		t.Fatalf("policy update did not reset watermark: %v %v", watermark, err)
+	}
+	cursor, _, err = store.GetBackfillCursor(ctx, camera.ID)
+	if err != nil || cursor != nil {
+		t.Fatalf("policy update did not reset backfill cursor: %v %v", cursor, err)
 	}
 }
 

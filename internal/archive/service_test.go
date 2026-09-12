@@ -14,7 +14,10 @@ type serviceStore struct {
 	camera     domain.Camera
 	credential domain.EncryptedCredential
 	watermark  *time.Time
+	backfill   *time.Time
+	backfilled int
 	run        domain.IngestionRun
+	runs       []domain.IngestionRun
 	recordings []domain.Recording
 }
 
@@ -30,8 +33,13 @@ func (store *serviceStore) GetSearchWatermark(context.Context, string) (*time.Ti
 	return store.watermark, nil
 }
 
+func (store *serviceStore) GetBackfillCursor(context.Context, string) (*time.Time, int, error) {
+	return store.backfill, store.backfilled, nil
+}
+
 func (store *serviceStore) SaveReconciliation(_ context.Context, run domain.IngestionRun, recordings []domain.Recording, _ time.Time) error {
 	store.run = run
+	store.runs = append(store.runs, run)
 	store.recordings = recordings
 	return nil
 }
@@ -45,12 +53,14 @@ type serviceSearcher struct {
 	from       time.Time
 	to         time.Time
 	items      []reolink.Recording
+	windows    [][2]time.Time
 }
 
 func (searcher *serviceSearcher) SearchRecordings(_ context.Context, connection reolink.Connection, _ domain.ArchiveStream, from, to time.Time) ([]reolink.Recording, error) {
 	searcher.connection = connection
 	searcher.from = from
 	searcher.to = to
+	searcher.windows = append(searcher.windows, [2]time.Time{from, to})
 	return searcher.items, nil
 }
 
@@ -130,6 +140,45 @@ func TestReconcileContinuousModeKeepsUntaggedNativeRecordings(t *testing.T) {
 	}
 	if len(store.recordings) != 1 || store.recordings[0].State != domain.RecordingQueued {
 		t.Fatalf("continuous recording was not retained: %#v", store.recordings)
+	}
+}
+
+func TestReconcileAllAvailableSearchesRecentThenBoundedOlderWindows(t *testing.T) {
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	store := &serviceStore{
+		camera: domain.Camera{
+			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Timezone: "UTC",
+			Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
+			RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeContinuous,
+			HistoricalImport: domain.HistoricalImportAll,
+		},
+		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+	}
+	searcher := &serviceSearcher{}
+	service := NewService(store, searcher, serviceCipher{})
+	service.now = func() time.Time { return now }
+	if err := service.Reconcile(context.Background(), store.camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(searcher.windows) != 1+maxBackfillWindowsPerRun {
+		t.Fatalf("expected recent search and bounded backfill batch, got %#v", searcher.windows)
+	}
+	if searcher.windows[0][0] != now.Add(-initialSearchWindow) || searcher.windows[0][1] != now {
+		t.Fatalf("unexpected recent search window: %#v", searcher.windows[0])
+	}
+	if searcher.windows[1][0] != now.Add(-2*initialSearchWindow) || searcher.windows[1][1] != now.Add(-initialSearchWindow) {
+		t.Fatalf("unexpected first backfill search window: %#v", searcher.windows[1])
+	}
+	for index, window := range searcher.windows[1:] {
+		if !window[0].Before(window[1]) || window[1].Sub(window[0]) > emptyBackfillWindow {
+			t.Fatalf("backfill window %d is invalid: %#v", index, window)
+		}
+		if index > 0 && window[1] != searcher.windows[index][0] {
+			t.Fatalf("backfill windows are not newest-first and contiguous: %#v", searcher.windows)
+		}
+	}
+	if len(store.runs) != 1+maxBackfillWindowsPerRun || store.runs[1].Kind != "Backfill" {
+		t.Fatalf("backfill progress was not persisted: %#v", store.runs)
 	}
 }
 

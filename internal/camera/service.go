@@ -163,6 +163,7 @@ func (service *Service) Create(ctx context.Context, draft Draft) (domain.Camera,
 	if err := validateRecordingPolicy(draft, result.Capabilities); err != nil {
 		return domain.Camera{}, err
 	}
+	normalizeRecordingPolicy(&draft)
 	id, err := randomID()
 	if err != nil {
 		return domain.Camera{}, fmt.Errorf("generate camera ID: %w", err)
@@ -226,6 +227,7 @@ func (service *Service) Update(ctx context.Context, id string, draft Draft) (dom
 	if err := validateRecordingPolicy(draft, result.Capabilities); err != nil {
 		return domain.Camera{}, err
 	}
+	normalizeRecordingPolicy(&draft)
 	now := service.now().UTC()
 	camera := cameraFromDraft(id, draft, result, existing.CreatedAtUtc, now)
 	if draft.RecordingSource == existing.RecordingSource && draft.HistoricalImport == existing.HistoricalImport {
@@ -374,6 +376,12 @@ func validateRecordingPolicy(draft Draft, capabilities domain.CameraCapabilities
 		return fmt.Errorf("%w: select at least one event category for event recording", ErrInvalid)
 	}
 	return nil
+}
+
+func normalizeRecordingPolicy(draft *Draft) {
+	if draft.RecordingSource == domain.RecordingSourceCameraStorage {
+		draft.HistoricalImport = domain.HistoricalImportAll
+	}
 }
 
 func validateEventTypes(selected, supported []domain.EventType) error {

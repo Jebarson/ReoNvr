@@ -105,6 +105,20 @@ func TestDownloadNextPublishesVerifiedNativeRecording(t *testing.T) {
 	}
 }
 
+func TestVerifyRecordingAcceptsGrowthButRejectsTruncation(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "clip.mp4")
+	payload := []byte("camera-file-grew")
+	if err := os.WriteFile(filePath, payload, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if size, _, err := verifyRecording(filePath, int64(len("camera-file"))); err != nil || size != int64(len(payload)) {
+		t.Fatalf("larger complete recording was rejected: size=%d err=%v", size, err)
+	}
+	if _, _, err := verifyRecording(filePath, int64(len(payload)+1)); err == nil {
+		t.Fatal("truncated recording was accepted")
+	}
+}
+
 func TestDownloadNextRejectsUnsafeNativeName(t *testing.T) {
 	store := &downloadStore{
 		camera:    domain.Camera{ID: "camera-one", Enabled: true, ArchiveEnabled: true, RecordingSource: domain.RecordingSourceCameraStorage},

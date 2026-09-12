@@ -8,7 +8,7 @@ from camera storage or record live RTSP streams without transcoding.
 - Camera-storage event and continuous recording import
 - RTSP event buffering and continuous recording
 - Native H.264/H.265 preservation with FFmpeg stream copy
-- Automatic newest-first historical import within the selected time range
+- Automatic newest-first import of matching camera-storage recordings
 - UTC persistence with camera timezone and DST discovery
 - Local AES-256-GCM credential encryption
 - Playback, original-file download, retention, and capacity protection

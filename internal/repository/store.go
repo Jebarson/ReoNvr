@@ -132,7 +132,10 @@ func (store *Store) initialize(ctx context.Context) error {
 	if err := store.migrateRecordingPolicies(ctx); err != nil {
 		return err
 	}
-	return store.migrateApplicationSettings(ctx)
+	if err := store.migrateApplicationSettings(ctx); err != nil {
+		return err
+	}
+	return store.migrateAutomaticCameraStorageImport(ctx)
 }
 
 func (store *Store) migrateActiveCameraUniqueness(ctx context.Context) error {
@@ -344,6 +347,42 @@ func (store *Store) migrateApplicationSettings(ctx context.Context) error {
 	})
 }
 
+func (store *Store) migrateAutomaticCameraStorageImport(ctx context.Context) error {
+	var applied int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM SchemaMigrations WHERE Version = 6`).Scan(&applied); err != nil {
+		return fmt.Errorf("check automatic camera-storage import migration: %w", err)
+	}
+	if applied != 0 {
+		return nil
+	}
+	statements := []string{
+		`UPDATE Cameras SET HistoricalImport = 'AllAvailable', ArchiveFromUtc = NULL,
+			LastSearchWatermarkAtUtc = NULL
+			WHERE RecordingSource = 'CameraStorage' AND RetiredAtUtc IS NULL`,
+		`UPDATE Recordings SET State = 'Queued', UpdatedAtUtc = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			WHERE Source = 'CameraStorage' AND State = 'Discovered' AND EXISTS (
+				SELECT 1 FROM Cameras
+				WHERE Cameras.Id = Recordings.CameraId AND Cameras.RetiredAtUtc IS NULL
+				AND Cameras.ArchiveEnabled = 1 AND Cameras.RecordingSource = 'CameraStorage'
+				AND (Cameras.RecordingMode = 'Continuous' OR EXISTS (
+					SELECT 1 FROM RecordingTags
+					JOIN CameraEventTypes ON CameraEventTypes.CameraId = Cameras.Id
+						AND CameraEventTypes.EventType = RecordingTags.EventType
+					WHERE RecordingTags.RecordingId = Recordings.Id AND CameraEventTypes.Enabled = 1
+				))
+			)`,
+		`INSERT INTO SchemaMigrations (Version, AppliedAtUtc) VALUES (6, CURRENT_TIMESTAMP)`,
+	}
+	return store.withTransaction(ctx, func(tx *sql.Tx) error {
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migrate automatic camera-storage import: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 func (store *Store) GetRecordingControl(ctx context.Context) (domain.RecordingControl, error) {
 	var enabled int
 	var updated string
@@ -444,6 +483,11 @@ func (store *Store) UpdateCamera(ctx context.Context, camera domain.Camera, cred
 		if rows == 0 {
 			return ErrNotFound
 		}
+		if resetSearch {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM IngestionRuns WHERE CameraId = ? AND Kind = 'Backfill'`, camera.ID); err != nil {
+				return fmt.Errorf("reset camera-storage backfill cursor: %w", err)
+			}
+		}
 		if credential != nil {
 			if err := upsertCredential(ctx, tx, camera.ID, *credential, camera.UpdatedAtUtc); err != nil {
 				return err
@@ -454,8 +498,29 @@ func (store *Store) UpdateCamera(ctx context.Context, camera domain.Camera, cred
 				return err
 			}
 		}
-		return replaceEventTypes(ctx, tx, camera.ID, camera.EventTypes, supported)
+		if err := replaceEventTypes(ctx, tx, camera.ID, camera.EventTypes, supported); err != nil {
+			return err
+		}
+		if camera.RecordingSource == domain.RecordingSourceCameraStorage && camera.ArchiveEnabled {
+			return queueEligibleDiscovered(ctx, tx, camera.ID, camera.RecordingMode, camera.UpdatedAtUtc)
+		}
+		return nil
 	})
+}
+
+func queueEligibleDiscovered(ctx context.Context, tx *sql.Tx, cameraID string, mode domain.RecordingMode, updatedAt time.Time) error {
+	_, err := tx.ExecContext(ctx, `UPDATE Recordings SET State = 'Queued', UpdatedAtUtc = ?
+		WHERE CameraId = ? AND Source = 'CameraStorage' AND State = 'Discovered'
+		AND (? = 'Continuous' OR EXISTS (
+			SELECT 1 FROM RecordingTags
+			JOIN CameraEventTypes ON CameraEventTypes.CameraId = ?
+				AND CameraEventTypes.EventType = RecordingTags.EventType
+			WHERE RecordingTags.RecordingId = Recordings.Id AND CameraEventTypes.Enabled = 1
+		))`, formatTime(&updatedAt), cameraID, mode, cameraID)
+	if err != nil {
+		return fmt.Errorf("queue discovered camera-storage recordings: %w", err)
+	}
+	return nil
 }
 
 func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, cameraID, timezone string, updatedAt time.Time) error {
@@ -883,6 +948,25 @@ func (store *Store) GetSearchWatermark(ctx context.Context, cameraID string) (*t
 		return nil, fmt.Errorf("parse search watermark: %w", err)
 	}
 	return &value, nil
+}
+
+func (store *Store) GetBackfillCursor(ctx context.Context, cameraID string) (*time.Time, int, error) {
+	var raw string
+	var discoveredCount int
+	err := store.db.QueryRowContext(ctx, `SELECT WindowStartUtc, DiscoveredCount FROM IngestionRuns
+		WHERE CameraId = ? AND Kind = 'Backfill' AND Status = 'Complete'
+		ORDER BY julianday(WindowStartUtc) ASC LIMIT 1`, cameraID).Scan(&raw, &discoveredCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("get camera-storage backfill cursor: %w", err)
+	}
+	cursor, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return nil, 0, fmt.Errorf("parse camera-storage backfill cursor: %w", err)
+	}
+	return &cursor, discoveredCount, nil
 }
 
 func (store *Store) SaveReconciliation(ctx context.Context, run domain.IngestionRun, recordings []domain.Recording, watermark time.Time) error {
@@ -1470,7 +1554,10 @@ func applyCameraPolicyDefaults(camera *domain.Camera) {
 	if camera.RecordingMode == "" {
 		camera.RecordingMode = domain.RecordingModeEvents
 	}
-	if camera.HistoricalImport == "" {
+	if camera.RecordingSource == domain.RecordingSourceCameraStorage {
+		camera.HistoricalImport = domain.HistoricalImportAll
+		camera.ArchiveFromUtc = nil
+	} else if camera.HistoricalImport == "" {
 		camera.HistoricalImport = domain.HistoricalImportNewOnly
 	}
 	if camera.ArchiveFromUtc == nil && camera.HistoricalImport != domain.HistoricalImportAll {

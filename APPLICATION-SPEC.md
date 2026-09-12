@@ -119,7 +119,8 @@ Editable fields:
 - Recording mode: `Events` or `Continuous`.
 - Main or sub recording stream.
 - Event categories to archive.
-- Historical import range for camera-storage recording.
+- Camera-storage recording automatically imports all matching SD-card media,
+  newest first.
 - RTSP pre-event and post-event durations for event recording.
 
 Read-only fields discovered from the camera:
@@ -230,8 +231,8 @@ camera microSD capacity.
 4. Never store the clear-text password, CLI token, or authenticated URL.
 5. Start or restart the `CameraLifecycleWorker` after the transaction commits.
 6. Start workers for the configured recording source and mode.
-7. In camera-storage mode, trigger an overlapping VOD reconciliation using the
-  configured historical import boundary.
+7. In camera-storage mode, trigger an overlapping VOD reconciliation for all
+  available matching recordings.
 
 ### Delete
 
@@ -291,7 +292,7 @@ recording, or payload must not stop unrelated work.
 | `LiveEventWorker` | Per camera | Maintains the Baichuan event subscription and durably records normalized and raw events | 2 |
 | `EventFinalizationWorker` | Application | Waits for event end plus post-record delay, then queues a focused recording search | 2 |
 | `ReconciliationWorker` | Per camera | Runs startup, reconnect, hourly, and daily overlapping VOD searches and advances durable watermarks | 2 |
-| `DownloadWorker` | Bounded pool | Claims downloads, resumes partial files, streams bytes, and checkpoints progress | 2 |
+| `DownloadWorker` | Bounded pool | Claims downloads, safely restarts partial transfers, streams bytes, and checkpoints progress | 2 |
 | `RtspRecorderWorker` | Per camera | Stream-copies the selected RTSP profile into a bounded event ring or durable continuous segments | 2 |
 | `VerificationWorker` | Bounded pool | Verifies length and ETag, hashes files, atomically finalizes media, and writes sidecars | 2 |
 | `RetentionWorker` | Archive filesystem | Maintains the 30-minute reserve by deleting oldest eligible completed recordings | 2 |
@@ -359,7 +360,7 @@ Each work cycle follows these stages:
   `QueueDownloads`, `CommitWatermark`.
 - Event finalization: `WaitForEnd`, `WaitForCameraFinalize`, `Search`, `Match`,
   `QueueDownload`.
-- Download: `Claim`, `CheckCapacity`, `OpenOrResume`, `Transfer`, `Checkpoint`,
+- Download: `Claim`, `CheckCapacity`, `OpenOrRestart`, `Transfer`, `Checkpoint`,
   `QueueVerification`.
 - RTSP recording: `Connect`, `StreamCopy`, `RotateSegment`, `RetainOrExpire`,
   `Checkpoint`, `Reconnect`.
@@ -662,16 +663,15 @@ No mode transcodes video. Main/sub selection controls the source profile.
 - Wait for event end, camera post-record duration, and a 15-second safety delay.
 - Search a narrow VOD window and match by camera, time overlap, and native tags.
 - Download the exact recording by native name.
-- Run an hourly overlapping reconciliation and a daily 48-hour reconciliation.
+- Run an hourly overlapping recent reconciliation plus bounded, durable
+  newest-to-oldest historical backfill windows.
 - Use unique recording identities to make every reconciliation idempotent.
 - Preserve raw search/event payloads for future firmware decoding changes.
 - Camera-storage reconciliation automatically queues every matching recording
-  inside the selected historical import boundary. Existing `Discovered` rows
-  are promoted when they become eligible under a changed policy.
+  available on the SD card. Existing matching `Discovered` rows are promoted
+  when Camera Storage is selected.
 - Download queued camera-storage recordings newest-first so recent footage is
-  available before older backfill. `NewOnly` queues only recordings ending
-  after configuration save; other import values set an explicit lookback
-  boundary. Recordings outside that boundary remain metadata-only.
+  available before older backfill.
 
 ### RTSP
 
@@ -699,9 +699,11 @@ Discovered -> Queued -> Downloading -> Verifying -> Complete
                                  +-> Failed or Expired
 ```
 
-Files are written as `.partial`, resumed with HTTP byte ranges when supported,
-verified against expected bytes and stable ETag, flushed, and atomically
-renamed on the same filesystem.
+Files are written as `.partial`; retries replace the incomplete transfer.
+Completed transfers must be at least as large as the camera's indexed byte
+count, are SHA-256 hashed and flushed, and are atomically renamed on the same
+filesystem. A larger transfer is accepted because camera size metadata can be
+stale.
 
 RTSP fragments are written under the configured buffer root and promoted to
 the archive with an atomic rename on the same filesystem. Sidecars identify
