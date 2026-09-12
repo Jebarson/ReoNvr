@@ -27,7 +27,7 @@ type Store interface {
 	GetSearchWatermark(context.Context, string) (*time.Time, error)
 	GetBackfillCursor(context.Context, string) (*time.Time, int, error)
 	SaveReconciliation(context.Context, domain.IngestionRun, []domain.Recording, time.Time) error
-	ListRecordings(context.Context, string, int) ([]domain.Recording, error)
+	ListArchivedRecordings(context.Context, string, int) ([]domain.Recording, error)
 }
 
 type Searcher interface {
@@ -193,7 +193,7 @@ func (service *Service) ListRecordings(ctx context.Context, cameraID string, lim
 	if _, err := service.store.GetCamera(ctx, cameraID); err != nil {
 		return nil, err
 	}
-	return service.store.ListRecordings(ctx, cameraID, limit)
+	return service.store.ListArchivedRecordings(ctx, cameraID, limit)
 }
 
 func hasSelectedType(types []domain.EventType, selected map[domain.EventType]bool) bool {

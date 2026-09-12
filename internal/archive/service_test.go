@@ -44,7 +44,7 @@ func (store *serviceStore) SaveReconciliation(_ context.Context, run domain.Inge
 	return nil
 }
 
-func (store *serviceStore) ListRecordings(context.Context, string, int) ([]domain.Recording, error) {
+func (store *serviceStore) ListArchivedRecordings(context.Context, string, int) ([]domain.Recording, error) {
 	return store.recordings, nil
 }
 

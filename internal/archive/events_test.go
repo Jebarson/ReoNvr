@@ -37,6 +37,10 @@ func (store *eventStore) ListEvents(context.Context, string, int) ([]domain.Even
 	return store.events, nil
 }
 
+func (store *eventStore) ListArchivedEvents(context.Context, string, int) ([]domain.Event, error) {
+	return store.events, nil
+}
+
 func (store *eventStore) ListEventsReadyForFinalization(context.Context, time.Time, int) ([]domain.Event, error) {
 	return store.events, nil
 }

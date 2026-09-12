@@ -636,6 +636,7 @@ func TestCameraArchiveStatsOnlyCountTheActiveSource(t *testing.T) {
 		Source: domain.RecordingSourceRtsp, Stream: domain.StreamMain,
 		StartAtUtc: now, EndAtUtc: now.Add(time.Minute), State: domain.RecordingComplete,
 		RawMetadata: json.RawMessage(`{}`), DiscoveredAtUtc: now, UpdatedAtUtc: now,
+		LocalPath: "camera-one/Rtsp/current.mkv",
 	}
 	if err := store.SaveRtspRecording(ctx, current); err != nil {
 		t.Fatal(err)
@@ -752,6 +753,124 @@ func TestApplyEventTransitionPersistsAndClosesEventsIdempotently(t *testing.T) {
 	}
 	if len(cameras) != 1 || cameras[0].LastEventAtUtc == nil || !cameras[0].LastEventAtUtc.Equal(ended) {
 		t.Fatalf("unexpected camera event time: %#v", cameras)
+	}
+}
+
+func TestArchivedViewsExposeEventsOnlyAfterTheirMediaIsLocal(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "archived-events.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	started := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+	ended := started.Add(time.Minute)
+	camera := domain.Camera{
+		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
+		RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
+		HistoricalImport: domain.HistoricalImportAll, EventTypes: []domain.EventType{domain.EventVehicle},
+		CreatedAtUtc: started, UpdatedAtUtc: started,
+	}
+	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: started, EventType: domain.EventVehicle, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: ended}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListEvents(ctx, camera.ID, 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("unexpected internal events: %#v %v", events, err)
+	}
+	recording := domain.Recording{
+		ID: "recording-one", CameraID: camera.ID, NativeName: "vehicle.mp4",
+		Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain,
+		StartAtUtc: started.Add(-time.Second), EndAtUtc: ended.Add(time.Second), SizeBytes: 1024,
+		EventTypes: []domain.EventType{domain.EventVehicle}, State: domain.RecordingQueued,
+		RawMetadata: json.RawMessage(`{}`), DiscoveredAtUtc: ended, UpdatedAtUtc: ended,
+	}
+	completed := ended
+	run := domain.IngestionRun{
+		ID: "event-run", CameraID: camera.ID, Kind: "EventFinalization",
+		WindowStartUtc: recording.StartAtUtc, WindowEndUtc: recording.EndAtUtc,
+		Status: "Complete", DiscoveredCount: 1, StartedAtUtc: ended, CompletedAtUtc: &completed,
+	}
+	if err := store.SaveEventFinalization(ctx, events[0].ID, run, []domain.Recording{recording}, recording.NativeName, ended); err != nil {
+		t.Fatal(err)
+	}
+	archivedRecordings, err := store.ListArchivedRecordings(ctx, camera.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivedEvents, err := store.ListArchivedEvents(ctx, camera.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archivedRecordings) != 0 || len(archivedEvents) != 0 {
+		t.Fatalf("pending media leaked into public archive views: recordings=%#v events=%#v", archivedRecordings, archivedEvents)
+	}
+	if err := store.CompleteRecording(ctx, recording.ID, "camera-one/vehicle.mp4", "abc123", recording.SizeBytes, ended.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	archivedRecordings, err = store.ListArchivedRecordings(ctx, camera.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivedEvents, err = store.ListArchivedEvents(ctx, camera.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archivedRecordings) != 1 || len(archivedEvents) != 1 || archivedEvents[0].NativeRecordingName != recording.NativeName {
+		t.Fatalf("completed media and event were not exposed together: recordings=%#v events=%#v", archivedRecordings, archivedEvents)
+	}
+}
+
+func TestArchivedEventsIncludeOnlyEventsCoveredByLocalRtspSegments(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "archived-rtsp-events.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	started := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+	camera := domain.Camera{
+		ID: "camera-one", Name: "Living", Host: "10.0.0.156", Port: 9000,
+		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamSub,
+		RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
+		EventTypes: []domain.EventType{domain.EventPerson}, CreatedAtUtc: started, UpdatedAtUtc: started,
+	}
+	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: started, EventType: domain.EventPerson, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	ended := started.Add(10 * time.Second)
+	if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: ended}); err != nil {
+		t.Fatal(err)
+	}
+	if events, err := store.ListArchivedEvents(ctx, camera.ID, 10); err != nil || len(events) != 0 {
+		t.Fatalf("event without local RTSP media was exposed: %#v %v", events, err)
+	}
+	recording := domain.Recording{
+		ID: "rtsp-one", CameraID: camera.ID, NativeName: "Rtsp/segment.mkv",
+		Source: domain.RecordingSourceRtsp, Stream: domain.StreamSub,
+		StartAtUtc: started.Add(-time.Second), EndAtUtc: ended.Add(time.Second), SizeBytes: 1024,
+		EventTypes: []domain.EventType{domain.EventPerson}, State: domain.RecordingComplete,
+		RawMetadata: json.RawMessage(`{}`), DiscoveredAtUtc: ended, UpdatedAtUtc: ended,
+		LocalPath: "camera-one/Rtsp/segment.mkv", Sha256: "abc123",
+	}
+	if err := store.SaveRtspRecording(ctx, recording); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListArchivedEvents(ctx, camera.ID, 10)
+	if err != nil || len(events) != 1 || events[0].EventType != domain.EventPerson {
+		t.Fatalf("event covered by local RTSP media was not exposed: %#v %v", events, err)
 	}
 }
 

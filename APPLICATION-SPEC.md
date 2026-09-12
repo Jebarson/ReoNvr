@@ -606,6 +606,12 @@ their source. `Events` stores normalized and raw live notifications.
 `IngestionRuns` stores bounded reconciliation history. Every identifier follows
 the PascalCase convention.
 
+Pending camera metadata remains available to reconciliation and download
+workers but is not exposed as playable history. Public recording lists include
+only completed media with a local archive path. Public event lists likewise
+include only events backed by completed local media; retention removes both
+from the public archive view together.
+
 ## 10. HTTP API
 
 All responses use JSON. Errors use a stable code, user-safe message, and
@@ -626,6 +632,7 @@ POST   /api/cameras/{id}/test
 GET    /api/cameras/{id}/status
 
 GET    /api/cameras/{id}/events
+GET    /api/cameras/{id}/recordings
 GET    /api/recordings/{id}
 GET    /api/recordings/{id}/media
 GET    /api/recordings/{id}/original

@@ -763,7 +763,7 @@ func (store *Store) loadEventTypes(ctx context.Context, camera *domain.Camera) e
 
 func (store *Store) loadArchiveStats(ctx context.Context, camera *domain.Camera) error {
 	err := store.db.QueryRowContext(ctx, `SELECT
-		COUNT(*),
+		COALESCE(SUM(CASE WHEN State = 'Complete' AND LocalPath IS NOT NULL AND LocalPath != '' THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN State IN ('Queued', 'Downloading', 'Verifying', 'RetryWait') THEN 1 ELSE 0 END), 0)
 		FROM Recordings WHERE CameraId = ? AND Source = ? AND State != 'Deleted'`, camera.ID, camera.RecordingSource).Scan(
 		&camera.RecordingCount, &camera.PendingDownloadCount)
@@ -1095,13 +1095,29 @@ func (store *Store) MarkEventFinalizationMiss(ctx context.Context, eventID strin
 }
 
 func (store *Store) ListRecordings(ctx context.Context, cameraID string, limit int) ([]domain.Recording, error) {
+	return store.listRecordings(ctx, cameraID, limit, false)
+}
+
+func (store *Store) ListArchivedRecordings(ctx context.Context, cameraID string, limit int) ([]domain.Recording, error) {
+	return store.listRecordings(ctx, cameraID, limit, true)
+}
+
+func (store *Store) listRecordings(ctx context.Context, cameraID string, limit int, archivedOnly bool) ([]domain.Recording, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := store.db.QueryContext(ctx, `SELECT Id, CameraId, NativeName, Source, Stream, IFNULL(Codec, ''),
+	query := `SELECT Id, CameraId, NativeName, Source, Stream, IFNULL(Codec, ''),
 		StartAtUtc, EndAtUtc, SizeBytes, State, RawMetadataJson, DiscoveredAtUtc, UpdatedAtUtc,
 		IFNULL(LocalPath, ''), IFNULL(Sha256, '')
-		FROM Recordings WHERE CameraId = ? ORDER BY StartAtUtc DESC LIMIT ?`, cameraID, limit)
+		FROM Recordings WHERE CameraId = ? ORDER BY StartAtUtc DESC LIMIT ?`
+	if archivedOnly {
+		query = `SELECT Id, CameraId, NativeName, Source, Stream, IFNULL(Codec, ''),
+			StartAtUtc, EndAtUtc, SizeBytes, State, RawMetadataJson, DiscoveredAtUtc, UpdatedAtUtc,
+			IFNULL(LocalPath, ''), IFNULL(Sha256, '')
+			FROM Recordings WHERE CameraId = ? AND State = 'Complete'
+			AND LocalPath IS NOT NULL AND LocalPath != '' ORDER BY StartAtUtc DESC LIMIT ?`
+	}
+	rows, err := store.db.QueryContext(ctx, query, cameraID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list recordings: %w", err)
 	}
@@ -1351,6 +1367,29 @@ func (store *Store) ListEvents(ctx context.Context, cameraID string, limit int) 
 		FROM Events WHERE CameraId = ? ORDER BY StartedAtUtc DESC LIMIT ?`, cameraID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list events: %w", err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
+func (store *Store) ListArchivedEvents(ctx context.Context, cameraID string, limit int) ([]domain.Event, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := store.db.QueryContext(ctx, `SELECT Events.Id, Events.CameraId, Events.EventType,
+		Events.StartedAtUtc, Events.EndedAtUtc, Events.NativeRecordingName,
+		Events.RawPayloadJson, Events.CreatedAtUtc
+		FROM Events WHERE Events.CameraId = ? AND EXISTS (
+			SELECT 1 FROM Recordings WHERE Recordings.CameraId = Events.CameraId
+			AND Recordings.State = 'Complete' AND Recordings.LocalPath IS NOT NULL AND Recordings.LocalPath != ''
+			AND (Recordings.NativeName = Events.NativeRecordingName OR (
+				Recordings.Source = 'Rtsp'
+				AND julianday(Recordings.StartAtUtc) <= julianday(COALESCE(Events.EndedAtUtc, Events.StartedAtUtc))
+				AND julianday(Recordings.EndAtUtc) >= julianday(Events.StartedAtUtc)
+			))
+		) ORDER BY Events.StartedAtUtc DESC LIMIT ?`, cameraID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list archived events: %w", err)
 	}
 	defer rows.Close()
 	return scanEvents(rows)

@@ -15,6 +15,7 @@ type EventStore interface {
 	GetCredential(context.Context, string) (domain.EncryptedCredential, error)
 	ApplyEventTransition(context.Context, string, domain.EventTransition) error
 	ListEvents(context.Context, string, int) ([]domain.Event, error)
+	ListArchivedEvents(context.Context, string, int) ([]domain.Event, error)
 	ListEventsReadyForFinalization(context.Context, time.Time, int) ([]domain.Event, error)
 	SaveEventFinalization(context.Context, string, domain.IngestionRun, []domain.Recording, string, time.Time) error
 	MarkEventFinalizationMiss(context.Context, string) error
@@ -199,5 +200,5 @@ func (service *EventService) ListEvents(ctx context.Context, cameraID string, li
 	if _, err := service.store.GetCamera(ctx, cameraID); err != nil {
 		return nil, err
 	}
-	return service.store.ListEvents(ctx, cameraID, limit)
+	return service.store.ListArchivedEvents(ctx, cameraID, limit)
 }

@@ -494,7 +494,7 @@ function App() {
                     {cameras.map((camera) => <tr key={camera.id}>
                       <td><div className="cameraName"><button className="cameraGlyph" title={`Open ${camera.name} playback`} onClick={() => openPlayback(camera.id)}><Video /></button><div><strong>{camera.name}</strong><small>{camera.model ?? 'Reolink camera'} · {camera.host}</small></div></div></td>
                       <td data-label="Status"><button className={`statusBadge ${camera.connectionStatus.toLowerCase()}`} onClick={() => void handleToggle(camera)} title={camera.enabled ? 'Disable camera' : 'Enable camera'}>{camera.enabled ? camera.connectionStatus : 'Disabled'}</button></td>
-                      <td data-label="Archive">{camera.archiveEnabled ? <><strong>{camera.recordingSource === 'Rtsp' ? 'RTSP' : 'Camera storage'} · {camera.recordingMode}</strong><small>{camera.archiveStream} stream · {camera.recordingCount > 0 ? `${camera.recordingCount.toLocaleString()} found · ${camera.pendingDownloadCount.toLocaleString()} pending` : 'Waiting for recordings'}</small></> : <><strong className="notRecording">Not recording</strong><small>Archive disabled</small></>}</td>
+                      <td data-label="Archive">{camera.archiveEnabled ? <><strong>{camera.recordingSource === 'Rtsp' ? 'RTSP' : 'Camera storage'} · {camera.recordingMode}</strong><small>{camera.archiveStream} stream · {camera.recordingCount > 0 || camera.pendingDownloadCount > 0 ? `${camera.recordingCount.toLocaleString()} local · ${camera.pendingDownloadCount.toLocaleString()} pending` : 'Waiting for recordings'}</small></> : <><strong className="notRecording">Not recording</strong><small>Archive disabled</small></>}</td>
                       <td data-label="Events"><div className="tagRow">{camera.eventTypes.map((eventType) => <span className="tag" key={eventType}>{eventLabels[eventType]}</span>)}</div></td>
                       <td data-label="Last tested">{camera.lastTestedAtUtc ? new Date(camera.lastTestedAtUtc).toLocaleString() : 'Not tested'}</td>
                       <td data-label="Actions"><div className="rowActions"><button className="iconButton" title="Edit camera" onClick={() => openEdit(camera)}><Pencil /></button><button className="iconButton danger" title="Remove camera" onClick={() => void handleDelete(camera)}><Trash2 /></button></div></td>
@@ -506,7 +506,7 @@ function App() {
       ) : screen === 'Playback' ? (
       <section className="screen">
         <div className="pageHeading">
-        <div><h1>Playback</h1><p>Indexed native recordings</p></div>
+        <div><h1>Playback</h1><p>Recordings available in the local archive</p></div>
         <button className="button" disabled={!selectedCameraId || recordingsLoading} onClick={() => {
           if (!selectedCameraId) return
           setRecordingsLoading(true)
@@ -524,13 +524,12 @@ function App() {
 
         <div className="playbackSummary">
         <span><strong>{filteredRecordings.length.toLocaleString()}</strong> recordings</span>
-        <span><strong>{formatBytes(filteredRecordings.reduce((total, recording) => total + recording.sizeBytes, 0))}</strong> indexed</span>
-        <span><strong>{selectedCamera?.pendingDownloadCount.toLocaleString() ?? 0}</strong> pending archive</span>
+        <span><strong>{formatBytes(filteredRecordings.reduce((total, recording) => total + recording.sizeBytes, 0))}</strong> stored locally</span>
         </div>
 
         <div className="panel playbackWorkspace">
         <div className="recordingList">
-          {recordingsLoading ? <div className="playbackEmpty"><RefreshCw className="spin" /> Loading recordings</div> : filteredRecordings.length === 0 ? <div className="playbackEmpty"><Video /> No indexed recordings for this date</div> : filteredRecordings.map((recording) => <button key={recording.id} className={`recordingRow ${selectedRecording?.id === recording.id ? 'selected' : ''}`} onClick={() => setSelectedRecordingId(recording.id)}>
+          {recordingsLoading ? <div className="playbackEmpty"><RefreshCw className="spin" /> Loading recordings</div> : filteredRecordings.length === 0 ? <div className="playbackEmpty"><Video /> No local recordings for this date</div> : filteredRecordings.map((recording) => <button key={recording.id} className={`recordingRow ${selectedRecording?.id === recording.id ? 'selected' : ''}`} onClick={() => setSelectedRecordingId(recording.id)}>
           <span className="recordingTime">{new Date(recording.startAtUtc).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
           <span className="recordingMeta"><strong>{recording.eventTypes.length > 0 ? recording.eventTypes.map((eventType) => eventLabels[eventType]).join(' + ') : recording.source === 'Rtsp' ? 'Continuous' : 'Camera recording'}</strong><small>{formatDuration(recording.startAtUtc, recording.endAtUtc)} · {formatBytes(recording.sizeBytes)} · {recording.source === 'Rtsp' ? 'RTSP' : 'Camera storage'}</small></span>
           <span className={`archiveState ${recording.state.toLowerCase()}`}>{recording.state}</span>
