@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -170,17 +171,41 @@ func (server *Server) openRecording(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	fileName := filepath.Base(recording.LocalPath)
-	if contentType := mime.TypeByExtension(filepath.Ext(fileName)); contentType != "" {
-		writer.Header().Set("Content-Type", contentType)
-	} else {
-		writer.Header().Set("Content-Type", "application/octet-stream")
+	contentType, err := recordingContentType(fileName, file)
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
 	}
+	writer.Header().Set("Content-Type", contentType)
 	disposition := "inline"
 	if attachment {
 		disposition = "attachment"
 	}
 	writer.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": fileName}))
 	http.ServeContent(writer, request, fileName, info.ModTime(), file)
+}
+
+func recordingContentType(fileName string, file *os.File) (string, error) {
+	if contentType := mime.TypeByExtension(filepath.Ext(fileName)); contentType != "" {
+		return contentType, nil
+	}
+	header := make([]byte, 512)
+	count, err := file.Read(header)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", errors.New("inspect recording media type")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", errors.New("reset recording after media type inspection")
+	}
+	header = header[:count]
+	if len(header) >= 12 && string(header[4:8]) == "ftyp" {
+		return "video/mp4", nil
+	}
+	detected := http.DetectContentType(header)
+	if strings.HasPrefix(detected, "video/") || strings.HasPrefix(detected, "audio/") {
+		return detected, nil
+	}
+	return "application/octet-stream", nil
 }
 
 func (server *Server) listEvents(writer http.ResponseWriter, request *http.Request) {

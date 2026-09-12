@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -158,6 +159,25 @@ func TestRecordingMediaSupportsByteRangesAndOriginalDownload(t *testing.T) {
 	handler.ServeHTTP(downloadResponse, downloadRequest)
 	if downloadResponse.Code != http.StatusOK || !strings.HasPrefix(downloadResponse.Header().Get("Content-Disposition"), "attachment") {
 		t.Fatalf("unexpected original response %d: %s", downloadResponse.Code, downloadResponse.Header())
+	}
+}
+
+func TestRecordingMediaDetectsExtensionlessMp4(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "0120260911194624")
+	payload := []byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 'i', 's', 'o', '4', 0, 0, 0, 1, 'i', 's', 'o', '4', 'h', 'v', 'c', '1'}
+	if err := os.WriteFile(filePath, payload, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	playback := fixturePlaybackService{
+		recording: domain.Recording{ID: "recording-one", LocalPath: "camera-one/0120260911194624", State: domain.RecordingComplete},
+		filePath:  filePath,
+	}
+	handler := New(rejectingCameraService{}, nil, nil, playback, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequest(http.MethodGet, "/api/recordings/recording-one/media", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "video/mp4" {
+		t.Fatalf("unexpected extensionless MP4 response %d %q", response.Code, response.Header().Get("Content-Type"))
 	}
 }
 

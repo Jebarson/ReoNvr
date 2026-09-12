@@ -155,7 +155,7 @@ export function listRecordings(cameraId: string) {
 }
 
 export function recordingMediaUrl(recordingId: string) {
-  return `/api/recordings/${encodeURIComponent(recordingId)}/media`
+  return `/api/recordings/${encodeURIComponent(recordingId)}/media?mediaVersion=2`
 }
 
 export function recordingOriginalUrl(recordingId: string) {
