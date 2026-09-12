@@ -1,0 +1,364 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"mime"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"reonavr/internal/archive"
+	"reonavr/internal/camera"
+	"reonavr/internal/domain"
+)
+
+type CameraService interface {
+	List(ctx context.Context) ([]domain.Camera, error)
+	Get(ctx context.Context, id string) (domain.Camera, error)
+	Test(ctx context.Context, cameraID string, draft camera.Draft) (camera.TestResponse, error)
+	Create(ctx context.Context, draft camera.Draft) (domain.Camera, error)
+	Update(ctx context.Context, id string, draft camera.Draft) (domain.Camera, error)
+	Delete(ctx context.Context, id string) error
+}
+
+type SystemStatus interface {
+	Ready() bool
+	Workers() any
+	Issues() any
+}
+
+type RecordingControlService interface {
+	Get(context.Context) (domain.RecordingControl, error)
+	Update(context.Context, bool) (domain.RecordingControl, error)
+}
+
+type RecordingService interface {
+	ListRecordings(context.Context, string, int) ([]domain.Recording, error)
+}
+
+type EventService interface {
+	ListEvents(context.Context, string, int) ([]domain.Event, error)
+}
+
+type PlaybackService interface {
+	GetRecording(context.Context, string) (domain.Recording, error)
+	OpenRecording(context.Context, string) (domain.Recording, *os.File, error)
+}
+
+type Server struct {
+	cameras    CameraService
+	recordings RecordingService
+	events     EventService
+	playback   PlaybackService
+	status     SystemStatus
+	recording  RecordingControlService
+	logger     *slog.Logger
+}
+
+func New(cameras CameraService, recordings RecordingService, events EventService, playback PlaybackService, status SystemStatus, recording RecordingControlService, assets fs.FS, logger *slog.Logger) http.Handler {
+	server := &Server{cameras: cameras, recordings: recordings, events: events, playback: playback, status: status, recording: recording, logger: logger}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health/live", server.live)
+	mux.HandleFunc("GET /api/health/ready", server.ready)
+	mux.HandleFunc("GET /api/system/workers", server.workers)
+	mux.HandleFunc("GET /api/system/issues", server.issues)
+	mux.HandleFunc("GET /api/system/recording", server.getRecordingControl)
+	mux.HandleFunc("PUT /api/system/recording", server.updateRecordingControl)
+	mux.HandleFunc("GET /api/cameras", server.listCameras)
+	mux.HandleFunc("POST /api/cameras/test", server.testNewCamera)
+	mux.HandleFunc("POST /api/cameras", server.createCamera)
+	mux.HandleFunc("GET /api/cameras/{id}", server.getCamera)
+	mux.HandleFunc("PUT /api/cameras/{id}", server.updateCamera)
+	mux.HandleFunc("DELETE /api/cameras/{id}", server.deleteCamera)
+	mux.HandleFunc("POST /api/cameras/{id}/test", server.testExistingCamera)
+	mux.HandleFunc("GET /api/cameras/{id}/status", server.getCamera)
+	mux.HandleFunc("GET /api/cameras/{id}/recordings", server.listRecordings)
+	mux.HandleFunc("GET /api/cameras/{id}/events", server.listEvents)
+	mux.HandleFunc("GET /api/recordings/{id}", server.getRecording)
+	mux.HandleFunc("GET /api/recordings/{id}/media", server.serveRecording)
+	mux.HandleFunc("GET /api/recordings/{id}/original", server.downloadRecording)
+	if assets != nil {
+		mux.Handle("/", http.FileServer(http.FS(assets)))
+	}
+	return securityHeaders(mux)
+}
+
+func (server *Server) getRecordingControl(writer http.ResponseWriter, request *http.Request) {
+	if server.recording == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Recording control is not available."})
+		return
+	}
+	state, err := server.recording.Get(request.Context())
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, state)
+}
+
+func (server *Server) updateRecordingControl(writer http.ResponseWriter, request *http.Request) {
+	if server.recording == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Recording control is not available."})
+		return
+	}
+	var input struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !decodeRequest(writer, request, &input) {
+		return
+	}
+	if input.Enabled == nil {
+		writeError(writer, http.StatusBadRequest, "InvalidRecordingControl", "Recording enabled state is required.")
+		return
+	}
+	state, err := server.recording.Update(request.Context(), *input.Enabled)
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, state)
+}
+
+func (server *Server) getRecording(writer http.ResponseWriter, request *http.Request) {
+	if server.playback == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Recording playback is not available."})
+		return
+	}
+	recording, err := server.playback.GetRecording(request.Context(), request.PathValue("id"))
+	if errors.Is(err, archive.ErrRecordingUnavailable) {
+		writeError(writer, http.StatusNotFound, "RecordingNotFound", "The recording is not available.")
+		return
+	}
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, recording)
+}
+
+func (server *Server) serveRecording(writer http.ResponseWriter, request *http.Request) {
+	server.openRecording(writer, request, false)
+}
+
+func (server *Server) downloadRecording(writer http.ResponseWriter, request *http.Request) {
+	server.openRecording(writer, request, true)
+}
+
+func (server *Server) openRecording(writer http.ResponseWriter, request *http.Request, attachment bool) {
+	if server.playback == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Recording playback is not available."})
+		return
+	}
+	recording, file, err := server.playback.OpenRecording(request.Context(), request.PathValue("id"))
+	if errors.Is(err, archive.ErrRecordingUnavailable) {
+		writeError(writer, http.StatusNotFound, "RecordingNotFound", "The recording is not available.")
+		return
+	}
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	fileName := filepath.Base(recording.LocalPath)
+	if contentType := mime.TypeByExtension(filepath.Ext(fileName)); contentType != "" {
+		writer.Header().Set("Content-Type", contentType)
+	} else {
+		writer.Header().Set("Content-Type", "application/octet-stream")
+	}
+	disposition := "inline"
+	if attachment {
+		disposition = "attachment"
+	}
+	writer.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": fileName}))
+	http.ServeContent(writer, request, fileName, info.ModTime(), file)
+}
+
+func (server *Server) listEvents(writer http.ResponseWriter, request *http.Request) {
+	if server.events == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Event history is not available."})
+		return
+	}
+	events, err := server.events.ListEvents(request.Context(), request.PathValue("id"), 1000)
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, events)
+}
+
+func (server *Server) listRecordings(writer http.ResponseWriter, request *http.Request) {
+	if server.recordings == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Recording inventory is not available."})
+		return
+	}
+	recordings, err := server.recordings.ListRecordings(request.Context(), request.PathValue("id"), 1000)
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, recordings)
+}
+
+func (server *Server) live(writer http.ResponseWriter, _ *http.Request) {
+	writeJSON(writer, http.StatusOK, map[string]string{"status": "Live"})
+}
+
+func (server *Server) ready(writer http.ResponseWriter, _ *http.Request) {
+	if server.status != nil && !server.status.Ready() {
+		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "Degraded"})
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]string{"status": "Ready"})
+}
+
+func (server *Server) workers(writer http.ResponseWriter, _ *http.Request) {
+	if server.status == nil {
+		writeJSON(writer, http.StatusOK, []any{})
+		return
+	}
+	writeJSON(writer, http.StatusOK, server.status.Workers())
+}
+
+func (server *Server) issues(writer http.ResponseWriter, _ *http.Request) {
+	if server.status == nil {
+		writeJSON(writer, http.StatusOK, []any{})
+		return
+	}
+	writeJSON(writer, http.StatusOK, server.status.Issues())
+}
+
+func (server *Server) listCameras(writer http.ResponseWriter, request *http.Request) {
+	cameras, err := server.cameras.List(request.Context())
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, cameras)
+}
+
+func (server *Server) getCamera(writer http.ResponseWriter, request *http.Request) {
+	item, err := server.cameras.Get(request.Context(), request.PathValue("id"))
+	if err != nil {
+		server.serviceError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, item)
+}
+
+func (server *Server) testNewCamera(writer http.ResponseWriter, request *http.Request) {
+	server.testCamera(writer, request, "")
+}
+
+func (server *Server) testExistingCamera(writer http.ResponseWriter, request *http.Request) {
+	server.testCamera(writer, request, request.PathValue("id"))
+}
+
+func (server *Server) testCamera(writer http.ResponseWriter, request *http.Request, cameraID string) {
+	var draft camera.Draft
+	if !decodeRequest(writer, request, &draft) {
+		return
+	}
+	result, err := server.cameras.Test(request.Context(), cameraID, draft)
+	draft.Password = ""
+	if err != nil {
+		server.serviceError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+func (server *Server) createCamera(writer http.ResponseWriter, request *http.Request) {
+	var draft camera.Draft
+	if !decodeRequest(writer, request, &draft) {
+		return
+	}
+	created, err := server.cameras.Create(request.Context(), draft)
+	draft.Password = ""
+	if err != nil {
+		server.serviceError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, created)
+}
+
+func (server *Server) updateCamera(writer http.ResponseWriter, request *http.Request) {
+	var draft camera.Draft
+	if !decodeRequest(writer, request, &draft) {
+		return
+	}
+	updated, err := server.cameras.Update(request.Context(), request.PathValue("id"), draft)
+	draft.Password = ""
+	if err != nil {
+		server.serviceError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, updated)
+}
+
+func (server *Server) deleteCamera(writer http.ResponseWriter, request *http.Request) {
+	if err := server.cameras.Delete(request.Context(), request.PathValue("id")); err != nil {
+		server.serviceError(writer, request, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (server *Server) serviceError(writer http.ResponseWriter, request *http.Request, err error) {
+	switch {
+	case errors.Is(err, camera.ErrInvalid):
+		writeError(writer, http.StatusBadRequest, "InvalidCamera", strings.TrimPrefix(err.Error(), camera.ErrInvalid.Error()+": "))
+	case errors.Is(err, camera.ErrRetest):
+		writeError(writer, http.StatusConflict, "ConnectionTestRequired", camera.ErrRetest.Error())
+	case errors.Is(err, camera.ErrNotFound):
+		writeError(writer, http.StatusNotFound, "CameraNotFound", camera.ErrNotFound.Error())
+	case strings.Contains(err.Error(), "UNIQUE constraint failed"):
+		writeError(writer, http.StatusConflict, "CameraConflict", "A camera with this name or host and channel is already registered.")
+	case strings.Contains(err.Error(), "camera command") || strings.Contains(err.Error(), "camera returned") || strings.Contains(err.Error(), "host ") || strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "port "):
+		writeError(writer, http.StatusBadGateway, "CameraConnectionFailed", "Unable to connect to the camera. Verify its address, Baichuan port, and credentials.")
+	default:
+		server.internalError(writer, request, err)
+	}
+}
+
+func (server *Server) internalError(writer http.ResponseWriter, request *http.Request, err error) {
+	server.logger.Error("request failed", "method", request.Method, "path", request.URL.Path, "error", err)
+	writeError(writer, http.StatusInternalServerError, "InternalError", "The request could not be completed.")
+}
+
+func decodeRequest(writer http.ResponseWriter, request *http.Request, target any) bool {
+	request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
+	if err := json.NewDecoder(request.Body).Decode(target); err != nil {
+		writeError(writer, http.StatusBadRequest, "InvalidJson", "Request body must contain valid JSON.")
+		return false
+	}
+	return true
+}
+
+func writeError(writer http.ResponseWriter, status int, code, message string) {
+	writeJSON(writer, status, map[string]string{"code": code, "message": message})
+}
+
+func writeJSON(writer http.ResponseWriter, status int, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		writer.Header().Set("X-Frame-Options", "DENY")
+		writer.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(writer, request)
+	})
+}

@@ -1,0 +1,57 @@
+name: reonvr
+
+services:
+  gateway:
+    container_name: reonvr-gateway
+    image: reonvr-gateway:latest
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    restart: unless-stopped
+    expose:
+      - "9000"
+    volumes:
+      - ./runtime/gateway:/var/lib/reolink
+    healthcheck:
+      test: ["CMD", "reolink-cli", "--gateway-addr", "127.0.0.1:9000", "gateway", "status"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  app:
+    container_name: reonvr-app
+    image: reonvr-app:latest
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      REONVR_ADDRESS: ":8080"
+      REONVR_DATABASE_PATH: /data/reonavr.db
+      REONVR_MASTER_KEY_FILE: /run/secrets/master.key
+      REONVR_CLI_PATH: /usr/local/bin/reolink-cli
+      REONVR_GATEWAY_ADDR: gateway:9000
+      REONVR_VALIDATION_GATEWAY_PATH: /usr/local/bin/reolink-gateway
+      REONVR_ARCHIVE_ROOT: /archive
+      REONVR_RTSP_BUFFER_ROOT: /archive/.rtsp-buffer
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./runtime/data:/data
+      - ./runtime/archive:/archive
+      - ./runtime/secrets:/run/secrets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health/live"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+networks:
+  default:
+    name: reonvr-private
+    driver: bridge

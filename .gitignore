@@ -1,0 +1,37 @@
+# Runtime state, recordings, credentials, and backups
+/runtime/
+**/runtime/
+**/backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+*.partial
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.local
+*.log
+logs/
+
+# Dependencies, builds, tests, and tooling
+node_modules/
+dist/
+!webui/dist/
+!webui/dist/index.html
+coverage/
+.cache/
+.playwright-mcp/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.sw?
