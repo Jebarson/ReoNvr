@@ -67,9 +67,11 @@ func run(logger *slog.Logger) error {
 	eventService := archive.NewEventService(store, sharedClient, credentialCipher)
 	eventService.SetSearcher(sharedClient)
 	archiveRoot := environment("REONVR_ARCHIVE_ROOT", "/archive")
+	applicationSettingsService := control.NewApplicationSettingsService(store, archiveRoot)
 	retentionService := archive.NewRetentionService(store, archiveRoot)
 	playbackService := archive.NewPlaybackService(store, archiveRoot)
 	downloadService := archive.NewDownloadService(store, sharedClient, credentialCipher, archiveRoot)
+	downloadService.SetApplicationSettingsProvider(store)
 	downloadService.SetCapacityGuard(retentionService)
 	rtspRecorderService := archive.NewRtspRecorderService(
 		store, sharedClient, credentialCipher,
@@ -83,6 +85,7 @@ func run(logger *slog.Logger) error {
 	if err := rtspRecorderService.Recover(ctx); err != nil {
 		return err
 	}
+	rtspRecorderService.SetApplicationSettingsProvider(store)
 	rtspRecorderService.SetCapacityGuard(retentionService)
 	supervisor := workers.NewSupervisor(store, logger)
 	supervisor.Start(ctx)
@@ -184,7 +187,7 @@ func run(logger *slog.Logger) error {
 	}
 	server := &http.Server{
 		Addr:              environment("REONVR_ADDRESS", ":8080"),
-		Handler:           httpapi.New(service, archiveService, eventService, playbackService, supervisor, recordingControlService, assets, logger),
+		Handler:           httpapi.New(service, archiveService, eventService, playbackService, supervisor, recordingControlService, applicationSettingsService, assets, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       20 * time.Second,
 		WriteTimeout:      30 * time.Second,

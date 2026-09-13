@@ -69,7 +69,7 @@ func TestDownloadNextPublishesVerifiedNativeRecording(t *testing.T) {
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	payload := []byte("native-video")
 	store := &downloadStore{
-		camera:     domain.Camera{ID: "camera-one", Host: "10.0.0.152", Port: 9000, Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecordingSource: domain.RecordingSourceCameraStorage},
+		camera:     domain.Camera{ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000, Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecordingSource: domain.RecordingSourceCameraStorage},
 		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
 		recording: &domain.Recording{
 			ID: "recording-one", CameraID: "camera-one", NativeName: "Mp4Record/2026/clip.mp4",
@@ -85,7 +85,7 @@ func TestDownloadNextPublishesVerifiedNativeRecording(t *testing.T) {
 	if err := service.DownloadNext(context.Background(), store.camera.ID); err != nil {
 		t.Fatal(err)
 	}
-	finalPath := filepath.Join(root, "camera-one", "Mp4Record", "2026", "clip.mp4")
+	finalPath := filepath.Join(root, "Front-cameraon", "2026", "09", "11", "clip.mp4")
 	if downloaded, err := os.ReadFile(finalPath); err != nil || string(downloaded) != string(payload) {
 		t.Fatalf("unexpected archived media: %q %v", downloaded, err)
 	}
@@ -97,7 +97,7 @@ func TestDownloadNextPublishesVerifiedNativeRecording(t *testing.T) {
 		t.Fatalf("unexpected sidecar: %s", sidecar)
 	}
 	expectedHash := fmt.Sprintf("%x", sha256.Sum256(payload))
-	if downloader.password != "secret" || store.completed.Sha256 != expectedHash || store.completed.LocalPath != "camera-one/Mp4Record/2026/clip.mp4" {
+	if downloader.password != "secret" || store.completed.Sha256 != expectedHash || store.completed.LocalPath != "Front-cameraon/2026/09/11/clip.mp4" {
 		t.Fatalf("unexpected completion: %#v", store.completed)
 	}
 	if len(store.states) != 1 || store.states[0] != domain.RecordingVerifying {

@@ -135,7 +135,10 @@ func (store *Store) initialize(ctx context.Context) error {
 	if err := store.migrateApplicationSettings(ctx); err != nil {
 		return err
 	}
-	return store.migrateAutomaticCameraStorageImport(ctx)
+	if err := store.migrateAutomaticCameraStorageImport(ctx); err != nil {
+		return err
+	}
+	return store.migrateStorageSettings(ctx)
 }
 
 func (store *Store) migrateActiveCameraUniqueness(ctx context.Context) error {
@@ -383,6 +386,30 @@ func (store *Store) migrateAutomaticCameraStorageImport(ctx context.Context) err
 	})
 }
 
+func (store *Store) migrateStorageSettings(ctx context.Context) error {
+	var applied int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM SchemaMigrations WHERE Version = 7`).Scan(&applied); err != nil {
+		return fmt.Errorf("check storage settings migration: %w", err)
+	}
+	if applied != 0 {
+		return nil
+	}
+	statements := []string{
+		`ALTER TABLE ApplicationSettings ADD COLUMN RecordingFolder TEXT NOT NULL DEFAULT '.'`,
+		`ALTER TABLE ApplicationSettings ADD COLUMN ArchiveLayout TEXT NOT NULL DEFAULT 'CameraDate'
+			CHECK (ArchiveLayout IN ('CameraDate', 'DateCamera', 'Camera', 'Date'))`,
+		`INSERT INTO SchemaMigrations (Version, AppliedAtUtc) VALUES (7, CURRENT_TIMESTAMP)`,
+	}
+	return store.withTransaction(ctx, func(tx *sql.Tx) error {
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migrate storage settings: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 func (store *Store) GetRecordingControl(ctx context.Context) (domain.RecordingControl, error) {
 	var enabled int
 	var updated string
@@ -400,6 +427,30 @@ func (store *Store) SetRecordingControl(ctx context.Context, enabled bool, updat
 	_, err := store.db.ExecContext(ctx, `UPDATE ApplicationSettings SET RecordingEnabled = ?, UpdatedAtUtc = ? WHERE Id = 1`, enabled, formatTime(&updatedAt))
 	if err != nil {
 		return fmt.Errorf("set recording control: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) GetApplicationSettings(ctx context.Context) (domain.ApplicationSettings, error) {
+	var settings domain.ApplicationSettings
+	var updated string
+	if err := store.db.QueryRowContext(ctx, `SELECT RecordingFolder, ArchiveLayout, UpdatedAtUtc FROM ApplicationSettings WHERE Id = 1`).Scan(
+		&settings.RecordingFolder, &settings.ArchiveLayout, &updated); err != nil {
+		return domain.ApplicationSettings{}, fmt.Errorf("get application settings: %w", err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, updated)
+	if err != nil {
+		return domain.ApplicationSettings{}, fmt.Errorf("parse application settings update time: %w", err)
+	}
+	settings.UpdatedAtUtc = updatedAt
+	return settings, nil
+}
+
+func (store *Store) SetApplicationSettings(ctx context.Context, settings domain.ApplicationSettings) error {
+	_, err := store.db.ExecContext(ctx, `UPDATE ApplicationSettings SET RecordingFolder = ?, ArchiveLayout = ?, UpdatedAtUtc = ? WHERE Id = 1`,
+		settings.RecordingFolder, settings.ArchiveLayout, formatTime(&settings.UpdatedAtUtc))
+	if err != nil {
+		return fmt.Errorf("set application settings: %w", err)
 	}
 	return nil
 }

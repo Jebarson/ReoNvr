@@ -70,6 +70,7 @@ type RtspRecorderService struct {
 	cipher      CredentialCipher
 	segmenter   RtspSegmenter
 	capacity    CapacityGuard
+	settings    ApplicationSettingsProvider
 	archiveRoot string
 	bufferRoot  string
 	now         func() time.Time
@@ -77,6 +78,10 @@ type RtspRecorderService struct {
 
 func (service *RtspRecorderService) SetCapacityGuard(capacity CapacityGuard) {
 	service.capacity = capacity
+}
+
+func (service *RtspRecorderService) SetApplicationSettingsProvider(settings ApplicationSettingsProvider) {
+	service.settings = settings
 }
 
 func NewRtspRecorderService(store RtspRecordingStore, provider RtspURLProvider, cipher CredentialCipher, segmenter RtspSegmenter, archiveRoot, bufferRoot string) *RtspRecorderService {
@@ -380,7 +385,13 @@ func (service *RtspRecorderService) publishSegment(ctx context.Context, camera d
 	recordingID := hex.EncodeToString(idHash[:16])
 	fileName := startAt.Format("20060102T150405.000Z") + "-" + recordingID[:12] + ".mkv"
 	nativeName := filepath.ToSlash(filepath.Join("Rtsp", startAt.Format("2006"), startAt.Format("01"), startAt.Format("02"), fileName))
-	relativePath, err := archiveRelativePath(camera.ID, nativeName)
+	settings, err := loadApplicationSettings(ctx, service.settings)
+	if err != nil {
+		return err
+	}
+	relativePath, err := archiveRelativePath(camera, domain.Recording{
+		ID: recordingID, NativeName: nativeName, Source: domain.RecordingSourceRtsp, StartAtUtc: startAt,
+	}, settings)
 	if err != nil {
 		return err
 	}

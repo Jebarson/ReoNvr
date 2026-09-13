@@ -16,6 +16,7 @@ import {
   RefreshCw,
   Save,
   Server,
+	Settings as SettingsIcon,
   ShieldCheck,
   Trash2,
   Video,
@@ -23,6 +24,7 @@ import {
 import {
   createCamera,
   deleteCamera,
+	getApplicationSettings,
   getRecordingControl,
   listCameras,
 	listRecordings,
@@ -30,8 +32,11 @@ import {
   recordingOriginalUrl,
   testCamera,
   updateCamera,
+	updateApplicationSettings,
   updateRecordingControl,
+	type ApplicationSettings,
   type ArchiveStream,
+	type ArchiveLayout,
   type Camera,
   type CameraDraft,
   type CameraTestResult,
@@ -42,7 +47,14 @@ import {
 } from './api'
 import './App.css'
 
-type Screen = 'Cameras' | 'CameraForm' | 'Playback'
+type Screen = 'Cameras' | 'CameraForm' | 'Playback' | 'Settings'
+
+const archiveLayoutLabels: Record<ArchiveLayout, { label: string, example: string }> = {
+  CameraDate: { label: 'Camera, then day', example: 'Front-Camera-a35b97be/2026/09/12/recording.mp4' },
+  DateCamera: { label: 'Day, then camera', example: '2026/09/12/Front-Camera-a35b97be/recording.mp4' },
+  Camera: { label: 'Camera only', example: 'Front-Camera-a35b97be/recording.mp4' },
+  Date: { label: 'Day only', example: '2026/09/12/Front-Camera-a35b97be-recording.mp4' },
+}
 
 const eventLabels: Record<EventType, string> = {
   Motion: 'Motion',
@@ -124,6 +136,10 @@ function App() {
   const [cameras, setCameras] = useState<Camera[]>([])
   const [recordingControl, setRecordingControl] = useState<RecordingControl | null>(null)
   const [recordingControlSaving, setRecordingControlSaving] = useState(false)
+  const [applicationSettings, setApplicationSettings] = useState<ApplicationSettings | null>(null)
+  const [settingsDraft, setSettingsDraft] = useState<Pick<ApplicationSettings, 'recordingFolder' | 'archiveLayout'>>({ recordingFolder: '.', archiveLayout: 'CameraDate' })
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
   const [loading, setLoading] = useState(true)
   const [pageError, setPageError] = useState('')
   const [editing, setEditing] = useState<Camera | null>(null)
@@ -158,11 +174,13 @@ function App() {
 
   useEffect(() => {
     let active = true
-    Promise.all([listCameras(), getRecordingControl()])
-      .then(([items, control]) => {
+    Promise.all([listCameras(), getRecordingControl(), getApplicationSettings()])
+      .then(([items, control, settings]) => {
         if (active) {
           setCameras(items)
           setRecordingControl(control)
+		  setApplicationSettings(settings)
+		  setSettingsDraft({ recordingFolder: settings.recordingFolder, archiveLayout: settings.archiveLayout })
         }
       })
       .catch((error: unknown) => {
@@ -365,6 +383,22 @@ function App() {
     }
   }
 
+  async function handleApplicationSettings(event: FormEvent) {
+    event.preventDefault()
+    setSettingsSaving(true)
+    setSettingsError('')
+    try {
+      const settings = await updateApplicationSettings(settingsDraft)
+      setApplicationSettings(settings)
+      setSettingsDraft({ recordingFolder: settings.recordingFolder, archiveLayout: settings.archiveLayout })
+      setNotice('Storage settings saved')
+    } catch (error) {
+      setSettingsError(errorMessage(error))
+    } finally {
+      setSettingsSaving(false)
+    }
+  }
+
   async function handleDelete(camera: Camera) {
     if (!window.confirm(`Remove ${camera.name}? Existing archive ownership will be preserved.`)) return
     try {
@@ -439,8 +473,9 @@ function App() {
       <aside className="sidebar">
         <div className="brand"><span className="brandMark"><Archive /></span>ReoNvr</div>
         <div className="navLabel">Workspace</div>
-        <button className={`navItem ${screen !== 'Playback' ? 'active' : ''}`} onClick={() => setScreen('Cameras')}><CameraIcon /> Cameras</button>
+        <button className={`navItem ${screen === 'Cameras' || screen === 'CameraForm' ? 'active' : ''}`} onClick={() => setScreen('Cameras')}><CameraIcon /> Cameras</button>
         <button className={`navItem ${screen === 'Playback' ? 'active' : ''}`} onClick={() => openPlayback()}><Video /> Playback</button>
+        <button className={`navItem ${screen === 'Settings' ? 'active' : ''}`} onClick={() => setScreen('Settings')}><SettingsIcon /> Settings</button>
         <div className="systemState">
           <div><span className={`statusDot ${pageError ? 'warning' : ''}`} />{pageError ? 'Service needs attention' : 'Archive service ready'}</div>
           <div><ShieldCheck /> Credentials encrypted locally</div>
@@ -449,7 +484,7 @@ function App() {
 
       <div className="workspace">
         <header className="topbar">
-		  <strong>{screen === 'Cameras' ? 'Cameras' : screen === 'Playback' ? 'Playback' : editing ? 'Edit camera' : 'Add camera'}</strong>
+      <strong>{screen === 'Cameras' ? 'Cameras' : screen === 'Playback' ? 'Playback' : screen === 'Settings' ? 'Settings' : editing ? 'Edit camera' : 'Add camera'}</strong>
           <span><HardDrive /> Automatic 30 minute reserve</span>
         </header>
 
@@ -544,6 +579,23 @@ function App() {
         </div>
         </div>
       </section>
+      ) : screen === 'Settings' ? (
+    <section className="screen">
+      <div className="pageHeading"><div><h1>Settings</h1><p>Storage location and archive organization</p></div></div>
+      {notice && <div className="alert success"><CheckCircle2 /> {notice}</div>}
+      {settingsError && <div className="alert error"><CircleAlert /> {settingsError}</div>}
+      <form className="panel settingsPanel" onSubmit={(event) => void handleApplicationSettings(event)}>
+      <div className="sectionTitle"><HardDrive /><h2>Recording storage</h2></div>
+      <div className="settingsGrid">
+        <label>Mounted archive root<input value={applicationSettings?.archiveRoot ?? ''} readOnly /></label>
+        <label>Recording folder<input value={settingsDraft.recordingFolder} onChange={(event) => setSettingsDraft((current) => ({ ...current, recordingFolder: event.target.value }))} placeholder="." required /></label>
+        <label>Folder organization<select value={settingsDraft.archiveLayout} onChange={(event) => setSettingsDraft((current) => ({ ...current, archiveLayout: event.target.value as ArchiveLayout }))}>{(Object.keys(archiveLayoutLabels) as ArchiveLayout[]).map((layout) => <option key={layout} value={layout}>{archiveLayoutLabels[layout].label}</option>)}</select></label>
+      </div>
+      <div className="settingsPreview"><span>New recording path</span><code>{applicationSettings?.archiveRoot ?? '/archive'}/{settingsDraft.recordingFolder === '.' ? '' : `${settingsDraft.recordingFolder.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '')}/`}{archiveLayoutLabels[settingsDraft.archiveLayout].example}</code></div>
+      <div className="policyNote"><Archive /><div><strong>Existing recordings stay in place</strong><p>Folder changes apply to newly archived media. Playback and retention continue using each recording's stored path.</p></div></div>
+      <div className="formActions"><button className="button primary" disabled={settingsSaving || !applicationSettings} type="submit"><Save /> {settingsSaving ? 'Saving' : 'Save settings'}</button></div>
+      </form>
+    </section>
       ) : (
             <section className="screen">
               <div className="pageHeading"><div><h1>{editing ? 'Edit camera' : 'Add camera'}</h1><p>{editing ? `${editing.name} · ${editing.model ?? 'Camera'}` : 'Register a Reolink camera on your local network'}</p></div>{testResult?.testId && connectionIsCurrent && <span className="connectedBadge"><CheckCircle2 /> Connected</span>}</div>

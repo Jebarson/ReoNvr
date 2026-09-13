@@ -15,6 +15,7 @@ import (
 
 	"reonavr/internal/archive"
 	"reonavr/internal/camera"
+	"reonavr/internal/control"
 	"reonavr/internal/domain"
 )
 
@@ -38,6 +39,11 @@ type RecordingControlService interface {
 	Update(context.Context, bool) (domain.RecordingControl, error)
 }
 
+type ApplicationSettingsService interface {
+	Get(context.Context) (domain.ApplicationSettings, error)
+	Update(context.Context, string, domain.ArchiveLayout) (domain.ApplicationSettings, error)
+}
+
 type RecordingService interface {
 	ListRecordings(context.Context, string, int) ([]domain.Recording, error)
 }
@@ -58,11 +64,12 @@ type Server struct {
 	playback   PlaybackService
 	status     SystemStatus
 	recording  RecordingControlService
+	settings   ApplicationSettingsService
 	logger     *slog.Logger
 }
 
-func New(cameras CameraService, recordings RecordingService, events EventService, playback PlaybackService, status SystemStatus, recording RecordingControlService, assets fs.FS, logger *slog.Logger) http.Handler {
-	server := &Server{cameras: cameras, recordings: recordings, events: events, playback: playback, status: status, recording: recording, logger: logger}
+func New(cameras CameraService, recordings RecordingService, events EventService, playback PlaybackService, status SystemStatus, recording RecordingControlService, settings ApplicationSettingsService, assets fs.FS, logger *slog.Logger) http.Handler {
+	server := &Server{cameras: cameras, recordings: recordings, events: events, playback: playback, status: status, recording: recording, settings: settings, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health/live", server.live)
 	mux.HandleFunc("GET /api/health/ready", server.ready)
@@ -70,6 +77,8 @@ func New(cameras CameraService, recordings RecordingService, events EventService
 	mux.HandleFunc("GET /api/system/issues", server.issues)
 	mux.HandleFunc("GET /api/system/recording", server.getRecordingControl)
 	mux.HandleFunc("PUT /api/system/recording", server.updateRecordingControl)
+	mux.HandleFunc("GET /api/system/settings", server.getApplicationSettings)
+	mux.HandleFunc("PUT /api/system/settings", server.updateApplicationSettings)
 	mux.HandleFunc("GET /api/cameras", server.listCameras)
 	mux.HandleFunc("POST /api/cameras/test", server.testNewCamera)
 	mux.HandleFunc("POST /api/cameras", server.createCamera)
@@ -87,6 +96,47 @@ func New(cameras CameraService, recordings RecordingService, events EventService
 		mux.Handle("/", http.FileServer(http.FS(assets)))
 	}
 	return securityHeaders(mux)
+}
+
+func (server *Server) getApplicationSettings(writer http.ResponseWriter, request *http.Request) {
+	if server.settings == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Application settings are not available."})
+		return
+	}
+	settings, err := server.settings.Get(request.Context())
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, settings)
+}
+
+func (server *Server) updateApplicationSettings(writer http.ResponseWriter, request *http.Request) {
+	if server.settings == nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]string{"code": "NotAvailable", "message": "Application settings are not available."})
+		return
+	}
+	var input struct {
+		RecordingFolder *string               `json:"recordingFolder"`
+		ArchiveLayout   *domain.ArchiveLayout `json:"archiveLayout"`
+	}
+	if !decodeRequest(writer, request, &input) {
+		return
+	}
+	if input.RecordingFolder == nil || input.ArchiveLayout == nil {
+		writeError(writer, http.StatusBadRequest, "InvalidApplicationSettings", "Recording folder and archive layout are required.")
+		return
+	}
+	settings, err := server.settings.Update(request.Context(), *input.RecordingFolder, *input.ArchiveLayout)
+	if errors.Is(err, control.ErrInvalidApplicationSettings) {
+		writeError(writer, http.StatusBadRequest, "InvalidApplicationSettings", err.Error())
+		return
+	}
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, settings)
 }
 
 func (server *Server) getRecordingControl(writer http.ResponseWriter, request *http.Request) {
@@ -176,6 +226,7 @@ func (server *Server) openRecording(writer http.ResponseWriter, request *http.Re
 		server.internalError(writer, request, err)
 		return
 	}
+	fileName = recordingFileName(fileName, contentType)
 	writer.Header().Set("Content-Type", contentType)
 	disposition := "inline"
 	if attachment {
@@ -206,6 +257,13 @@ func recordingContentType(fileName string, file *os.File) (string, error) {
 		return detected, nil
 	}
 	return "application/octet-stream", nil
+}
+
+func recordingFileName(fileName, contentType string) string {
+	if filepath.Ext(fileName) == "" && contentType == "video/mp4" {
+		return fileName + ".mp4"
+	}
+	return fileName
 }
 
 func (server *Server) listEvents(writer http.ResponseWriter, request *http.Request) {

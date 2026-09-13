@@ -116,6 +116,43 @@ func TestRecordingControlDefaultsEnabledAndPersists(t *testing.T) {
 	}
 }
 
+func TestApplicationSettingsDefaultAndPersist(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "application-settings.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := store.GetApplicationSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.RecordingFolder != "." || settings.ArchiveLayout != domain.ArchiveLayoutCameraDate {
+		t.Fatalf("unexpected default application settings: %#v", settings)
+	}
+	settings.RecordingFolder = "recordings"
+	settings.ArchiveLayout = domain.ArchiveLayoutDateCamera
+	settings.UpdatedAtUtc = time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	if err := store.SetApplicationSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	persisted, err := store.GetApplicationSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.RecordingFolder != "recordings" || persisted.ArchiveLayout != domain.ArchiveLayoutDateCamera || !persisted.UpdatedAtUtc.Equal(settings.UpdatedAtUtc) {
+		t.Fatalf("unexpected persisted application settings: %#v", persisted)
+	}
+}
+
 func TestOpenMigratesRecordingPoliciesAndUnstartedQueue(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "recording-policy.db")

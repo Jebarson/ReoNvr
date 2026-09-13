@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -36,12 +35,17 @@ type DownloadService struct {
 	downloader  NativeDownloader
 	cipher      CredentialCipher
 	capacity    CapacityGuard
+	settings    ApplicationSettingsProvider
 	archiveRoot string
 	now         func() time.Time
 }
 
 func (service *DownloadService) SetCapacityGuard(capacity CapacityGuard) {
 	service.capacity = capacity
+}
+
+func (service *DownloadService) SetApplicationSettingsProvider(settings ApplicationSettingsProvider) {
+	service.settings = settings
 }
 
 func NewDownloadService(store DownloadStore, downloader NativeDownloader, cipher CredentialCipher, archiveRoot string) *DownloadService {
@@ -82,7 +86,11 @@ func (service *DownloadService) download(ctx context.Context, camera domain.Came
 			return err
 		}
 	}
-	relativePath, err := archiveRelativePath(camera.ID, recording.NativeName)
+	settings, err := loadApplicationSettings(ctx, service.settings)
+	if err != nil {
+		return err
+	}
+	relativePath, err := archiveRelativePath(camera, *recording, settings)
 	if err != nil {
 		return err
 	}
@@ -155,15 +163,6 @@ func (service *DownloadService) download(ctx context.Context, camera domain.Came
 		return err
 	}
 	return service.store.CompleteRecording(ctx, recording.ID, filepath.ToSlash(relativePath), digest, sizeBytes, service.now().UTC())
-}
-
-func archiveRelativePath(cameraID, nativeName string) (string, error) {
-	normalized := strings.ReplaceAll(strings.TrimSpace(nativeName), "\\", "/")
-	cleaned := path.Clean(normalized)
-	if cleaned == "." || path.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", errors.New("camera returned an unsafe recording name")
-	}
-	return filepath.Join(cameraID, filepath.FromSlash(cleaned)), nil
 }
 
 func verifyRecording(filePath string, expectedBytes int64) (int64, string, error) {

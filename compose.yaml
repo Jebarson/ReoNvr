@@ -42,7 +42,9 @@ services:
       - "8080:8080"
     volumes:
       - ./runtime/data:/data
-      - ./runtime/archive:/archive
+      - type: bind
+        source: ${REONVR_RECORDINGS_PATH:-./runtime/archive}
+        target: /archive
       - ./runtime/secrets:/run/secrets
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health/live"]

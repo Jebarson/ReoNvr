@@ -34,6 +34,20 @@ type fixtureRecordingControl struct {
 	state domain.RecordingControl
 }
 
+type fixtureApplicationSettings struct {
+	settings domain.ApplicationSettings
+}
+
+func (service *fixtureApplicationSettings) Get(context.Context) (domain.ApplicationSettings, error) {
+	return service.settings, nil
+}
+
+func (service *fixtureApplicationSettings) Update(_ context.Context, recordingFolder string, archiveLayout domain.ArchiveLayout) (domain.ApplicationSettings, error) {
+	service.settings.RecordingFolder = recordingFolder
+	service.settings.ArchiveLayout = archiveLayout
+	return service.settings, nil
+}
+
 func (control *fixtureRecordingControl) Get(context.Context) (domain.RecordingControl, error) {
 	return control.state, nil
 }
@@ -85,7 +99,7 @@ func TestCameraWriteResponsesNeverExposePassword(t *testing.T) {
 	const password = "camera-secret-value"
 	handler := New(
 		rejectingCameraService{err: errors.New("camera command failed: password " + password)},
-		nil, nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil, nil, nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	tests := []struct {
 		method string
@@ -119,7 +133,7 @@ func TestListEventsReturnsDurableEventMetadata(t *testing.T) {
 	handler := New(
 		rejectingCameraService{}, nil,
 		fixtureEventService{events: []domain.Event{{ID: "event-one", CameraID: "camera-one", EventType: domain.EventPerson, StartedAtUtc: started, CreatedAtUtc: started}}},
-		nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	request := httptest.NewRequest(http.MethodGet, "/api/cameras/camera-one/events", nil)
 	response := httptest.NewRecorder()
@@ -144,7 +158,7 @@ func TestRecordingMediaSupportsByteRangesAndOriginalDownload(t *testing.T) {
 		recording: domain.Recording{ID: "recording-one", LocalPath: "camera-one/clip.mkv", State: domain.RecordingComplete},
 		filePath:  file.Name(),
 	}
-	handler := New(rejectingCameraService{}, nil, nil, playback, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler := New(rejectingCameraService{}, nil, nil, playback, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rangeRequest := httptest.NewRequest(http.MethodGet, "/api/recordings/recording-one/media", nil)
 	rangeRequest.Header.Set("Range", "bytes=2-5")
@@ -172,18 +186,24 @@ func TestRecordingMediaDetectsExtensionlessMp4(t *testing.T) {
 		recording: domain.Recording{ID: "recording-one", LocalPath: "camera-one/0120260911194624", State: domain.RecordingComplete},
 		filePath:  filePath,
 	}
-	handler := New(rejectingCameraService{}, nil, nil, playback, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler := New(rejectingCameraService{}, nil, nil, playback, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	request := httptest.NewRequest(http.MethodGet, "/api/recordings/recording-one/media", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "video/mp4" {
 		t.Fatalf("unexpected extensionless MP4 response %d %q", response.Code, response.Header().Get("Content-Type"))
 	}
+	downloadRequest := httptest.NewRequest(http.MethodGet, "/api/recordings/recording-one/original", nil)
+	downloadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(downloadResponse, downloadRequest)
+	if disposition := downloadResponse.Header().Get("Content-Disposition"); !strings.Contains(disposition, `filename=0120260911194624.mp4`) {
+		t.Fatalf("unexpected extensionless MP4 download disposition %q", disposition)
+	}
 }
 
 func TestRecordingControlCanBeReadAndPaused(t *testing.T) {
 	control := &fixtureRecordingControl{state: domain.RecordingControl{Enabled: true, UpdatedAtUtc: time.Now().UTC()}}
-	handler := New(rejectingCameraService{}, nil, nil, nil, nil, control, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler := New(rejectingCameraService{}, nil, nil, nil, nil, control, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	getRequest := httptest.NewRequest(http.MethodGet, "/api/system/recording", nil)
 	getResponse := httptest.NewRecorder()
@@ -197,5 +217,26 @@ func TestRecordingControlCanBeReadAndPaused(t *testing.T) {
 	handler.ServeHTTP(putResponse, putRequest)
 	if putResponse.Code != http.StatusOK || !strings.Contains(putResponse.Body.String(), `"enabled":false`) || control.state.Enabled {
 		t.Fatalf("unexpected recording update response %d: %s", putResponse.Code, putResponse.Body.String())
+	}
+}
+
+func TestApplicationSettingsCanBeReadAndUpdated(t *testing.T) {
+	settings := &fixtureApplicationSettings{settings: domain.ApplicationSettings{
+		ArchiveRoot: "/archive", RecordingFolder: ".", ArchiveLayout: domain.ArchiveLayoutCameraDate,
+	}}
+	handler := New(rejectingCameraService{}, nil, nil, nil, nil, nil, settings, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	getRequest := httptest.NewRequest(http.MethodGet, "/api/system/settings", nil)
+	getResponse := httptest.NewRecorder()
+	handler.ServeHTTP(getResponse, getRequest)
+	if getResponse.Code != http.StatusOK || !strings.Contains(getResponse.Body.String(), `"archiveRoot":"/archive"`) {
+		t.Fatalf("unexpected application settings response %d: %s", getResponse.Code, getResponse.Body.String())
+	}
+
+	putRequest := httptest.NewRequest(http.MethodPut, "/api/system/settings", strings.NewReader(`{"recordingFolder":"recordings","archiveLayout":"DateCamera"}`))
+	putResponse := httptest.NewRecorder()
+	handler.ServeHTTP(putResponse, putRequest)
+	if putResponse.Code != http.StatusOK || settings.settings.RecordingFolder != "recordings" || settings.settings.ArchiveLayout != domain.ArchiveLayoutDateCamera {
+		t.Fatalf("unexpected application settings update %d: %s", putResponse.Code, putResponse.Body.String())
 	}
 }

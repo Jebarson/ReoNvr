@@ -79,6 +79,15 @@ export interface RecordingControl {
   updatedAtUtc: string
 }
 
+export type ArchiveLayout = 'CameraDate' | 'DateCamera' | 'Camera' | 'Date'
+
+export interface ApplicationSettings {
+  archiveRoot: string
+  recordingFolder: string
+  archiveLayout: ArchiveLayout
+  updatedAtUtc: string
+}
+
 interface ApiErrorBody {
   message?: string
 }
@@ -113,6 +122,14 @@ export function getRecordingControl() {
 
 export function updateRecordingControl(enabled: boolean) {
   return request<RecordingControl>('/api/system/recording', { method: 'PUT', body: JSON.stringify({ enabled }) })
+}
+
+export function getApplicationSettings() {
+  return request<ApplicationSettings>('/api/system/settings')
+}
+
+export function updateApplicationSettings(settings: Pick<ApplicationSettings, 'recordingFolder' | 'archiveLayout'>) {
+  return request<ApplicationSettings>('/api/system/settings', { method: 'PUT', body: JSON.stringify(settings) })
 }
 
 export function testCamera(camera: CameraDraft, cameraId?: string) {
