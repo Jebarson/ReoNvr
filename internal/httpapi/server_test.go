@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -15,14 +16,80 @@ import (
 
 	"reonavr/internal/camera"
 	"reonavr/internal/domain"
+	"reonavr/internal/reolink"
+
+	"reonavr/internal/testconfig"
 )
 
 type rejectingCameraService struct {
 	err error
 }
 
+type fixtureDiscoveryService struct {
+	rejectingCameraService
+	devices      []camera.DiscoveredCamera
+	discoveryErr error
+}
+
+func (service fixtureDiscoveryService) Discover(context.Context) ([]camera.DiscoveredCamera, error) {
+	return service.devices, service.discoveryErr
+}
+
+func TestCameraDiscoveryReturnsDevicesAndSafeFailures(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		err     error
+		devices []camera.DiscoveredCamera
+		status  int
+		body    string
+	}{
+		{name: "found", devices: []camera.DiscoveredCamera{{DiscoveredCamera: reolink.DiscoveredCamera{Host: testconfig.Host(2), Port: 9000, Name: "Front"}, Registered: true}}, status: http.StatusOK, body: `"registered":true`},
+		{name: "empty", status: http.StatusOK, body: `[]`},
+		{name: "busy", err: camera.ErrDiscoveryBusy, status: http.StatusConflict, body: `"code":"DiscoveryBusy"`},
+		{name: "unavailable", err: camera.ErrDiscoveryUnavailable, status: http.StatusNotImplemented, body: `"code":"NotAvailable"`},
+		{name: "failed", err: errors.New("private-diagnostic"), status: http.StatusBadGateway, body: `"code":"DiscoveryFailed"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := New(fixtureDiscoveryService{devices: test.devices, discoveryErr: test.err}, nil, nil, nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/cameras/discover", nil))
+			if response.Code != test.status || !strings.Contains(response.Body.String(), test.body) || strings.Contains(response.Body.String(), "private-diagnostic") {
+				t.Fatalf("unexpected discovery response: %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 type fixtureEventService struct {
 	events []domain.Event
+}
+
+type fixtureRecoveryService struct{ gaps []domain.RecoveryGap }
+
+func (service fixtureRecoveryService) ListRecordings(context.Context, string, int) ([]domain.Recording, error) {
+	return nil, nil
+}
+func (service fixtureRecoveryService) ListRecoveryGaps(context.Context, string, int) ([]domain.RecoveryGap, error) {
+	return service.gaps, nil
+}
+
+func TestRecoveryHistoryShowsPartialCoverageAndChecksCamera(t *testing.T) {
+	for _, missingCamera := range []bool{false, true} {
+		var cameraErr error
+		if missingCamera {
+			cameraErr = camera.ErrNotFound
+		}
+		handler := New(rejectingCameraService{err: cameraErr}, fixtureRecoveryService{gaps: []domain.RecoveryGap{{ID: "gap-one", Status: "Partial", MissingSeconds: 30}}}, nil, nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/cameras/camera-one/recovery", nil))
+		if missingCamera {
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("unexpected status: %d", response.Code)
+			}
+		} else if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"Partial"`) || !strings.Contains(response.Body.String(), `"missingSeconds":30`) {
+			t.Fatalf("unexpected recovery response: %d %s", response.Code, response.Body.String())
+		}
+	}
 }
 
 type fixturePlaybackService struct {
@@ -96,7 +163,7 @@ func (service rejectingCameraService) Delete(context.Context, string) error {
 }
 
 func TestCameraWriteResponsesNeverExposePassword(t *testing.T) {
-	const password = "camera-secret-value"
+	password := testconfig.Password()
 	handler := New(
 		rejectingCameraService{err: errors.New("camera command failed: password " + password)},
 		nil, nil, nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -111,7 +178,7 @@ func TestCameraWriteResponsesNeverExposePassword(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
-			request := httptest.NewRequest(test.method, test.path, strings.NewReader(`{"name":"Front","host":"10.0.0.152","port":9000,"channel":0,"username":"admin","password":"`+password+`","enabled":true}`))
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(testconfig.Expand("{\"name\":\"Front\",\"host\":\"{{host2}}\",\"port\":9000,\"channel\":0,\"username\":\"{{username}}\",\"password\":\"")+password+`","enabled":true}`))
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			body := response.Body.String()
@@ -123,6 +190,64 @@ func TestCameraWriteResponsesNeverExposePassword(t *testing.T) {
 			}
 			if !strings.Contains(body, "Baichuan port") {
 				t.Fatalf("response omitted port guidance: %s", body)
+			}
+		})
+	}
+}
+
+func TestCameraTestFailuresGiveSafeGuidance(test *testing.T) {
+	password := testconfig.Password()
+	const privateDiagnostic = "private-diagnostic"
+	for _, scenario := range []struct {
+		name    string
+		err     error
+		status  int
+		code    string
+		message string
+	}{
+		{
+			name: "invalid connection", err: errors.Join(errors.New(privateDiagnostic+password), reolink.ErrInvalidConnection),
+			status: http.StatusBadRequest, code: "InvalidCameraConnection", message: "private camera address",
+		},
+		{
+			name: "timezone mismatch", err: errors.Join(errors.New(privateDiagnostic+password), &reolink.TimezoneMismatchError{Configuration: reolink.TimezoneConfiguration{BaseOffsetSeconds: -28800, DstEnabled: true}}),
+			status: http.StatusUnprocessableEntity, code: "CameraTimezoneUnsupported", message: "No camera settings were changed",
+		},
+		{
+			name: "timeout", err: errors.New("camera command timed out: " + privateDiagnostic + password),
+			status: http.StatusGatewayTimeout, code: "CameraTestTimeout", message: "awake and reachable",
+		},
+		{
+			name: "unreadable clock", err: errors.New("camera returned malformed daylight-saving data: " + privateDiagnostic + password),
+			status: http.StatusBadGateway, code: "CameraClockUnavailable", message: "Review its time settings",
+		},
+		{
+			name: "connection", err: errors.New("camera command failed: " + privateDiagnostic + password),
+			status: http.StatusBadGateway, code: "CameraConnectionFailed", message: "Baichuan port",
+		},
+	} {
+		test.Run(scenario.name, func(test *testing.T) {
+			var logs strings.Builder
+			handler := New(rejectingCameraService{err: scenario.err}, nil, nil, nil, nil, nil, nil, nil, slog.New(slog.NewJSONHandler(&logs, nil)))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/cameras/test", strings.NewReader(testconfig.Expand("{\"host\":\"{{host1}}\",\"password\":\"")+password+`"}`)))
+			var payload struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				test.Fatal(err)
+			}
+			if response.Code != scenario.status || payload.Code != scenario.code || !strings.Contains(payload.Message, scenario.message) {
+				test.Fatalf("unexpected failure guidance: %d %s", response.Code, response.Body.String())
+			}
+			for _, output := range []string{response.Body.String(), logs.String()} {
+				if strings.Contains(output, password) || strings.Contains(output, privateDiagnostic) {
+					test.Fatal("response or logs exposed credentials or raw diagnostics")
+				}
+			}
+			if scenario.code == "CameraTimezoneUnsupported" && !strings.Contains(logs.String(), `"baseOffsetSeconds":-28800`) {
+				test.Fatal("timezone diagnostics omitted the safe parsed clock configuration")
 			}
 		})
 	}

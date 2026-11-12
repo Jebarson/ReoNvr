@@ -1,0 +1,240 @@
+package archive
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"reonavr/internal/domain"
+	"reonavr/internal/repository"
+)
+
+type rtspPublication struct {
+	Version     int                `json:"version"`
+	Recording   domain.Recording   `json:"recording"`
+	RawMetadata json.RawMessage    `json:"rawMetadata"`
+	Coverage    []domain.TimeRange `json:"coverage"`
+	BufferName  string             `json:"bufferName"`
+}
+
+func (service *RtspRecorderService) publishRtspRecording(ctx context.Context, segment RtspSegment, recording domain.Recording) error {
+	service.publicationMu.Lock()
+	defer service.publicationMu.Unlock()
+	root, err := os.OpenRoot(service.archiveRoot)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	source, err := filepath.Rel(service.archiveRoot, segment.Path)
+	if err != nil {
+		return err
+	}
+	if err := syncRtspPath(root, source); err != nil {
+		return err
+	}
+	journal := filepath.Join(filepath.Dir(source), "publication-"+recording.ID+".json")
+	pending := rtspPublication{Version: 1, Recording: recording, RawMetadata: recording.RawMetadata, Coverage: segment.Coverage, BufferName: filepath.Base(source)}
+	if err := writeRtspJSON(root, journal, pending); err != nil {
+		return err
+	}
+	return service.finishRtspPublication(ctx, root, journal, pending)
+}
+
+func (service *RtspRecorderService) recoverCameraPublications(ctx context.Context, cameraID string) error {
+	root, err := os.OpenRoot(service.archiveRoot)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	buffer, err := filepath.Rel(service.archiveRoot, filepath.Join(service.bufferRoot, cameraID))
+	if err != nil {
+		return err
+	}
+	directory, err := root.Open(buffer)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	entries, err := directory.ReadDir(-1)
+	directory.Close()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "publication-") && strings.HasSuffix(entry.Name(), ".json") {
+			if err := service.recoverRtspPublication(ctx, root, filepath.Join(buffer, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (service *RtspRecorderService) recoverRtspPublication(ctx context.Context, root *os.Root, journal string) error {
+	service.publicationMu.Lock()
+	defer service.publicationMu.Unlock()
+	file, err := root.Open(journal)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	var pending rtspPublication
+	decoder := json.NewDecoder(io.LimitReader(file, 1024*1024))
+	if err := decoder.Decode(&pending); err != nil {
+		return fmt.Errorf("read RTSP publication journal: %w", err)
+	}
+	return service.finishRtspPublication(ctx, root, journal, pending)
+}
+
+func (service *RtspRecorderService) finishRtspPublication(ctx context.Context, root *os.Root, journal string, pending rtspPublication) error {
+	recording := pending.Recording
+	recording.RawMetadata = pending.RawMetadata
+	buffer, err := filepath.Rel(service.archiveRoot, filepath.Join(service.bufferRoot, recording.CameraID))
+	if err != nil {
+		return err
+	}
+	digest, digestErr := hex.DecodeString(recording.Sha256)
+	if pending.Version != 1 || !safePathComponent(recording.CameraID) || !safePathComponent(recording.ID) ||
+		filepath.Dir(journal) != buffer || filepath.Base(journal) != "publication-"+recording.ID+".json" ||
+		pending.BufferName != filepath.Base(pending.BufferName) || strings.ContainsAny(pending.BufferName, "/\\") || !strings.HasSuffix(pending.BufferName, ".partial.mkv") ||
+		recording.Source != domain.RecordingSourceRtsp || recording.State != domain.RecordingComplete ||
+		!recording.StartAtUtc.Before(recording.EndAtUtc) || recording.SizeBytes <= 0 || digestErr != nil || len(digest) != sha256.Size ||
+		filepath.IsAbs(recording.LocalPath) || !pathWithin(service.archiveRoot, filepath.Join(service.archiveRoot, recording.LocalPath)) ||
+		pathWithin(service.bufferRoot, filepath.Join(service.archiveRoot, recording.LocalPath)) {
+		return errors.New("invalid RTSP publication journal")
+	}
+	existing, err := service.store.GetRecording(ctx, recording.ID)
+	indexed := err == nil
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	if indexed {
+		if existing.State == domain.RecordingDeleted || existing.State == domain.RecordingExpired {
+			return removeRtspJournal(root, journal)
+		}
+		if existing.State != domain.RecordingComplete || existing.CameraID != recording.CameraID || existing.Source != recording.Source ||
+			existing.Sha256 != recording.Sha256 || existing.LocalPath != recording.LocalPath {
+			return errors.New("RTSP publication conflicts with an indexed recording")
+		}
+	}
+	source := filepath.Join(buffer, pending.BufferName)
+	if _, err := root.Stat(recording.LocalPath); errors.Is(err, os.ErrNotExist) {
+		if err := verifyRtspPublicationFile(root, source, recording); err != nil {
+			return err
+		}
+		if err := root.MkdirAll(filepath.Dir(recording.LocalPath), 0o750); err != nil {
+			return err
+		}
+		if err := root.Rename(source, recording.LocalPath); err != nil {
+			return fmt.Errorf("publish RTSP segment: %w", err)
+		}
+		if err := syncRtspPath(root, filepath.Dir(recording.LocalPath)); err != nil {
+			return err
+		}
+		if err := syncRtspPath(root, buffer); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := verifyRtspPublicationFile(root, recording.LocalPath, recording); err != nil {
+		return err
+	}
+	if err := writeRtspJSON(root, recording.LocalPath+".json", recording); err != nil {
+		return err
+	}
+	if !indexed {
+		if err := service.store.SaveRtspRecording(ctx, recording); err != nil {
+			return err
+		}
+	}
+	if writer, ok := service.store.(coverageWriter); ok && len(pending.Coverage) > 0 {
+		if err := writer.SaveRecordingCoverage(ctx, recording.ID, pending.Coverage); err != nil {
+			return err
+		}
+	}
+	return removeRtspJournal(root, journal)
+}
+
+func verifyRtspPublicationFile(root *os.Root, path string, recording domain.Recording) error {
+	info, err := root.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != recording.SizeBytes {
+		return errors.New("RTSP publication media has invalid size or type")
+	}
+	file, err := root.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != recording.Sha256 {
+		return errors.New("RTSP publication media checksum mismatch")
+	}
+	return file.Sync()
+}
+
+func writeRtspJSON(root *os.Root, path string, value any) error {
+	payload, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	id, err := randomIdentifier()
+	if err != nil {
+		return err
+	}
+	temporary := filepath.Join(filepath.Dir(path), ".publication-"+id)
+	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err != nil {
+		return err
+	}
+	defer root.Remove(temporary)
+	if _, err := file.Write(append(payload, '\n')); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := root.Rename(temporary, path); err != nil {
+		return err
+	}
+	return syncRtspPath(root, filepath.Dir(path))
+}
+
+func syncRtspPath(root *os.Root, path string) error {
+	file, err := root.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
+}
+
+func removeRtspJournal(root *os.Root, journal string) error {
+	if err := root.Remove(journal); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncRtspPath(root, filepath.Dir(journal))
+}

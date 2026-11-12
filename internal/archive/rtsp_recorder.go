@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
 	"reonavr/internal/domain"
@@ -33,6 +33,7 @@ type RtspRecordingStore interface {
 	GetCredential(context.Context, string) (domain.EncryptedCredential, error)
 	ListEvents(context.Context, string, int) ([]domain.Event, error)
 	SaveRtspRecording(context.Context, domain.Recording) error
+	GetRecording(context.Context, string) (domain.Recording, error)
 }
 
 type RtspURLProvider interface {
@@ -43,6 +44,9 @@ type RtspSegment struct {
 	Path        string
 	StartOffset time.Duration
 	EndOffset   time.Duration
+	StartAtUtc  time.Time
+	EndAtUtc    time.Time
+	Coverage    []domain.TimeRange
 }
 
 type RtspSegmenter interface {
@@ -58,22 +62,24 @@ type bufferedRtspSegment struct {
 }
 
 type rtspEventBuffer struct {
-	segments    []bufferedRtspSegment
-	recording   bool
-	windowStart time.Time
-	windowEnd   time.Time
+	segments       []bufferedRtspSegment
+	recording      bool
+	windowStart    time.Time
+	windowEnd      time.Time
+	publishedUntil time.Time
 }
 
 type RtspRecorderService struct {
-	store       RtspRecordingStore
-	provider    RtspURLProvider
-	cipher      CredentialCipher
-	segmenter   RtspSegmenter
-	capacity    CapacityGuard
-	settings    ApplicationSettingsProvider
-	archiveRoot string
-	bufferRoot  string
-	now         func() time.Time
+	store         RtspRecordingStore
+	provider      RtspURLProvider
+	cipher        CredentialCipher
+	segmenter     RtspSegmenter
+	capacity      CapacityGuard
+	settings      ApplicationSettingsProvider
+	archiveRoot   string
+	bufferRoot    string
+	now           func() time.Time
+	publicationMu sync.Mutex
 }
 
 func (service *RtspRecorderService) SetCapacityGuard(capacity CapacityGuard) {
@@ -97,6 +103,7 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 	if archiveRoot == bufferRoot || !pathWithin(archiveRoot, bufferRoot) {
 		return errors.New("RTSP buffer must be a child of the archive root")
 	}
+	var publications, partials []string
 	err := filepath.WalkDir(bufferRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -104,14 +111,16 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".partial.mkv") {
+		if entry.IsDir() {
 			return nil
 		}
 		if !pathWithin(bufferRoot, path) {
 			return errors.New("RTSP recovery path escaped the configured buffer root")
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove abandoned RTSP fragment: %w", err)
+		if strings.HasPrefix(entry.Name(), "publication-") && strings.HasSuffix(entry.Name(), ".json") {
+			publications = append(publications, path)
+		} else if strings.HasSuffix(entry.Name(), ".partial.mkv") {
+			partials = append(partials, path)
 		}
 		return nil
 	})
@@ -120,6 +129,29 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 	}
 	if err != nil {
 		return fmt.Errorf("recover RTSP buffer: %w", err)
+	}
+	root, err := os.OpenRoot(archiveRoot)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	for _, path := range publications {
+		relative, err := filepath.Rel(archiveRoot, path)
+		if err != nil {
+			return err
+		}
+		if err := service.recoverRtspPublication(ctx, root, relative); err != nil {
+			return err
+		}
+	}
+	for _, path := range partials {
+		relative, err := filepath.Rel(archiveRoot, path)
+		if err != nil {
+			return err
+		}
+		if err := root.Remove(relative); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }
@@ -140,6 +172,9 @@ func (service *RtspRecorderService) Record(ctx context.Context, cameraID string)
 	}
 	if !safePathComponent(camera.ID) {
 		return errors.New("camera ID is not safe for an archive path")
+	}
+	if err := service.recoverCameraPublications(ctx, camera.ID); err != nil {
+		return err
 	}
 	credential, err := service.store.GetCredential(ctx, camera.ID)
 	if err != nil {
@@ -187,13 +222,44 @@ func (service *RtspRecorderService) Record(ctx context.Context, cameraID string)
 			publishContext, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 		}
+		if inspector, ok := service.segmenter.(MediaInspector); ok {
+			inspection, err := inspector.InspectVideo(publishContext, segment.Path)
+			if err != nil {
+				return err
+			}
+			if segment.EndOffset < time.Duration(946684800)*time.Second {
+				return errors.New("RTSP segment has no wall-clock timestamp")
+			}
+			segment.EndAtUtc = time.Unix(0, int64(segment.EndOffset)).UTC()
+			segment.StartAtUtc = segment.EndAtUtc.Add(-inspection.Duration)
+			if segment.StartOffset >= time.Duration(946684800)*time.Second {
+				segment.StartAtUtc = time.Unix(0, int64(segment.StartOffset)).UTC()
+			}
+			segment.Coverage = absoluteCoverage(inspection, segment.StartAtUtc, segment.EndAtUtc)
+			if writer, ok := service.store.(coverageWriter); ok {
+				if err := writer.SaveCaptureCoverage(publishContext, camera.ID, camera.ArchiveStream, segment.Coverage); err != nil {
+					return err
+				}
+			}
+		}
 		if camera.RecordingMode == domain.RecordingModeEvents {
 			return service.handleEventSegment(publishContext, camera, captureStartedAt, eventBuffer, segment, outputPattern)
 		}
 		return service.publishSegment(publishContext, camera, captureStartedAt, segment)
 	})
 	password = ""
+	if camera.RecordingMode == domain.RecordingModeEvents && eventBuffer.recording {
+		flushContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		flushErr := service.publishEventBuffer(flushContext, camera, captureStartedAt, eventBuffer, outputPattern)
+		cancel()
+		if flushErr != nil {
+			return errors.Join(err, flushErr)
+		}
+	}
 	if ctx.Err() != nil {
+		if err != nil && !errors.Is(err, ctx.Err()) {
+			return err
+		}
 		return nil
 	}
 	if err != nil {
@@ -207,6 +273,9 @@ func (service *RtspRecorderService) handleEventSegment(ctx context.Context, came
 		segment: segment,
 		startAt: captureStartedAt.Add(segment.StartOffset).UTC(),
 		endAt:   captureStartedAt.Add(segment.EndOffset).UTC(),
+	}
+	if !segment.StartAtUtc.IsZero() {
+		current.startAt, current.endAt = segment.StartAtUtc, segment.EndAtUtc
 	}
 	buffer.segments = append(buffer.segments, current)
 	events, err := service.store.ListEvents(ctx, camera.ID, 1000)
@@ -276,7 +345,30 @@ func (service *RtspRecorderService) handleEventSegment(ctx context.Context, came
 	if !buffer.recording {
 		return trimEventBuffer(buffer, current.endAt.Add(-time.Duration(camera.PreEventSeconds)*time.Second))
 	}
-	if open || current.endAt.Before(buffer.windowEnd) {
+	if open && current.endAt.After(buffer.windowEnd) {
+		buffer.windowEnd = current.endAt
+	}
+	unfinished := open || current.endAt.Before(buffer.windowEnd)
+	if unfinished && current.endAt.Sub(buffer.segments[0].startAt) < defaultRtspSegmentDuration {
+		return nil
+	}
+	windowEnd := buffer.windowEnd
+	if err := service.publishEventBuffer(ctx, camera, captureStartedAt, buffer, outputPattern); err != nil {
+		return err
+	}
+	if unfinished {
+		buffer.recording = true
+		buffer.windowStart, buffer.windowEnd = current.startAt, windowEnd
+	}
+	return nil
+}
+
+func (service *RtspRecorderService) publishEventBuffer(ctx context.Context, camera domain.Camera, captureStartedAt time.Time, buffer *rtspEventBuffer, outputPattern string) error {
+	if len(buffer.segments) == 0 {
+		return nil
+	}
+	current := buffer.segments[len(buffer.segments)-1]
+	if !current.endAt.After(buffer.publishedUntil) {
 		return nil
 	}
 	paths := make([]string, 0, len(buffer.segments))
@@ -314,11 +406,17 @@ func (service *RtspRecorderService) handleEventSegment(ctx context.Context, came
 	}
 	joined := RtspSegment{
 		Path: joinedPath, StartOffset: first.startAt.Sub(captureStartedAt),
-		EndOffset: last.endAt.Sub(captureStartedAt),
+		EndOffset: last.endAt.Sub(captureStartedAt), StartAtUtc: first.startAt, EndAtUtc: last.endAt,
+	}
+	for _, item := range buffer.segments {
+		if !item.endAt.Before(first.startAt) && !item.startAt.After(last.endAt) {
+			joined.Coverage = append(joined.Coverage, item.segment.Coverage...)
+		}
 	}
 	if err := service.publishSegment(ctx, camera, captureStartedAt, joined); err != nil {
 		return err
 	}
+	buffer.publishedUntil = last.endAt
 	for _, path := range paths {
 		if path != current.segment.Path {
 			_ = os.Remove(path)
@@ -347,10 +445,22 @@ func trimEventBuffer(buffer *rtspEventBuffer, retainAfter time.Time) error {
 }
 
 func removeRtspRunFiles(outputPattern string) {
+	protected := make(map[string]bool)
+	journals, _ := filepath.Glob(filepath.Join(filepath.Dir(outputPattern), "publication-*.json"))
+	for _, journal := range journals {
+		payload, err := os.ReadFile(journal)
+		var pending rtspPublication
+		if err != nil || json.Unmarshal(payload, &pending) != nil || pending.BufferName == "" {
+			return
+		}
+		protected[filepath.Join(filepath.Dir(journal), pending.BufferName)] = true
+	}
 	pattern := strings.Replace(outputPattern, "%06d", "*", 1)
 	paths, _ := filepath.Glob(pattern)
 	for _, path := range paths {
-		_ = os.Remove(path)
+		if !protected[path] {
+			_ = os.Remove(path)
+		}
 	}
 }
 
@@ -377,6 +487,9 @@ func (service *RtspRecorderService) publishSegment(ctx context.Context, camera d
 	}
 	startAt := captureStartedAt.Add(segment.StartOffset).UTC()
 	endAt := captureStartedAt.Add(segment.EndOffset).UTC()
+	if !segment.StartAtUtc.IsZero() {
+		startAt, endAt = segment.StartAtUtc, segment.EndAtUtc
+	}
 	eventTypes, err := service.eventTypesForRange(ctx, camera, startAt, endAt)
 	if err != nil {
 		return err
@@ -395,38 +508,6 @@ func (service *RtspRecorderService) publishSegment(ctx context.Context, camera d
 	if err != nil {
 		return err
 	}
-	finalPath := filepath.Join(service.archiveRoot, relativePath)
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0o750); err != nil {
-		return fmt.Errorf("create RTSP archive directory: %w", err)
-	}
-	if err := os.Rename(segment.Path, finalPath); err != nil {
-		if errors.Is(err, syscall.EXDEV) {
-			return errors.New("RTSP buffer and archive must be on the same filesystem")
-		}
-		return fmt.Errorf("publish RTSP segment: %w", err)
-	}
-	sidecar := struct {
-		CameraID   string                 `json:"cameraId"`
-		NativeName string                 `json:"nativeName"`
-		Source     domain.RecordingSource `json:"source"`
-		Codec      string                 `json:"codec"`
-		Stream     domain.ArchiveStream   `json:"stream"`
-		StartAtUtc time.Time              `json:"startAtUtc"`
-		EndAtUtc   time.Time              `json:"endAtUtc"`
-		SizeBytes  int64                  `json:"sizeBytes"`
-		EventTypes []domain.EventType     `json:"eventTypes"`
-		Sha256     string                 `json:"sha256"`
-	}{
-		CameraID: camera.ID, NativeName: nativeName, Source: domain.RecordingSourceRtsp,
-		Codec: codec, Stream: camera.ArchiveStream, StartAtUtc: startAt, EndAtUtc: endAt,
-		SizeBytes: sizeBytes, EventTypes: eventTypes, Sha256: digest,
-	}
-	if err := writeSidecar(finalPath+".json", sidecar); err != nil {
-		return err
-	}
-	if err := syncDirectory(filepath.Dir(finalPath)); err != nil {
-		return err
-	}
 	rawMetadata, err := json.Marshal(struct {
 		Capture             string  `json:"capture"`
 		SegmentStartSeconds float64 `json:"segmentStartSeconds"`
@@ -436,7 +517,7 @@ func (service *RtspRecorderService) publishSegment(ctx context.Context, camera d
 		return fmt.Errorf("encode RTSP recording metadata: %w", err)
 	}
 	completedAt := service.now().UTC()
-	return service.store.SaveRtspRecording(ctx, domain.Recording{
+	return service.publishRtspRecording(ctx, segment, domain.Recording{
 		ID: recordingID, CameraID: camera.ID, NativeName: nativeName,
 		Source: domain.RecordingSourceRtsp, Stream: camera.ArchiveStream, Codec: codec,
 		StartAtUtc: startAt, EndAtUtc: endAt, SizeBytes: sizeBytes,
@@ -625,14 +706,15 @@ func ffmpegCaptureSpec(streamURL, username, password string, segmentDuration tim
 	if strings.Contains(authenticatedURL, "'") || strings.ContainsAny(authenticatedURL, "\r\n") {
 		return nil, "", "", errors.New("RTSP URL cannot be represented safely")
 	}
-	input := "ffconcat version 1.0\nfile '" + authenticatedURL + "'\noption rtsp_transport tcp\noption timeout 15000000\n"
+	input := "ffconcat version 1.0\nfile '" + authenticatedURL + "'\noption rtsp_transport tcp\noption timeout 15000000\noption use_wallclock_as_timestamps 1\n"
 	arguments := []string{
 		"-nostdin", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
-		"-protocol_whitelist", "pipe,file,rtsp,tcp,udp", "-i", "pipe:0",
-		"-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-f", "segment",
+		"-protocol_whitelist", "pipe,file,rtsp,tcp,udp", "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
+		"-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-copyts", "-f", "segment",
 		"-segment_time", strconv.FormatFloat(segmentDuration.Seconds(), 'f', 3, 64),
+		"-segment_atclocktime", "1",
 		"-reset_timestamps", "1", "-segment_list", "pipe:1", "-segment_list_type", "csv",
-		"-segment_format", "matroska", "-n", outputPattern,
+		"-segment_format", "matroska", "-segment_format_options", "avoid_negative_ts=make_zero", "-n", outputPattern,
 	}
 	return arguments, input, authenticatedURL, nil
 }

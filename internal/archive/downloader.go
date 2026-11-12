@@ -36,12 +36,17 @@ type DownloadService struct {
 	cipher      CredentialCipher
 	capacity    CapacityGuard
 	settings    ApplicationSettingsProvider
+	inspector   MediaInspector
 	archiveRoot string
 	now         func() time.Time
 }
 
 func (service *DownloadService) SetCapacityGuard(capacity CapacityGuard) {
 	service.capacity = capacity
+}
+
+func (service *DownloadService) SetMediaInspector(inspector MediaInspector) {
+	service.inspector = inspector
 }
 
 func (service *DownloadService) SetApplicationSettingsProvider(settings ApplicationSettingsProvider) {
@@ -57,7 +62,7 @@ func (service *DownloadService) DownloadNext(ctx context.Context, cameraID strin
 	if err != nil {
 		return err
 	}
-	if !camera.Enabled || !camera.ArchiveEnabled || camera.RecordingSource != domain.RecordingSourceCameraStorage {
+	if !camera.Enabled || !camera.ArchiveEnabled || (camera.RecordingSource != domain.RecordingSourceCameraStorage && !camera.RecoveryEnabled) {
 		return nil
 	}
 	now := service.now().UTC()
@@ -126,6 +131,11 @@ func (service *DownloadService) download(ctx context.Context, camera domain.Came
 		if _, _, err := verifyRecording(partialPath, recording.SizeBytes); err != nil {
 			return err
 		}
+		if service.inspector != nil {
+			if _, err := service.inspector.InspectVideo(ctx, partialPath); err != nil {
+				return err
+			}
+		}
 		if err := os.Rename(partialPath, finalPath); err != nil {
 			return fmt.Errorf("publish recording: %w", err)
 		}
@@ -161,6 +171,17 @@ func (service *DownloadService) download(ctx context.Context, camera domain.Came
 	}
 	if err := syncDirectory(filepath.Dir(finalPath)); err != nil {
 		return err
+	}
+	if service.inspector != nil {
+		inspection, err := service.inspector.InspectVideo(ctx, finalPath)
+		if err != nil {
+			return err
+		}
+		if writer, ok := service.store.(coverageWriter); ok {
+			if err := writer.SaveRecordingCoverage(ctx, recording.ID, absoluteCoverage(inspection, recording.StartAtUtc, recording.EndAtUtc)); err != nil {
+				return err
+			}
+		}
 	}
 	return service.store.CompleteRecording(ctx, recording.ID, filepath.ToSlash(relativePath), digest, sizeBytes, service.now().UTC())
 }

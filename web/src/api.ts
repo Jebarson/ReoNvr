@@ -5,6 +5,7 @@ export type RecordingMode = 'Events' | 'Continuous'
 export type HistoricalImport = 'NewOnly' | 'Last24Hours' | 'Last48Hours' | 'Last7Days' | 'AllAvailable'
 
 export interface CameraCapabilities {
+  clockWarning?: string
   mainStream: string
   subStream: string
   mainBitrateKbps: number
@@ -13,6 +14,7 @@ export interface CameraCapabilities {
   postRecordSeconds: number
   storage: string
   storageAvailable: boolean
+  storagePlaybackAvailable: boolean
   rtspAvailable: boolean
   continuousAvailable: boolean
   supportedEventTypes: EventType[]
@@ -30,6 +32,10 @@ export interface Camera {
   archiveEnabled: boolean
   archiveStream: ArchiveStream
   recordingSource: RecordingSource
+  recoveryEnabled: boolean
+  recoveryStatus: string
+  recoveryPendingCount: number
+  recoveryMissingSeconds: number
   recordingMode: RecordingMode
   historicalImport: HistoricalImport
   preEventSeconds: number
@@ -58,11 +64,19 @@ export interface CameraDraft {
   archiveEnabled: boolean
   archiveStream: ArchiveStream
   recordingSource: RecordingSource
+  recoveryEnabled: boolean
   recordingMode: RecordingMode
   historicalImport: HistoricalImport
   preEventSeconds: number
   postEventSeconds: number
   eventTypes: EventType[]
+}
+
+export interface DiscoveredCamera {
+  host: string
+  port: number
+  name: string
+  registered: boolean
 }
 
 export interface CameraTestResult extends CameraCapabilities {
@@ -114,6 +128,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function listCameras() {
   return request<Camera[]>('/api/cameras')
+}
+
+export function discoverCameras(signal: AbortSignal) {
+  return request<DiscoveredCamera[]>('/api/cameras/discover', { method: 'POST', signal })
 }
 
 export function getRecordingControl() {
@@ -177,4 +195,20 @@ export function recordingMediaUrl(recordingId: string) {
 
 export function recordingOriginalUrl(recordingId: string) {
   return `/api/recordings/${encodeURIComponent(recordingId)}/original`
+}
+
+export interface RecoveryGap {
+  id: string
+  cameraId: string
+  stream: ArchiveStream
+  mode: RecordingMode
+  startAtUtc: string
+  endAtUtc: string
+  status: string
+  missingSeconds: number
+  lastCheckedAtUtc?: string
+}
+
+export function listRecoveryGaps(cameraId: string) {
+  return request<RecoveryGap[]>(`/api/cameras/${encodeURIComponent(cameraId)}/recovery`)
 }

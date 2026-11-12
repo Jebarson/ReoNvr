@@ -13,6 +13,8 @@ import (
 
 	"reonavr/internal/domain"
 	"reonavr/internal/reolink"
+
+	"reonavr/internal/testconfig"
 )
 
 type downloadStore struct {
@@ -69,8 +71,8 @@ func TestDownloadNextPublishesVerifiedNativeRecording(t *testing.T) {
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	payload := []byte("native-video")
 	store := &downloadStore{
-		camera:     domain.Camera{ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000, Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecordingSource: domain.RecordingSourceCameraStorage},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		camera:     domain.Camera{ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000, Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecordingSource: domain.RecordingSourceCameraStorage},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 		recording: &domain.Recording{
 			ID: "recording-one", CameraID: "camera-one", NativeName: "Mp4Record/2026/clip.mp4",
 			Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain,
@@ -93,11 +95,11 @@ func TestDownloadNextPublishesVerifiedNativeRecording(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(sidecar), "secret") || !strings.Contains(string(sidecar), `"source": "CameraStorage"`) {
+	if strings.Contains(string(sidecar), testconfig.Password()) || !strings.Contains(string(sidecar), `"source": "CameraStorage"`) {
 		t.Fatalf("unexpected sidecar: %s", sidecar)
 	}
 	expectedHash := fmt.Sprintf("%x", sha256.Sum256(payload))
-	if downloader.password != "secret" || store.completed.Sha256 != expectedHash || store.completed.LocalPath != "Front-cameraon/2026/09/11/clip.mp4" {
+	if downloader.password != testconfig.Password() || store.completed.Sha256 != expectedHash || store.completed.LocalPath != "Front-cameraon/2026/09/11/clip.mp4" {
 		t.Fatalf("unexpected completion: %#v", store.completed)
 	}
 	if len(store.states) != 1 || store.states[0] != domain.RecordingVerifying {

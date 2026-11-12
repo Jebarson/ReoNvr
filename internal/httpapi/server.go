@@ -17,6 +17,7 @@ import (
 	"reonavr/internal/camera"
 	"reonavr/internal/control"
 	"reonavr/internal/domain"
+	"reonavr/internal/reolink"
 )
 
 type CameraService interface {
@@ -80,6 +81,7 @@ func New(cameras CameraService, recordings RecordingService, events EventService
 	mux.HandleFunc("GET /api/system/settings", server.getApplicationSettings)
 	mux.HandleFunc("PUT /api/system/settings", server.updateApplicationSettings)
 	mux.HandleFunc("GET /api/cameras", server.listCameras)
+	mux.HandleFunc("POST /api/cameras/discover", server.discoverCameras)
 	mux.HandleFunc("POST /api/cameras/test", server.testNewCamera)
 	mux.HandleFunc("POST /api/cameras", server.createCamera)
 	mux.HandleFunc("GET /api/cameras/{id}", server.getCamera)
@@ -88,6 +90,7 @@ func New(cameras CameraService, recordings RecordingService, events EventService
 	mux.HandleFunc("POST /api/cameras/{id}/test", server.testExistingCamera)
 	mux.HandleFunc("GET /api/cameras/{id}/status", server.getCamera)
 	mux.HandleFunc("GET /api/cameras/{id}/recordings", server.listRecordings)
+	mux.HandleFunc("GET /api/cameras/{id}/recovery", server.listRecoveryGaps)
 	mux.HandleFunc("GET /api/cameras/{id}/events", server.listEvents)
 	mux.HandleFunc("GET /api/recordings/{id}", server.getRecording)
 	mux.HandleFunc("GET /api/recordings/{id}/media", server.serveRecording)
@@ -96,6 +99,34 @@ func New(cameras CameraService, recordings RecordingService, events EventService
 		mux.Handle("/", http.FileServer(http.FS(assets)))
 	}
 	return securityHeaders(mux)
+}
+
+func (server *Server) discoverCameras(writer http.ResponseWriter, request *http.Request) {
+	discoverer, ok := server.cameras.(interface {
+		Discover(context.Context) ([]camera.DiscoveredCamera, error)
+	})
+	if !ok {
+		writeError(writer, http.StatusNotImplemented, "NotAvailable", "Camera discovery is unavailable.")
+		return
+	}
+	devices, err := discoverer.Discover(request.Context())
+	if errors.Is(err, camera.ErrDiscoveryBusy) {
+		writer.Header().Set("Retry-After", "3")
+		writeError(writer, http.StatusConflict, "DiscoveryBusy", "Camera detection is already running. Try again shortly.")
+		return
+	}
+	if errors.Is(err, camera.ErrDiscoveryUnavailable) {
+		writeError(writer, http.StatusNotImplemented, "NotAvailable", "Camera discovery is unavailable.")
+		return
+	}
+	if err != nil {
+		writeError(writer, http.StatusBadGateway, "DiscoveryFailed", "Camera detection failed. Check local network access and try again.")
+		return
+	}
+	if devices == nil {
+		devices = []camera.DiscoveredCamera{}
+	}
+	writeJSON(writer, http.StatusOK, devices)
 }
 
 func (server *Server) getApplicationSettings(writer http.ResponseWriter, request *http.Request) {
@@ -109,6 +140,30 @@ func (server *Server) getApplicationSettings(writer http.ResponseWriter, request
 		return
 	}
 	writeJSON(writer, http.StatusOK, settings)
+}
+
+func (server *Server) listRecoveryGaps(writer http.ResponseWriter, request *http.Request) {
+	if _, err := server.cameras.Get(request.Context(), request.PathValue("id")); err != nil {
+		if errors.Is(err, camera.ErrNotFound) {
+			writeError(writer, http.StatusNotFound, "CameraNotFound", "Camera not found.")
+			return
+		}
+		server.internalError(writer, request, err)
+		return
+	}
+	reader, ok := server.recordings.(interface {
+		ListRecoveryGaps(context.Context, string, int) ([]domain.RecoveryGap, error)
+	})
+	if !ok {
+		writeError(writer, http.StatusNotImplemented, "NotAvailable", "Recovery history is unavailable.")
+		return
+	}
+	gaps, err := reader.ListRecoveryGaps(request.Context(), request.PathValue("id"), 100)
+	if err != nil {
+		server.internalError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, gaps)
 }
 
 func (server *Server) updateApplicationSettings(writer http.ResponseWriter, request *http.Request) {
@@ -397,15 +452,25 @@ func (server *Server) deleteCamera(writer http.ResponseWriter, request *http.Req
 }
 
 func (server *Server) serviceError(writer http.ResponseWriter, request *http.Request, err error) {
+	var timezoneFailure *reolink.TimezoneMismatchError
 	switch {
 	case errors.Is(err, camera.ErrInvalid):
 		writeError(writer, http.StatusBadRequest, "InvalidCamera", strings.TrimPrefix(err.Error(), camera.ErrInvalid.Error()+": "))
+	case errors.Is(err, reolink.ErrInvalidConnection):
+		writeError(writer, http.StatusBadRequest, "InvalidCameraConnection", "Use a private camera address, a valid Baichuan port, and a username. Masked password placeholders are not accepted.")
 	case errors.Is(err, camera.ErrRetest):
 		writeError(writer, http.StatusConflict, "ConnectionTestRequired", camera.ErrRetest.Error())
 	case errors.Is(err, camera.ErrNotFound):
 		writeError(writer, http.StatusNotFound, "CameraNotFound", camera.ErrNotFound.Error())
 	case strings.Contains(err.Error(), "UNIQUE constraint failed"):
 		writeError(writer, http.StatusConflict, "CameraConflict", "A camera with this name or host and channel is already registered.")
+	case errors.As(err, &timezoneFailure):
+		server.logger.Warn("camera timezone could not be matched", "method", request.Method, "path", request.URL.Path, "timezoneConfiguration", timezoneFailure.Configuration)
+		writeError(writer, http.StatusUnprocessableEntity, "CameraTimezoneUnsupported", "Connected to the camera, but its timezone and daylight-saving schedule cannot be matched safely. Review the camera's time settings in the Reolink app. No camera settings were changed.")
+	case strings.Contains(err.Error(), "camera command timed out"):
+		writeError(writer, http.StatusGatewayTimeout, "CameraTestTimeout", "The camera did not respond before the connection test timed out. Check that it is awake and reachable at this address and Baichuan port, then retry.")
+	case strings.Contains(err.Error(), "timezone") || strings.Contains(err.Error(), "daylight-saving"):
+		writeError(writer, http.StatusBadGateway, "CameraClockUnavailable", "The camera did not provide usable timezone or daylight-saving data. Review its time settings in the Reolink app and retry. No camera settings were changed.")
 	case strings.Contains(err.Error(), "camera command") || strings.Contains(err.Error(), "camera returned") || strings.Contains(err.Error(), "host ") || strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "port "):
 		writeError(writer, http.StatusBadGateway, "CameraConnectionFailed", "Unable to connect to the camera. Verify its address, Baichuan port, and credentials.")
 	default:

@@ -3,9 +3,12 @@ package archive
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -14,13 +17,182 @@ import (
 
 	"reonavr/internal/domain"
 	"reonavr/internal/reolink"
+	"reonavr/internal/repository"
+	"reonavr/internal/security"
+
+	"reonavr/internal/testconfig"
 )
 
+func TestMediaInspectionWithRealFFmpeg(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("FFmpeg is not installed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "discontinuous.mkv")
+	command := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+		"-frames:v", "15", "-vf", "setpts=PTS+5/TB*gte(N\\,5)", "-vsync", "0", "-c:v", "libx264", "-g", "5", "-an", path)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generate media: %v %s", err, output)
+	}
+	inspection, err := (&FFmpegSegmenter{}).InspectVideo(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.Coverage) != 2 || inspection.Duration < 7*time.Second {
+		t.Fatalf("real packet discontinuity not detected: %#v", inspection)
+	}
+	t.Logf("Detected %d verified ranges in %s of native media", len(inspection.Coverage), inspection.Duration)
+}
+
+func TestClockAlignedSegmentsUseRelativeMediaTime(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("FFmpeg is not installed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pattern := filepath.Join(t.TempDir(), "segment-%06d.mkv")
+	arguments, _, _, err := ffmpegCaptureSpec(testconfig.Expand("rtsp://{{host2}}:554/Preview_01_sub"), testconfig.Username(), testconfig.Password(), time.Minute, pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segmentIndex := slices.Index(arguments, "segment") - 1
+	fixtureArguments := []string{"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
+		"-frames:v", "15", "-vf", "setpts=PTS+1700000000/TB", "-c:v", "libx264", "-g", "5", "-an", "-copyts"}
+	command := exec.CommandContext(ctx, "ffmpeg", append(fixtureArguments, arguments[segmentIndex:]...)...)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generate clock-aligned fixture: %v %s", err, output)
+	}
+	output, err := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=start_time,duration", "-of", "json", fmt.Sprintf(pattern, 0)).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probe struct {
+		Format struct {
+			StartTime float64 `json:"start_time,string"`
+			Duration  float64 `json:"duration,string"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(output, &probe); err != nil {
+		t.Fatal(err)
+	}
+	if probe.Format.StartTime < 0 || probe.Format.StartTime > 1 || probe.Format.Duration < 2 || probe.Format.Duration > 4 {
+		t.Fatalf("native segment must use relative presentation time: %s", output)
+	}
+}
+
+func TestRtspLiveMediaIntegration(t *testing.T) {
+	source := os.Getenv("REONVR_INTEGRATION_DATABASE")
+	if source == "" {
+		t.Skip("explicit isolated camera integration database not configured")
+	}
+	databasePath := filepath.Join(t.TempDir(), "camera.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		input, err := os.Open(source + suffix)
+		if errors.Is(err, os.ErrNotExist) && suffix != "" {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		output, err := os.Create(databasePath + suffix)
+		if err != nil {
+			input.Close()
+			t.Fatal(err)
+		}
+		_, copyErr := io.Copy(output, input)
+		input.Close()
+		output.Close()
+		if copyErr != nil {
+			t.Fatal(copyErr)
+		}
+	}
+	ctx := context.Background()
+	store, err := repository.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	control, err := store.GetRecordingControl(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if control.Enabled {
+		t.Fatal("integration snapshot must have global recording paused")
+	}
+	cameras, err := store.ListCameras(ctx)
+	if err != nil || len(cameras) == 0 {
+		t.Fatalf("no integration camera: %v", err)
+	}
+	camera := cameras[0]
+	camera.Enabled, camera.ArchiveEnabled, camera.RecoveryEnabled = true, true, false
+	camera.RecordingSource, camera.RecordingMode = domain.RecordingSourceRtsp, domain.RecordingModeContinuous
+	if err := store.UpdateCamera(ctx, camera, nil, camera.EventTypes); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.LoadOrCreateCredentialCipher(os.Getenv("REONVR_INTEGRATION_KEY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := reolink.NewClient(&reolink.ExecRunner{Path: "/usr/local/bin/reolink-cli", GatewayAddr: "gateway:9000"}, 15*time.Second)
+	root := t.TempDir()
+	service := NewRtspRecorderService(store, client, cipher, &FFmpegSegmenter{}, root, filepath.Join(root, ".rtsp-buffer"))
+	started := time.Now().UTC()
+	captureContext, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := service.Record(captureContext, camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	recordings, err := store.ListArchivedRecordings(ctx, camera.ID, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, recording := range recordings {
+		if recording.Source != domain.RecordingSourceRtsp || recording.StartAtUtc.Before(started.Add(-2*time.Second)) {
+			continue
+		}
+		coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, domain.TimeRange{StartAtUtc: started.Add(-2 * time.Second), EndAtUtc: time.Now().UTC()}, false)
+		if err != nil || len(coverage) == 0 {
+			t.Fatalf("live media has no verified coverage: %v", err)
+		}
+		if recording.EndAtUtc.After(time.Now().Add(2*time.Second)) || recording.EndAtUtc.Sub(recording.StartAtUtc) > 20*time.Second {
+			t.Fatalf("invalid wall-clock alignment: %s to %s", recording.StartAtUtc, recording.EndAtUtc)
+		}
+		t.Logf("Published native %s stream copy with %s duration and verified UTC coverage", recording.Codec, recording.EndAtUtc.Sub(recording.StartAtUtc))
+		return
+	}
+	t.Fatal("bounded live capture did not publish native media")
+}
+
 type rtspRecordingStore struct {
-	camera     domain.Camera
-	credential domain.EncryptedCredential
-	events     []domain.Event
-	recording  domain.Recording
+	camera      domain.Camera
+	credential  domain.EncryptedCredential
+	events      []domain.Event
+	recording   domain.Recording
+	recordings  []domain.Recording
+	lookupErr   error
+	saveErr     error
+	coverageErr error
+	coverage    []domain.TimeRange
+}
+
+func TestVideoInspectionRejectsDiscontinuitiesAndWaitsForKeyframe(t *testing.T) {
+	payload := `{"packets":[
+		{"pts_time":"100.2","duration_time":"0.2","flags":"__"},
+		{"pts_time":"100.0","duration_time":"0.2","flags":"K_"},
+		{"pts_time":"105.0","duration_time":"0.2","flags":"__"},
+		{"pts_time":"106.0","duration_time":"0.2","flags":"K_"},
+		{"pts_time":"106.2","duration_time":"0.2","flags":"__"}]}`
+	inspection, err := inspectVideoPackets(strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.Coverage) != 2 || inspection.Coverage[0].EndAtUtc.Sub(inspection.Coverage[0].StartAtUtc) != 400*time.Millisecond || inspection.Coverage[1].StartAtUtc.UnixNano() != int64(6*time.Second) {
+		t.Fatalf("packet gap was claimed as covered: %#v", inspection)
+	}
+	if _, err := inspectVideoPackets(strings.NewReader(`{"packets":[{"pts_time":"NaN"}]}`)); err == nil {
+		t.Fatal("invalid timestamp was accepted")
+	}
 }
 
 func (store *rtspRecordingStore) GetCamera(context.Context, string) (domain.Camera, error) {
@@ -35,8 +207,36 @@ func (store *rtspRecordingStore) ListEvents(context.Context, string, int) ([]dom
 	return store.events, nil
 }
 
+func (store *rtspRecordingStore) GetRecording(_ context.Context, id string) (domain.Recording, error) {
+	if store.lookupErr != nil {
+		return domain.Recording{}, store.lookupErr
+	}
+	for _, recording := range store.recordings {
+		if recording.ID == id {
+			return recording, nil
+		}
+	}
+	return domain.Recording{}, repository.ErrNotFound
+}
+
 func (store *rtspRecordingStore) SaveRtspRecording(_ context.Context, recording domain.Recording) error {
+	if store.saveErr != nil {
+		return store.saveErr
+	}
 	store.recording = recording
+	store.recordings = append(store.recordings, recording)
+	return nil
+}
+
+func (store *rtspRecordingStore) SaveCaptureCoverage(context.Context, string, domain.ArchiveStream, []domain.TimeRange) error {
+	return nil
+}
+
+func (store *rtspRecordingStore) SaveRecordingCoverage(_ context.Context, _ string, coverage []domain.TimeRange) error {
+	if store.coverageErr != nil {
+		return store.coverageErr
+	}
+	store.coverage = append([]domain.TimeRange(nil), coverage...)
 	return nil
 }
 
@@ -46,15 +246,17 @@ type rtspURLProvider struct {
 
 func (provider *rtspURLProvider) RtspURL(_ context.Context, connection reolink.Connection, _ domain.ArchiveStream) (string, error) {
 	provider.password = connection.Password
-	return "rtsp://10.0.0.152:554/Preview_01_main", nil
+	return testconfig.Expand("rtsp://{{host2}}:554/Preview_01_main"), nil
 }
 
 type rtspSegmenter struct {
-	password string
-	payload  []byte
-	cancel   context.CancelFunc
-	segments []RtspSegment
-	duration time.Duration
+	password     string
+	payload      []byte
+	cancel       context.CancelFunc
+	segments     []RtspSegment
+	duration     time.Duration
+	captureErr   error
+	afterSegment func(int)
 }
 
 func (segmenter *rtspSegmenter) Capture(ctx context.Context, streamURL, _, password, outputPattern string, duration time.Duration, onSegment func(RtspSegment) error) error {
@@ -75,13 +277,22 @@ func (segmenter *rtspSegmenter) Capture(ctx context.Context, streamURL, _, passw
 		if err := onSegment(segment); err != nil {
 			return err
 		}
+		if segmenter.afterSegment != nil {
+			segmenter.afterSegment(index)
+		}
+	}
+	if segmenter.captureErr != nil {
+		return segmenter.captureErr
 	}
 	segmenter.cancel()
 	<-ctx.Done()
 	return ctx.Err()
 }
 
-func (segmenter *rtspSegmenter) Join(_ context.Context, inputPaths []string, outputPath string) error {
+func (segmenter *rtspSegmenter) Join(ctx context.Context, inputPaths []string, outputPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var joined []byte
 	for _, inputPath := range inputPaths {
 		payload, err := os.ReadFile(inputPath)
@@ -101,11 +312,11 @@ func TestRtspRecorderPublishesContinuousSegment(t *testing.T) {
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	store := &rtspRecordingStore{
 		camera: domain.Camera{
-			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Enabled: true, ArchiveEnabled: true,
+			ID: "camera-one", Host: testconfig.Host(2), Port: 9000, Enabled: true, ArchiveEnabled: true,
 			ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceRtsp,
 			RecordingMode: domain.RecordingModeContinuous, EventTypes: []domain.EventType{domain.EventPerson},
 		},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 		events: []domain.Event{{
 			ID: "event-one", CameraID: "camera-one", EventType: domain.EventPerson,
 			StartedAtUtc: now.Add(10 * time.Second), CreatedAtUtc: now.Add(10 * time.Second),
@@ -121,7 +332,7 @@ func TestRtspRecorderPublishesContinuousSegment(t *testing.T) {
 	if err := service.Record(ctx, store.camera.ID); err != nil {
 		t.Fatal(err)
 	}
-	if provider.password != "secret" || segmenter.password != "secret" {
+	if provider.password != testconfig.Password() || segmenter.password != testconfig.Password() {
 		t.Fatal("decrypted password did not reach the secure RTSP adapters")
 	}
 	if segmenter.duration != time.Minute {
@@ -142,7 +353,7 @@ func TestRtspRecorderPublishesContinuousSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	expectedHash := fmt.Sprintf("%x", sha256.Sum256(segmenter.payload))
-	if store.recording.Sha256 != expectedHash || strings.Contains(string(sidecar), "secret") || !strings.Contains(string(sidecar), `"source": "Rtsp"`) {
+	if store.recording.Sha256 != expectedHash || strings.Contains(string(sidecar), testconfig.Password()) || !strings.Contains(string(sidecar), `"source": "Rtsp"`) {
 		t.Fatalf("unexpected RTSP publication: %#v %s", store.recording, sidecar)
 	}
 }
@@ -152,12 +363,12 @@ func TestRtspRecorderFinalizesCoalescedEventWindow(t *testing.T) {
 	ended := now.Add(5 * time.Second)
 	store := &rtspRecordingStore{
 		camera: domain.Camera{
-			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Enabled: true, ArchiveEnabled: true,
+			ID: "camera-one", Host: testconfig.Host(2), Port: 9000, Enabled: true, ArchiveEnabled: true,
 			ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceRtsp,
 			RecordingMode: domain.RecordingModeEvents, PreEventSeconds: 2, PostEventSeconds: 2,
 			EventTypes: []domain.EventType{domain.EventPerson, domain.EventVehicle},
 		},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 		events: []domain.Event{
 			{ID: "person", CameraID: "camera-one", EventType: domain.EventPerson, StartedAtUtc: now.Add(3 * time.Second), EndedAtUtc: &ended, CreatedAtUtc: now},
 			{ID: "vehicle", CameraID: "camera-one", EventType: domain.EventVehicle, StartedAtUtc: now.Add(4 * time.Second), EndedAtUtc: &ended, CreatedAtUtc: now},
@@ -187,22 +398,99 @@ func TestRtspRecorderFinalizesCoalescedEventWindow(t *testing.T) {
 	}
 }
 
+func TestRtspRecorderFlushesInterruptedEvents(t *testing.T) {
+	for _, scenario := range []string{"open event pause", "post-roll pause", "stream failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+			store := &rtspRecordingStore{
+				camera: domain.Camera{ID: "camera-one", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
+					RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents,
+					PreEventSeconds: 2, PostEventSeconds: 10, EventTypes: []domain.EventType{domain.EventPerson}},
+				credential: domain.EncryptedCredential{KeyVersion: 1},
+				events:     []domain.Event{{EventType: domain.EventPerson, StartedAtUtc: now.Add(time.Second)}},
+			}
+			if scenario == "post-roll pause" {
+				ended := now.Add(3 * time.Second)
+				store.events[0].EndedAtUtc = &ended
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			segmenter := &rtspSegmenter{payload: []byte("native-fragment"), cancel: cancel,
+				segments: []RtspSegment{{EndOffset: 2 * time.Second}, {StartOffset: 2 * time.Second, EndOffset: 4 * time.Second}}}
+			if scenario == "stream failure" {
+				segmenter.captureErr = errors.New("stream disconnected")
+			}
+			root := t.TempDir()
+			service := NewRtspRecorderService(store, &rtspURLProvider{}, serviceCipher{}, segmenter, root, filepath.Join(root, ".rtsp-buffer"))
+			service.now = func() time.Time { return now }
+			err := service.Record(ctx, store.camera.ID)
+			if scenario == "stream failure" {
+				if !errors.Is(err, segmenter.captureErr) {
+					t.Fatalf("capture error lost: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if len(store.recordings) != 1 || !store.recording.StartAtUtc.Equal(now) || !store.recording.EndAtUtc.Equal(now.Add(4*time.Second)) {
+				t.Fatalf("interrupted event footage lost: %#v", store.recordings)
+			}
+			payload, err := os.ReadFile(filepath.Join(root, store.recording.LocalPath))
+			if err != nil || len(payload) != 2*len(segmenter.payload) {
+				t.Fatalf("native fragments not retained: %v", err)
+			}
+		})
+	}
+}
+
+func TestRtspRecorderCheckpointsOpenEvents(t *testing.T) {
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	store := &rtspRecordingStore{
+		camera: domain.Camera{ID: "camera-one", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
+			RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents, EventTypes: []domain.EventType{domain.EventPerson}},
+		credential: domain.EncryptedCredential{KeyVersion: 1},
+		events:     []domain.Event{{EventType: domain.EventPerson, StartedAtUtc: now}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	segmenter := &rtspSegmenter{payload: []byte("native-fragment"), cancel: cancel}
+	for index := range 35 {
+		segmenter.segments = append(segmenter.segments, RtspSegment{StartOffset: time.Duration(index*2) * time.Second, EndOffset: time.Duration((index+1)*2) * time.Second})
+	}
+	segmenter.afterSegment = func(index int) {
+		if index == 29 && len(store.recordings) != 1 {
+			t.Error("open event was not checkpointed before capture stopped")
+		}
+	}
+	root := t.TempDir()
+	service := NewRtspRecorderService(store, &rtspURLProvider{}, serviceCipher{}, segmenter, root, filepath.Join(root, ".rtsp-buffer"))
+	service.now = func() time.Time { return now }
+	if err := service.Record(ctx, store.camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.recordings) != 2 || !store.recording.EndAtUtc.Equal(now.Add(70*time.Second)) {
+		t.Fatalf("checkpoint or final tail missing: %#v", store.recordings)
+	}
+}
+
 func TestFFmpegCaptureSpecKeepsCredentialsOutOfArguments(t *testing.T) {
 	arguments, input, authenticatedURL, err := ffmpegCaptureSpec(
-		"rtsp://10.0.0.152:554/Preview_01_main", "camera-user", "s e/c:r@t", time.Minute, "/buffer/segment-%06d.partial.mkv",
+		testconfig.Expand("rtsp://{{host2}}:554/Preview_01_main"), testconfig.Username(), testconfig.SpecialPassword(), time.Minute, "/buffer/segment-%06d.partial.mkv",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(arguments, " ")
-	if strings.Contains(joined, "camera-user") || strings.Contains(joined, "s e/c:r@t") || strings.Contains(joined, authenticatedURL) {
+	if !strings.Contains(joined, "-segment_time 60.000 -segment_atclocktime 1") {
+		t.Fatal("wall-clock timestamps must use clock-aligned segmentation")
+	}
+	if strings.Contains(joined, testconfig.Username()) || strings.Contains(joined, testconfig.SpecialPassword()) || strings.Contains(joined, authenticatedURL) {
 		t.Fatalf("credentials leaked into FFmpeg arguments: %s", joined)
 	}
 	if !strings.Contains(input, authenticatedURL) || !strings.Contains(input, "option rtsp_transport tcp") {
 		t.Fatalf("authenticated RTSP input was not sent through stdin: %q", input)
 	}
-	message := safeFFmpegError("failed to open "+authenticatedURL+" for camera-user with s e/c:r@t", authenticatedURL, "camera-user", "s e/c:r@t")
-	if strings.Contains(message, "camera-user") || strings.Contains(message, "s e/c:r@t") || strings.Contains(message, authenticatedURL) {
+	message := safeFFmpegError("failed to open "+authenticatedURL+testconfig.Expand(" for {{username}} with {{specialPassword}}"), authenticatedURL, testconfig.Username(), testconfig.SpecialPassword())
+	if strings.Contains(message, testconfig.Username()) || strings.Contains(message, testconfig.SpecialPassword()) || strings.Contains(message, authenticatedURL) {
 		t.Fatalf("FFmpeg error leaked credentials: %q", message)
 	}
 }
@@ -242,6 +530,129 @@ func TestRtspRecoveryRemovesOnlyBufferedPartialFragments(t *testing.T) {
 	}
 	if _, err := os.Stat(keepPath); err != nil {
 		t.Fatalf("unrelated buffer file was removed: %v", err)
+	}
+}
+
+func TestRtspPublicationRecoversEveryCommitStage(t *testing.T) {
+	for _, stage := range []string{"before rename", "after rename", "after indexing", "worker retry", "retained tombstone"} {
+		t.Run(stage, func(t *testing.T) {
+			now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+			root := t.TempDir()
+			buffer := filepath.Join(root, ".rtsp-buffer", "camera-one")
+			if err := os.MkdirAll(buffer, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(buffer, "segment-run-000000.partial.mkv")
+			payload := []byte("native-video")
+			if err := os.WriteFile(path, payload, 0o640); err != nil {
+				t.Fatal(err)
+			}
+			store := &rtspRecordingStore{}
+			failure := errors.New("injected publication failure")
+			switch stage {
+			case "before rename":
+				store.lookupErr = failure
+			case "after rename", "worker retry":
+				store.saveErr = failure
+			default:
+				store.coverageErr = failure
+			}
+			camera := domain.Camera{ID: "camera-one", Name: "Front", ArchiveStream: domain.StreamMain}
+			service := NewRtspRecorderService(store, nil, nil, &rtspSegmenter{}, root, filepath.Dir(buffer))
+			segment := RtspSegment{Path: path, EndOffset: time.Minute, Coverage: []domain.TimeRange{{StartAtUtc: now, EndAtUtc: now.Add(time.Minute)}}}
+			if err := service.publishSegment(context.Background(), camera, now, segment); !errors.Is(err, failure) {
+				t.Fatalf("fault not injected: %v", err)
+			}
+			removeRtspRunFiles(filepath.Join(buffer, "segment-run-%06d.partial.mkv"))
+			if stage == "before rename" {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("journaled source removed: %v", err)
+				}
+			}
+			if stage == "retained tombstone" {
+				store.recordings[0].State = domain.RecordingDeleted
+				if err := os.Remove(filepath.Join(root, store.recording.LocalPath)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store.lookupErr, store.saveErr, store.coverageErr = nil, nil, nil
+			restarted := NewRtspRecorderService(store, nil, nil, &rtspSegmenter{}, root, filepath.Dir(buffer))
+			if stage == "worker retry" {
+				if err := restarted.recoverCameraPublications(context.Background(), camera.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := restarted.Recover(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.Recover(context.Background()); err != nil {
+				t.Fatalf("replay not idempotent: %v", err)
+			}
+			if len(store.recordings) != 1 {
+				t.Fatalf("publication lost or duplicated: %#v", store.recordings)
+			}
+			journals, _ := filepath.Glob(filepath.Join(buffer, "publication-*.json"))
+			if len(journals) != 0 {
+				t.Fatal("committed journal retained")
+			}
+			if stage == "retained tombstone" {
+				if _, err := os.Stat(filepath.Join(root, store.recording.LocalPath)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("retention tombstone resurrected")
+				}
+			} else {
+				actual, err := os.ReadFile(filepath.Join(root, store.recording.LocalPath))
+				if err != nil || string(actual) != string(payload) || len(store.coverage) != 1 {
+					t.Fatalf("native media or coverage lost: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRtspPublicationRejectsEscapedPathsAndCorruption(t *testing.T) {
+	for _, scenario := range []string{"escaped archive", "escaped buffer", "symlink", "checksum"} {
+		t.Run(scenario, func(t *testing.T) {
+			root, outside := t.TempDir(), t.TempDir()
+			buffer := filepath.Join(root, ".rtsp-buffer", "camera-one")
+			if err := os.MkdirAll(buffer, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			digest := sha256.Sum256([]byte("native-video"))
+			pending := rtspPublication{Version: 1, BufferName: "segment-run-000000.partial.mkv", Recording: domain.Recording{
+				ID: "recording-one", CameraID: "camera-one", Source: domain.RecordingSourceRtsp, State: domain.RecordingComplete,
+				StartAtUtc: now, EndAtUtc: now.Add(time.Minute), SizeBytes: 12, Sha256: fmt.Sprintf("%x", digest), LocalPath: "camera-one/video.mkv"}}
+			if err := os.WriteFile(filepath.Join(buffer, pending.BufferName), []byte("native-video"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			switch scenario {
+			case "escaped archive":
+				pending.Recording.LocalPath = "../outside.mkv"
+			case "escaped buffer":
+				pending.BufferName = "../outside.partial.mkv"
+			case "symlink":
+				if err := os.Symlink(outside, filepath.Join(root, "camera-one")); err != nil {
+					t.Fatal(err)
+				}
+			case "checksum":
+				pending.Recording.Sha256 = strings.Repeat("0", 64)
+			}
+			if err := writeSidecar(filepath.Join(buffer, "publication-recording-one.json"), pending); err != nil {
+				t.Fatal(err)
+			}
+			store := &rtspRecordingStore{}
+			service := NewRtspRecorderService(store, nil, nil, nil, root, filepath.Dir(buffer))
+			if err := service.Recover(context.Background()); err == nil {
+				t.Fatal("unsafe publication accepted")
+			}
+			if len(store.recordings) != 0 {
+				t.Fatal("unsafe media indexed")
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 0 {
+				t.Fatal("publication escaped archive root")
+			}
+		})
 	}
 }
 

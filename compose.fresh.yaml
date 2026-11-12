@@ -1,0 +1,72 @@
+name: reonvr-fresh
+
+services:
+  discovery-relay:
+    container_name: reonvr-fresh-discovery-relay
+    image: reonvr-discovery-relay:latest
+    build:
+      context: .
+      dockerfile: docker/discovery-relay.Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    environment:
+      REONVR_DISCOVERY_BROADCASTS: ${REONVR_DISCOVERY_BROADCASTS:-}
+
+  gateway:
+    container_name: reonvr-fresh-gateway
+    image: reonvr-fresh-gateway:snapshot
+    pull_policy: never
+    restart: unless-stopped
+    expose:
+      - "9000"
+    volumes:
+      - gateway:/var/lib/reolink
+    healthcheck:
+      test: ["CMD", "reolink-cli", "--gateway-addr", "127.0.0.1:9000", "gateway", "status"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  app:
+    container_name: reonvr-fresh-app
+    image: reonvr-fresh-app:snapshot
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      REONVR_ADDRESS: ":8080"
+      REONVR_DATABASE_PATH: /data/reonavr.db
+      REONVR_MASTER_KEY_FILE: /run/secrets/master.key
+      REONVR_CLI_PATH: /usr/local/bin/reolink-cli
+      REONVR_GATEWAY_ADDR: gateway:9000
+      REONVR_VALIDATION_GATEWAY_PATH: /usr/local/bin/reolink-gateway
+      REONVR_ARCHIVE_ROOT: /archive
+      REONVR_RTSP_BUFFER_ROOT: /archive/.rtsp-buffer
+    ports:
+      - "127.0.0.1:8081:8080"
+      - "3000:3000/udp"
+    volumes:
+      - data:/data
+      - archive:/archive
+      - secrets:/run/secrets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health/live"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  data:
+  archive:
+  secrets:
+  gateway:

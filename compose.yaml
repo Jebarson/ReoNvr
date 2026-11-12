@@ -1,6 +1,23 @@
 name: reonvr
 
 services:
+  discovery-relay:
+    container_name: reonvr-discovery-relay
+    image: reonvr-discovery-relay:latest
+    build:
+      context: .
+      dockerfile: docker/discovery-relay.Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    environment:
+      REONVR_DISCOVERY_BROADCASTS: ${REONVR_DISCOVERY_BROADCASTS:-}
+
   gateway:
     container_name: reonvr-gateway
     image: reonvr-gateway:latest
@@ -40,6 +57,7 @@ services:
       REONVR_RTSP_BUFFER_ROOT: /archive/.rtsp-buffer
     ports:
       - "8080:8080"
+      - "3000:3000/udp"
     volumes:
       - ./runtime/data:/data
       - type: bind

@@ -14,10 +14,11 @@ type Store interface {
 }
 
 type RecordingService struct {
-	store Store
-	now   func() time.Time
-	mu    sync.RWMutex
-	hook  func(bool)
+	store    Store
+	now      func() time.Time
+	mu       sync.RWMutex
+	updateMu sync.Mutex
+	hook     func(bool)
 }
 
 func NewRecordingService(store Store) *RecordingService {
@@ -35,6 +36,8 @@ func (service *RecordingService) Get(ctx context.Context) (domain.RecordingContr
 }
 
 func (service *RecordingService) Update(ctx context.Context, enabled bool) (domain.RecordingControl, error) {
+	service.updateMu.Lock()
+	defer service.updateMu.Unlock()
 	state := domain.RecordingControl{Enabled: enabled, UpdatedAtUtc: service.now().UTC()}
 	if err := service.store.SetRecordingControl(ctx, state.Enabled, state.UpdatedAtUtc); err != nil {
 		return domain.RecordingControl{}, err

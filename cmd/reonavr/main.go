@@ -73,12 +73,15 @@ func run(logger *slog.Logger) error {
 	downloadService := archive.NewDownloadService(store, sharedClient, credentialCipher, archiveRoot)
 	downloadService.SetApplicationSettingsProvider(store)
 	downloadService.SetCapacityGuard(retentionService)
+	mediaInspector := &archive.FFmpegSegmenter{
+		Path:      environment("REONVR_FFMPEG_PATH", "/usr/bin/ffmpeg"),
+		ProbePath: environment("REONVR_FFPROBE_PATH", "/usr/bin/ffprobe"),
+	}
+	downloadService.SetMediaInspector(mediaInspector)
+	recoveryService := archive.NewRecoveryService(store, sharedClient, credentialCipher)
 	rtspRecorderService := archive.NewRtspRecorderService(
 		store, sharedClient, credentialCipher,
-		&archive.FFmpegSegmenter{
-			Path:      environment("REONVR_FFMPEG_PATH", "/usr/bin/ffmpeg"),
-			ProbePath: environment("REONVR_FFPROBE_PATH", "/usr/bin/ffprobe"),
-		},
+		mediaInspector,
 		archiveRoot,
 		environment("REONVR_RTSP_BUFFER_ROOT", "/archive/.rtsp-buffer"),
 	)
@@ -97,6 +100,11 @@ func run(logger *slog.Logger) error {
 	}})
 	supervisor.Add(workers.Spec{Name: "HealthAggregationWorker", Interval: 30 * time.Second, Run: func(context.Context) error { return nil }})
 	manageCameraWorker := func(item domain.Camera) {
+		if err := store.SyncRecordingIntent(context.Background(), item, recordingEnabled.Load(), time.Now().UTC()); err != nil {
+			logger.Error("persist camera recording intent", "cameraId", item.ID, "error", err)
+			return
+		}
+		supervisor.Remove("RecoveryWorker", item.ID)
 		if !item.Enabled {
 			supervisor.Remove("CameraLifecycleWorker", item.ID)
 			supervisor.Remove("LiveEventWorker", item.ID)
@@ -123,11 +131,11 @@ func run(logger *slog.Logger) error {
 				Run: func(workerContext context.Context) error { return eventService.Watch(workerContext, item.ID) },
 			})
 		}
-		if item.ArchiveEnabled && item.RecordingSource == domain.RecordingSourceCameraStorage &&
+		if item.ArchiveEnabled && item.RecoveryEnabled &&
 			(item.RecordingMode == domain.RecordingModeContinuous || len(item.EventTypes) > 0) {
 			supervisor.Add(workers.Spec{
-				Name: "ReconciliationWorker", ScopeKey: item.ID, Interval: time.Hour,
-				Run: func(workerContext context.Context) error { return archiveService.Reconcile(workerContext, item.ID) },
+				Name: "RecoveryWorker", ScopeKey: item.ID, Interval: time.Minute,
+				Run: func(workerContext context.Context) error { return recoveryService.Reconcile(workerContext, item.ID) },
 			})
 			supervisor.Add(workers.Spec{
 				Name: "DownloadWorker", ScopeKey: item.ID, Interval: 5 * time.Second,
@@ -148,6 +156,10 @@ func run(logger *slog.Logger) error {
 		}
 	}
 	service.SetLifecycleHooks(manageCameraWorker, func(id string) {
+		if err := store.CloseRecordingIntents(context.Background(), id, time.Now().UTC()); err != nil {
+			logger.Error("close recording intent", "error", err)
+		}
+		supervisor.Remove("RecoveryWorker", id)
 		supervisor.Remove("CameraLifecycleWorker", id)
 		supervisor.Remove("LiveEventWorker", id)
 		supervisor.Remove("ReconciliationWorker", id)
@@ -157,10 +169,9 @@ func run(logger *slog.Logger) error {
 	applyRecordingControl := func(enabled bool) {
 		recordingEnabled.Store(enabled)
 		if !enabled {
-			supervisor.RemoveAll("EventFinalizationWorker", "LiveEventWorker", "ReconciliationWorker", "DownloadWorker", "RtspRecorderWorker")
+			supervisor.RemoveAll("RecoveryWorker", "EventFinalizationWorker", "LiveEventWorker", "ReconciliationWorker", "DownloadWorker", "RtspRecorderWorker")
 			return
 		}
-		supervisor.Add(workers.Spec{Name: "EventFinalizationWorker", Interval: 5 * time.Second, Run: eventService.FinalizeNext})
 		items, listErr := service.List(context.Background())
 		if listErr != nil {
 			logger.Error("restore camera recording workers", "error", listErr)
@@ -177,9 +188,6 @@ func run(logger *slog.Logger) error {
 	}
 	for _, item := range registered {
 		manageCameraWorker(item)
-	}
-	if recordingEnabled.Load() {
-		supervisor.Add(workers.Spec{Name: "EventFinalizationWorker", Interval: 5 * time.Second, Run: eventService.FinalizeNext})
 	}
 	assets, err := webui.Files()
 	if err != nil {

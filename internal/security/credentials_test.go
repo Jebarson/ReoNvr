@@ -3,6 +3,8 @@ package security
 import (
 	"bytes"
 	"testing"
+
+	"reonavr/internal/testconfig"
 )
 
 func TestCredentialCipherRoundTrip(t *testing.T) {
@@ -11,7 +13,7 @@ func TestCredentialCipherRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ciphertext, nonce, err := cipher.Encrypt("camera-one", "not-logged")
+	ciphertext, nonce, err := cipher.Encrypt("camera-one", testconfig.Password())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -19,7 +21,7 @@ func TestCredentialCipherRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plaintext != "not-logged" {
+	if plaintext != testconfig.Password() {
 		t.Fatalf("unexpected plaintext %q", plaintext)
 	}
 }
@@ -30,11 +32,11 @@ func TestCredentialCipherUsesUniqueNonce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, firstNonce, err := cipher.Encrypt("camera-one", "same-password")
+	first, firstNonce, err := cipher.Encrypt("camera-one", testconfig.Password())
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, secondNonce, err := cipher.Encrypt("camera-one", "same-password")
+	second, secondNonce, err := cipher.Encrypt("camera-one", testconfig.Password())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +51,7 @@ func TestCredentialCipherBindsCameraID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ciphertext, nonce, err := cipher.Encrypt("camera-one", "password")
+	ciphertext, nonce, err := cipher.Encrypt("camera-one", testconfig.Password())
 	if err != nil {
 		t.Fatal(err)
 	}

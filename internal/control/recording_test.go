@@ -59,3 +59,51 @@ func TestRecordingControlDoesNotNotifyWhenPersistenceFails(t *testing.T) {
 		t.Fatal("lifecycle hook ran after a failed update")
 	}
 }
+
+type blockingRecordingStore struct {
+	recordingStore
+	resumePersisted chan struct{}
+	releaseResume   chan struct{}
+	pausePersisted  chan struct{}
+}
+
+func (store *blockingRecordingStore) SetRecordingControl(ctx context.Context, enabled bool, now time.Time) error {
+	if err := store.recordingStore.SetRecordingControl(ctx, enabled, now); err != nil {
+		return err
+	}
+	if enabled {
+		close(store.resumePersisted)
+		<-store.releaseResume
+	} else {
+		close(store.pausePersisted)
+	}
+	return nil
+}
+
+func TestRecordingControlSerializesPersistenceAndLifecycle(t *testing.T) {
+	store := &blockingRecordingStore{
+		resumePersisted: make(chan struct{}), releaseResume: make(chan struct{}), pausePersisted: make(chan struct{}),
+	}
+	service := NewRecordingService(store)
+	lifecycle := make(chan bool, 2)
+	service.SetLifecycleHook(func(enabled bool) { lifecycle <- enabled })
+	results := make(chan error, 2)
+	go func() { _, err := service.Update(context.Background(), true); results <- err }()
+	<-store.resumePersisted
+	go func() { _, err := service.Update(context.Background(), false); results <- err }()
+	premature := false
+	select {
+	case <-store.pausePersisted:
+		premature = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(store.releaseResume)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if premature || !<-lifecycle || <-lifecycle || store.state.Enabled {
+		t.Fatal("concurrent pause overtook an unfinished resume or left lifecycle enabled")
+	}
+}

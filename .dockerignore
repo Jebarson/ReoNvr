@@ -4,6 +4,10 @@ runtime
 **/runtime
 **/backups
 .playwright-mcp
+test-results
+playwright-report
+**/test-config.json
+**/*.test-config.json
 node_modules
 web/node_modules
 web/dist
