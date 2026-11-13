@@ -43,6 +43,19 @@ func TestMediaInspectionWithRealFFmpeg(t *testing.T) {
 		t.Fatalf("real packet discontinuity not detected: %#v", inspection)
 	}
 	t.Logf("Detected %d verified ranges in %s of native media", len(inspection.Coverage), inspection.Duration)
+	invalidPath := filepath.Join(t.TempDir(), "invalid.mp4")
+	if err := os.WriteFile(invalidPath, []byte("not a video"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&FFmpegSegmenter{}).InspectVideo(ctx, invalidPath); !errors.Is(err, ErrInvalidMedia) {
+		t.Fatalf("corrupt native media was not classified as invalid: %v", err)
+	}
+	if _, err := (&FFmpegSegmenter{}).InspectVideo(ctx, invalidPath+"-missing"); err == nil || errors.Is(err, ErrInvalidMedia) {
+		t.Fatalf("missing-file probe failure was incorrectly terminal: %v", err)
+	}
+	if _, err := (&FFmpegSegmenter{ProbePath: filepath.Join(t.TempDir(), "missing-probe")}).InspectVideo(ctx, path); err == nil || errors.Is(err, ErrInvalidMedia) {
+		t.Fatalf("unavailable probe was incorrectly terminal: %v", err)
+	}
 }
 
 func TestClockAlignedSegmentsUseRelativeMediaTime(t *testing.T) {
@@ -175,6 +188,18 @@ type rtspRecordingStore struct {
 	coverageErr error
 	coverage    []domain.TimeRange
 	issues      []domain.OperationalIssue
+	resolutions map[string]int
+}
+
+func (store *rtspRecordingStore) ResolveIssue(_ context.Context, source, cameraID, code string, _ time.Time) error {
+	if source != "RtspPublication" || code != "PublicationReplayFailed" {
+		return errors.New("unexpected publication issue scope")
+	}
+	if store.resolutions == nil {
+		store.resolutions = make(map[string]int)
+	}
+	store.resolutions[cameraID]++
+	return nil
 }
 
 func (store *rtspRecordingStore) ReportIssue(_ context.Context, issue domain.OperationalIssue) error {
@@ -569,6 +594,92 @@ func TestRtspRecoveryRemovesOnlyBufferedPartialFragments(t *testing.T) {
 	}
 }
 
+type changingJoinSegmenter struct {
+	rtspSegmenter
+	joins int
+}
+
+func (segmenter *changingJoinSegmenter) Join(ctx context.Context, paths []string, output string) error {
+	segmenter.joins++
+	if err := segmenter.rtspSegmenter.Join(ctx, paths, output); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(output, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, writeErr := fmt.Fprintf(file, "join-%d", segmenter.joins)
+	return errors.Join(writeErr, file.Close())
+}
+
+func TestRtspEventPublicationRetryReplaysWithoutRemux(t *testing.T) {
+	for _, stage := range []string{"index", "coverage"} {
+		t.Run(stage, func(t *testing.T) {
+			root := t.TempDir()
+			bufferRoot := filepath.Join(root, ".rtsp-buffer")
+			camera := domain.Camera{ID: "camera-one", Name: "Front", Timezone: "UTC", ArchiveStream: domain.StreamMain}
+			directory := filepath.Join(bufferRoot, camera.ID)
+			if err := os.MkdirAll(directory, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			start := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+			buffer := &rtspEventBuffer{recording: true, windowStart: start, windowEnd: start.Add(8 * time.Second)}
+			for index := range 2 {
+				path := filepath.Join(directory, fmt.Sprintf("run-%06d.partial.mkv", index))
+				if err := os.WriteFile(path, []byte("native-fragment"), 0o640); err != nil {
+					t.Fatal(err)
+				}
+				from, to := start.Add(time.Duration(index)*4*time.Second), start.Add(time.Duration(index+1)*4*time.Second)
+				buffer.segments = append(buffer.segments, bufferedRtspSegment{startAt: from, endAt: to,
+					segment: RtspSegment{Path: path, Coverage: []domain.TimeRange{{StartAtUtc: from, EndAtUtc: to}}}})
+			}
+			store := &rtspRecordingStore{}
+			if stage == "index" {
+				store.saveErr = errors.New("index unavailable")
+			} else {
+				store.coverageErr = errors.New("coverage unavailable")
+			}
+			segmenter := &changingJoinSegmenter{}
+			service := NewRtspRecorderService(store, nil, nil, segmenter, root, bufferRoot)
+			pattern := filepath.Join(directory, "run-%06d.partial.mkv")
+			if err := service.publishEventBuffer(context.Background(), camera, start, buffer, pattern); err == nil {
+				t.Fatal("fault injection did not interrupt publication")
+			}
+			journals, _ := filepath.Glob(filepath.Join(directory, "publication-*.json"))
+			if len(journals) != 1 {
+				t.Fatal("failed publication did not retain its journal")
+			}
+			original, err := os.ReadFile(journals[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.publishEventBuffer(context.Background(), camera, start, buffer, pattern); err == nil {
+				t.Fatal("retry unexpectedly bypassed the persistent fault")
+			}
+			unchanged, err := os.ReadFile(journals[0])
+			if err != nil || string(unchanged) != string(original) || segmenter.joins != 1 {
+				t.Fatal("retry remuxed or replaced the original journal")
+			}
+			store.saveErr, store.coverageErr = nil, nil
+			staleBuffer := *buffer
+			staleBuffer.segments = append([]bufferedRtspSegment(nil), buffer.segments...)
+			if err := service.publishEventBuffer(context.Background(), camera, start, buffer, pattern); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.publishEventBuffer(context.Background(), camera, start, &staleBuffer, pattern); err != nil {
+				t.Fatalf("flush after another replay completed was not idempotent: %v", err)
+			}
+			if segmenter.joins != 1 || len(store.recordings) != 1 || len(store.coverage) == 0 || buffer.recording {
+				t.Fatal("event publication was not recovered exactly once")
+			}
+			published, err := os.ReadFile(filepath.Join(root, store.recording.LocalPath))
+			if err != nil || !strings.HasSuffix(string(published), "join-1") {
+				t.Fatal("replay did not preserve the first remux bytes")
+			}
+		})
+	}
+}
+
 func TestRtspPublicationRecoversEveryCommitStage(t *testing.T) {
 	for _, stage := range []string{"before rename", "after rename", "after indexing", "worker retry", "retained tombstone", "alongside corrupt journal"} {
 		t.Run(stage, func(t *testing.T) {
@@ -658,6 +769,49 @@ func TestRtspPublicationRecoversEveryCommitStage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRtspPublicationIssuesResolveOnlyAfterCameraPassHasNoFailures(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	bufferRoot := filepath.Join(root, ".rtsp-buffer")
+	for _, id := range []string{"camera-one", "camera-two"} {
+		if err := os.MkdirAll(filepath.Join(bufferRoot, id), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bufferRoot, id, "publication-corrupt.json"), []byte("invalid"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(bufferRoot, "camera-one", "run-000000.partial.mkv")
+	if err := os.WriteFile(path, []byte("native-video"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	store := &rtspRecordingStore{saveErr: errors.New("index unavailable")}
+	service := NewRtspRecorderService(store, nil, nil, &rtspSegmenter{}, root, bufferRoot)
+	camera := domain.Camera{ID: "camera-one", Name: "Front", ArchiveStream: domain.StreamMain}
+	if err := service.publishSegment(ctx, camera, time.Now().UTC(), RtspSegment{Path: path, EndOffset: time.Minute}); err == nil {
+		t.Fatal("index failure was not injected")
+	}
+	if err := service.Recover(ctx); err != nil || len(store.resolutions) != 0 {
+		t.Fatal("failed journals were not isolated or their issue was cleared")
+	}
+	store.saveErr = nil
+	if err := service.recoverCameraPublications(ctx, camera.ID); err != nil || len(store.recordings) != 1 || len(store.resolutions) != 0 {
+		t.Fatal("one successful journal cleared another outstanding failure")
+	}
+	if err := os.Remove(filepath.Join(bufferRoot, camera.ID, "publication-corrupt.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.recoverCameraPublications(ctx, camera.ID); err != nil || store.resolutions[camera.ID] != 1 || store.resolutions["camera-two"] != 0 {
+		t.Fatal("successful camera pass did not resolve only that camera's issue")
+	}
+	if err := os.Remove(filepath.Join(bufferRoot, "camera-two", "publication-corrupt.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Recover(ctx); err != nil || store.resolutions["camera-two"] == 0 {
+		t.Fatal("startup did not resolve an issue after all its journals were cleared")
 	}
 }
 

@@ -3,7 +3,9 @@ package archive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,8 +199,9 @@ func (inspection recoveryInspection) InspectVideo(context.Context, string) (Vide
 }
 
 func TestRecoveryDownloadsOnlyMissingStreamAndKeepsPartialGaps(t *testing.T) {
-	for _, partial := range []bool{false, true} {
-		t.Run(map[bool]string{false: "complete", true: "partial"}[partial], func(t *testing.T) {
+	for _, scenario := range []string{"complete", "partial", "invalid newest clip"} {
+		t.Run(scenario, func(t *testing.T) {
+			partial := scenario == "partial"
 			ctx := context.Background()
 			store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "recovery.db"))
 			if err != nil {
@@ -233,13 +236,22 @@ func TestRecoveryDownloadsOnlyMissingStreamAndKeepsPartialGaps(t *testing.T) {
 				{NativeName: "wrong-stream.mp4", Stream: domain.StreamSub, StartAtUtc: start, EndAtUtc: start.Add(5 * time.Minute)},
 				{NativeName: "older.mp4", Stream: domain.StreamMain, StartAtUtc: start.Add(-time.Hour), EndAtUtc: start.Add(-time.Minute)},
 			}}
+			if scenario == "invalid newest clip" {
+				searcher.items = append(searcher.items, reolink.Recording{NativeName: "invalid.mp4", Stream: domain.StreamMain,
+					StartAtUtc: start.Add(time.Minute), EndAtUtc: start.Add(4 * time.Minute), SizeBytes: 4})
+			}
 			service := NewRecoveryService(store, searcher, serviceCipher{})
-			service.now = func() time.Time { return start.Add(20 * time.Minute) }
+			recoveryNow := start.Add(20 * time.Minute)
+			service.now = func() time.Time { return recoveryNow }
 			if err := service.Reconcile(ctx, camera.ID); err != nil {
 				t.Fatal(err)
 			}
 			recordings, err := store.ListRecordings(ctx, camera.ID, 100)
-			if err != nil || len(recordings) != 3 {
+			wantRecordings := 3
+			if scenario == "invalid newest clip" {
+				wantRecordings = 4
+			}
+			if err != nil || len(recordings) != wantRecordings {
 				t.Fatalf("unrelated recordings queued: %#v %v", recordings, err)
 			}
 			duration := 210 * time.Second
@@ -247,7 +259,29 @@ func TestRecoveryDownloadsOnlyMissingStreamAndKeepsPartialGaps(t *testing.T) {
 				duration = time.Minute
 			}
 			downloader := NewDownloadService(store, &fileDownloader{payload: []byte("native-video")}, serviceCipher{}, t.TempDir())
-			downloader.SetMediaInspector(recoveryInspection{duration: duration})
+			downloader.SetMediaInspector(mediaInspectorFunc(func(ctx context.Context, path string) (VideoInspection, error) {
+				if strings.Contains(filepath.Base(path), "invalid.mp4") {
+					return VideoInspection{}, ErrInvalidMedia
+				}
+				return (recoveryInspection{duration: duration}).InspectVideo(ctx, path)
+			}))
+			if scenario == "invalid newest clip" {
+				if err := downloader.DownloadNext(ctx, camera.ID); !errors.Is(err, ErrInvalidMedia) {
+					t.Fatalf("newest invalid clip was not rejected: %v", err)
+				}
+				invalidID := recordingID(camera.ID, "invalid.mp4")
+				invalid, err := store.GetRecording(ctx, invalidID)
+				if err != nil || invalid.State != domain.RecordingFailed {
+					t.Fatalf("invalid clip did not become terminal: %v", err)
+				}
+				if final, err := store.RecoveryRecordingFinal(ctx, invalidID); err != nil || !final {
+					t.Fatalf("recovery would requeue invalid clip: %v", err)
+				}
+				recoveryNow = recoveryNow.Add(time.Second)
+				if err := service.Reconcile(ctx, camera.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := downloader.DownloadNext(ctx, camera.ID); err != nil {
 				t.Fatal(err)
 			}
@@ -276,7 +310,7 @@ func TestRecoveryDownloadsOnlyMissingStreamAndKeepsPartialGaps(t *testing.T) {
 }
 
 func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
-	for _, scenario := range []string{"quiet", "outage", "unpublished selected event", "overlapping selected events", "unselected event"} {
+	for _, scenario := range []string{"quiet", "outage", "unpublished selected event", "overlapping selected events", "unselected event", "disappeared queued native clip"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "events.db"))
@@ -324,10 +358,21 @@ func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
 					}
 				}
 			}
-			service := NewRecoveryService(store, &serviceSearcher{}, serviceCipher{})
+			searcher := &serviceSearcher{}
+			if scenario == "disappeared queued native clip" {
+				searcher.items = []reolink.Recording{{NativeName: "selected-native.mp4", Stream: domain.StreamMain,
+					StartAtUtc: start.Add(5 * time.Second), EndAtUtc: start.Add(15 * time.Second), EventTypes: []domain.EventType{domain.EventPerson}}}
+			}
+			service := NewRecoveryService(store, searcher, serviceCipher{})
 			service.now = func() time.Time { return start.Add(time.Hour) }
 			if err := service.Reconcile(ctx, camera.ID); err != nil {
 				t.Fatal(err)
+			}
+			if scenario == "disappeared queued native clip" {
+				searcher.items = nil
+				if err := service.Reconcile(ctx, camera.ID); err != nil {
+					t.Fatal(err)
+				}
 			}
 			gaps, err := store.ListRecoveryGaps(ctx, camera.ID, 100)
 			if err != nil {
@@ -344,6 +389,15 @@ func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
 			}
 			if scenario == "overlapping selected events" && (len(gaps) != 1 || gaps[0].MissingSeconds != 25) {
 				t.Fatalf("overlapping pre/post windows were counted twice: %#v", gaps)
+			}
+			if scenario == "disappeared queued native clip" {
+				if len(gaps) != 1 || gaps[0].MissingSeconds != 10 {
+					t.Fatalf("empty later search erased known missing native footage: %#v", gaps)
+				}
+				claimed, err := store.ClaimNextDownload(ctx, camera.ID, start.Add(time.Hour))
+				if err != nil || claimed == nil || claimed.NativeName != "selected-native.mp4" {
+					t.Fatalf("linked native recording was made ineligible: %v", err)
+				}
 			}
 		})
 	}

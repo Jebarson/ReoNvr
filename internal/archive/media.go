@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os/exec"
@@ -15,7 +16,12 @@ import (
 	"reonavr/internal/domain"
 )
 
-const coverageTolerance = 2 * time.Second
+const (
+	coverageTolerance  = 2 * time.Second
+	ffprobeInvalidData = -1094995529
+)
+
+var ErrInvalidMedia = errors.New("recording contains invalid video")
 
 type VideoInspection struct {
 	Duration time.Duration
@@ -35,7 +41,7 @@ func (segmenter *FFmpegSegmenter) InspectVideo(ctx context.Context, path string)
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	command := exec.CommandContext(ctx, segmenter.probeExecutable(), "-v", "error", "-select_streams", "v:0",
-		"-show_packets", "-show_entries", "packet=pts_time,duration_time,flags", "-of", "json", path)
+		"-show_error", "-show_packets", "-show_entries", "packet=pts_time,duration_time,flags", "-of", "json", path)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return VideoInspection{}, err
@@ -47,7 +53,14 @@ func (segmenter *FFmpegSegmenter) InspectVideo(ctx context.Context, path string)
 	if inspectErr != nil && command.Process != nil {
 		_ = command.Process.Kill()
 	}
-	if err := command.Wait(); err != nil {
+	waitErr := command.Wait()
+	if ctx.Err() != nil {
+		return VideoInspection{}, ctx.Err()
+	}
+	if errors.Is(inspectErr, ErrInvalidMedia) {
+		return VideoInspection{}, inspectErr
+	}
+	if waitErr != nil {
 		return VideoInspection{}, errors.New("video coverage probe failed")
 	}
 	return inspection, inspectErr
@@ -60,9 +73,18 @@ func inspectVideoPackets(reader io.Reader) (VideoInspection, error) {
 			Duration string `json:"duration_time"`
 			Flags    string `json:"flags"`
 		} `json:"packets"`
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
 	}
 	if err := json.NewDecoder(reader).Decode(&payload); err != nil {
 		return VideoInspection{}, errors.New("invalid video packet metadata")
+	}
+	if payload.Error != nil {
+		if payload.Error.Code == ffprobeInvalidData {
+			return VideoInspection{}, ErrInvalidMedia
+		}
+		return VideoInspection{}, errors.New("video coverage probe could not read media")
 	}
 	type packet struct {
 		start, end time.Duration
@@ -72,7 +94,7 @@ func inspectVideoPackets(reader io.Reader) (VideoInspection, error) {
 	for _, item := range payload.Packets {
 		pts, err := strconv.ParseFloat(item.PTS, 64)
 		if err != nil || math.IsNaN(pts) || math.IsInf(pts, 0) || math.Abs(pts) > 4e9 {
-			return VideoInspection{}, errors.New("video packet has no valid presentation timestamp")
+			return VideoInspection{}, fmt.Errorf("%w: video packet has no valid presentation timestamp", ErrInvalidMedia)
 		}
 		duration, err := strconv.ParseFloat(item.Duration, 64)
 		if err != nil || duration <= 0 || duration > 2 || math.IsNaN(duration) || math.IsInf(duration, 0) {
@@ -81,13 +103,13 @@ func inspectVideoPackets(reader io.Reader) (VideoInspection, error) {
 		packets = append(packets, packet{start: time.Duration(pts * float64(time.Second)), end: time.Duration((pts + duration) * float64(time.Second)), keyframe: strings.Contains(item.Flags, "K")})
 	}
 	if len(packets) < 2 {
-		return VideoInspection{}, errors.New("recording has insufficient video packets")
+		return VideoInspection{}, fmt.Errorf("%w: recording has insufficient video packets", ErrInvalidMedia)
 	}
 	sort.Slice(packets, func(first, second int) bool { return packets[first].start < packets[second].start })
 	origin := packets[0].start
 	duration := packets[len(packets)-1].end - origin
 	if duration <= 0 || duration > 24*time.Hour {
-		return VideoInspection{}, errors.New("recording has an invalid video duration")
+		return VideoInspection{}, fmt.Errorf("%w: recording has an invalid video duration", ErrInvalidMedia)
 	}
 	inspection := VideoInspection{Duration: duration}
 	var current *domain.TimeRange
@@ -107,7 +129,7 @@ func inspectVideoPackets(reader io.Reader) (VideoInspection, error) {
 		}
 	}
 	if len(inspection.Coverage) == 0 {
-		return VideoInspection{}, errors.New("recording has no independently decodable video")
+		return VideoInspection{}, fmt.Errorf("%w: recording has no independently decodable video", ErrInvalidMedia)
 	}
 	return inspection, nil
 }

@@ -236,8 +236,11 @@ func (store *Store) ListRequiredEventCoverage(ctx context.Context, gap domain.Re
 		JOIN RecoveryPeriods Periods ON Periods.Id = ? AND Periods.CameraId = Events.CameraId
 		WHERE Events.CameraId = ?
 		AND julianday(Events.StartedAtUtc) <= julianday(?) + Periods.PreEventSeconds / 86400.0
-		AND (Events.EndedAtUtc IS NULL OR julianday(Events.EndedAtUtc) >= julianday(?) - Periods.PostEventSeconds / 86400.0)`,
-		gap.PeriodID, gap.CameraID, formatTime(&gap.EndAtUtc), formatTime(&gap.StartAtUtc))
+		AND (Events.EndedAtUtc IS NULL OR julianday(Events.EndedAtUtc) >= julianday(?) - Periods.PostEventSeconds / 86400.0)
+		UNION ALL SELECT Recordings.StartAtUtc, Recordings.EndAtUtc, NULL, 0, 0
+		FROM RecoveryGapRecordings Links JOIN Recordings ON Recordings.Id = Links.RecordingId
+		WHERE Links.GapId = ? AND Recordings.CameraId = ? AND Recordings.Stream = ?`,
+		gap.PeriodID, gap.CameraID, formatTime(&gap.EndAtUtc), formatTime(&gap.StartAtUtc), gap.ID, gap.CameraID, gap.Stream)
 	if err != nil {
 		return nil, err
 	}
@@ -250,12 +253,12 @@ func (store *Store) ListRequiredEventCoverage(ctx context.Context, gap domain.Re
 	for rows.Next() {
 		var start string
 		var end sql.NullString
-		var eventType domain.EventType
+		var eventType sql.NullString
 		var pre, post int
 		if err := rows.Scan(&start, &end, &eventType, &pre, &post); err != nil {
 			return nil, err
 		}
-		if !selected[eventType] {
+		if eventType.Valid && !selected[domain.EventType(eventType.String)] {
 			continue
 		}
 		from, err := time.Parse(time.RFC3339Nano, start)
@@ -425,6 +428,6 @@ func (store *Store) loadRecoveryStats(ctx context.Context, camera *domain.Camera
 func (store *Store) RecoveryRecordingFinal(ctx context.Context, recordingID string) (bool, error) {
 	var final bool
 	err := store.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM Recordings WHERE Id = ? AND
-		(State IN ('Deleted', 'Expired') OR (State = 'Complete' AND EXISTS (SELECT 1 FROM RecordingCoverage WHERE RecordingId = Recordings.Id))))`, recordingID).Scan(&final)
+		(State IN ('Deleted', 'Expired', 'Failed') OR (State = 'Complete' AND EXISTS (SELECT 1 FROM RecordingCoverage WHERE RecordingId = Recordings.Id))))`, recordingID).Scan(&final)
 	return final, err
 }

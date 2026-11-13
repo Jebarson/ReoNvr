@@ -74,6 +74,8 @@ func (service *DownloadService) DownloadNext(ctx context.Context, cameraID strin
 		state := domain.RecordingRetryWait
 		if recordingExpired(err) {
 			state = domain.RecordingExpired
+		} else if errors.Is(err, ErrInvalidMedia) {
+			state = domain.RecordingFailed
 		}
 		updateContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

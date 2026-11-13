@@ -55,6 +55,57 @@ type fileDownloader struct {
 	called   bool
 }
 
+type mediaInspectorFunc func(context.Context, string) (VideoInspection, error)
+
+func (inspect mediaInspectorFunc) InspectVideo(ctx context.Context, path string) (VideoInspection, error) {
+	return inspect(ctx, path)
+}
+
+func TestDownloadInspectionDistinguishesInvalidMediaFromTransientFailure(t *testing.T) {
+	for _, invalid := range []bool{true, false} {
+		t.Run(map[bool]string{true: "invalid", false: "transient"}[invalid], func(t *testing.T) {
+			now := time.Now().UTC()
+			store := &downloadStore{
+				camera:     domain.Camera{ID: "camera-one", Name: "Front", Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecordingSource: domain.RecordingSourceCameraStorage},
+				credential: domain.EncryptedCredential{KeyVersion: 1},
+				recording: &domain.Recording{ID: "clip", NativeName: "clip.mp4", Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain,
+					StartAtUtc: now.Add(-time.Minute), EndAtUtc: now, SizeBytes: 4},
+			}
+			service := NewDownloadService(store, &fileDownloader{payload: []byte("video")}, serviceCipher{}, t.TempDir())
+			service.SetMediaInspector(mediaInspectorFunc(func(context.Context, string) (VideoInspection, error) {
+				if invalid {
+					return VideoInspection{}, fmt.Errorf("%w: no decodable frames", ErrInvalidMedia)
+				}
+				return VideoInspection{}, errors.New("probe temporarily unavailable")
+			}))
+			if err := service.DownloadNext(context.Background(), store.camera.ID); err == nil {
+				t.Fatal("inspection error was ignored")
+			}
+			want := domain.RecordingRetryWait
+			if invalid {
+				want = domain.RecordingFailed
+			}
+			if store.states[len(store.states)-1] != want || store.completed.State == domain.RecordingComplete {
+				t.Fatal("inspection failure was misclassified or invalid media was published")
+			}
+		})
+	}
+	for _, metadata := range []struct {
+		payload string
+		invalid bool
+	}{
+		{payload: `{"packets":[],"error":{"code":-1094995529}}`, invalid: true},
+		{payload: `{"packets":[]}`, invalid: true},
+		{payload: `{"error":{"code":-5}}`},
+		{payload: `{"packets":`},
+	} {
+		_, err := inspectVideoPackets(strings.NewReader(metadata.payload))
+		if err == nil || errors.Is(err, ErrInvalidMedia) != metadata.invalid {
+			t.Fatal("probe metadata classification did not distinguish invalid media from incomplete or I/O results")
+		}
+	}
+}
+
 type rejectingCapacityGuard struct{}
 
 func (rejectingCapacityGuard) EnsureCapacity(context.Context, int64) error {

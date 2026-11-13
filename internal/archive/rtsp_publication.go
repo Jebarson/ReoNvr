@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"reonavr/internal/domain"
 	"reonavr/internal/repository"
@@ -48,7 +49,47 @@ func (service *RtspRecorderService) publishRtspRecording(ctx context.Context, se
 	return service.finishRtspPublication(ctx, root, journal, pending)
 }
 
+func (service *RtspRecorderService) replayPendingRtspPublication(ctx context.Context, sourcePath string, expected domain.Recording) (bool, error) {
+	service.publicationMu.Lock()
+	defer service.publicationMu.Unlock()
+	root, err := os.OpenRoot(service.archiveRoot)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	source, err := filepath.Rel(service.archiveRoot, sourcePath)
+	if err != nil {
+		return false, err
+	}
+	journal := filepath.Join(filepath.Dir(source), "publication-"+expected.ID+".json")
+	if _, err := root.Lstat(journal); errors.Is(err, os.ErrNotExist) {
+		existing, err := service.store.GetRecording(ctx, expected.ID)
+		if errors.Is(err, repository.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if existing.CameraID != expected.CameraID || existing.Source != domain.RecordingSourceRtsp || existing.Stream != expected.Stream ||
+			!existing.StartAtUtc.Equal(expected.StartAtUtc) || !existing.EndAtUtc.Equal(expected.EndAtUtc) {
+			return true, errors.New("RTSP event publication conflicts with an indexed recording")
+		}
+		if existing.State == domain.RecordingDeleted || existing.State == domain.RecordingExpired {
+			return true, nil
+		}
+		if existing.State != domain.RecordingComplete {
+			return true, errors.New("RTSP event publication is not complete")
+		}
+		return true, verifyRtspPublicationFile(root, existing.LocalPath, existing)
+	} else if err != nil {
+		return false, err
+	}
+	return true, service.recoverRtspPublicationLocked(ctx, root, journal)
+}
+
 func (service *RtspRecorderService) recoverCameraPublications(ctx context.Context, cameraID string) error {
+	service.publicationMu.Lock()
+	defer service.publicationMu.Unlock()
 	root, err := os.OpenRoot(service.archiveRoot)
 	if err != nil {
 		return err
@@ -60,6 +101,7 @@ func (service *RtspRecorderService) recoverCameraPublications(ctx context.Contex
 	}
 	directory, err := root.Open(buffer)
 	if errors.Is(err, os.ErrNotExist) {
+		service.resolvePublicationIssue(ctx, cameraID)
 		return nil
 	}
 	if err != nil {
@@ -70,18 +112,36 @@ func (service *RtspRecorderService) recoverCameraPublications(ctx context.Contex
 	if err != nil {
 		return err
 	}
+	failed := false
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), "publication-") && strings.HasSuffix(entry.Name(), ".json") {
 			journal := filepath.Join(buffer, entry.Name())
-			if err := service.recoverRtspPublication(ctx, root, journal); err != nil {
+			if err := service.recoverRtspPublicationLocked(ctx, root, journal); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				service.reportPublicationFailure(ctx, journal)
+				failed = true
 			}
 		}
 	}
+	if !failed {
+		service.resolvePublicationIssue(ctx, cameraID)
+	}
 	return nil
+}
+
+func (service *RtspRecorderService) resolvePublicationIssue(ctx context.Context, cameraID string) {
+	if ctx.Err() != nil {
+		return
+	}
+	if resolver, ok := service.store.(interface {
+		ResolveIssue(context.Context, string, string, string, time.Time) error
+	}); ok {
+		if resolver.ResolveIssue(ctx, "RtspPublication", cameraID, "PublicationReplayFailed", service.now().UTC()) != nil {
+			slog.Error("Could not resolve RTSP publication issue", "cameraId", cameraID)
+		}
+	}
 }
 
 func (service *RtspRecorderService) reportPublicationFailure(ctx context.Context, journal string) {
@@ -110,6 +170,10 @@ func (service *RtspRecorderService) reportPublicationFailure(ctx context.Context
 func (service *RtspRecorderService) recoverRtspPublication(ctx context.Context, root *os.Root, journal string) error {
 	service.publicationMu.Lock()
 	defer service.publicationMu.Unlock()
+	return service.recoverRtspPublicationLocked(ctx, root, journal)
+}
+
+func (service *RtspRecorderService) recoverRtspPublicationLocked(ctx context.Context, root *os.Root, journal string) error {
 	file, err := root.Open(journal)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

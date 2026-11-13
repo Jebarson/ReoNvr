@@ -104,6 +104,7 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 		return errors.New("RTSP buffer must be a child of the archive root")
 	}
 	var publications, partials []string
+	cameraDirectories := make(map[string]string)
 	err := filepath.WalkDir(bufferRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -112,6 +113,13 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 			return err
 		}
 		if entry.IsDir() {
+			if filepath.Dir(path) == bufferRoot && safePathComponent(entry.Name()) {
+				relative, err := filepath.Rel(archiveRoot, path)
+				if err != nil {
+					return err
+				}
+				cameraDirectories[relative] = entry.Name()
+			}
 			return nil
 		}
 		if !pathWithin(bufferRoot, path) {
@@ -159,6 +167,13 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 		}
 		if err := root.Remove(relative); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+	}
+	for directory, cameraID := range cameraDirectories {
+		if !pendingDirectories[directory] {
+			if err := service.recoverCameraPublications(ctx, cameraID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -398,29 +413,38 @@ func (service *RtspRecorderService) publishEventBuffer(ctx context.Context, came
 		return errors.New("RTSP event window has no buffered media")
 	}
 	joinedPath := strings.Replace(outputPattern, "%06d", "event-"+strconv.FormatInt(current.endAt.UnixNano(), 10), 1)
-	if service.capacity != nil {
-		var requiredBytes int64
-		for _, path := range paths {
-			info, err := os.Stat(path)
-			if err != nil {
-				return fmt.Errorf("inspect RTSP event fragment: %w", err)
+	replayed, err := service.replayPendingRtspPublication(ctx, joinedPath, domain.Recording{
+		ID: rtspRecordingID(camera.ID, first.startAt, joinedPath), CameraID: camera.ID,
+		Stream: camera.ArchiveStream, StartAtUtc: first.startAt, EndAtUtc: last.endAt,
+	})
+	if err != nil {
+		return err
+	}
+	if !replayed {
+		if service.capacity != nil {
+			var requiredBytes int64
+			for _, path := range paths {
+				info, err := os.Stat(path)
+				if err != nil {
+					return fmt.Errorf("inspect RTSP event fragment: %w", err)
+				}
+				requiredBytes += info.Size()
 			}
-			requiredBytes += info.Size()
+			if err := service.capacity.EnsureCapacity(ctx, requiredBytes); err != nil {
+				return err
+			}
 		}
-		if err := service.capacity.EnsureCapacity(ctx, requiredBytes); err != nil {
+		if err := service.segmenter.Join(ctx, paths, joinedPath); err != nil {
 			return err
 		}
-	}
-	if err := service.segmenter.Join(ctx, paths, joinedPath); err != nil {
-		return err
-	}
-	joined := RtspSegment{
-		Path: joinedPath, StartOffset: first.startAt.Sub(captureStartedAt),
-		EndOffset: last.endAt.Sub(captureStartedAt), StartAtUtc: first.startAt, EndAtUtc: last.endAt,
-		Coverage: coverage,
-	}
-	if err := service.publishSegment(ctx, camera, captureStartedAt, joined); err != nil {
-		return err
+		joined := RtspSegment{
+			Path: joinedPath, StartOffset: first.startAt.Sub(captureStartedAt),
+			EndOffset: last.endAt.Sub(captureStartedAt), StartAtUtc: first.startAt, EndAtUtc: last.endAt,
+			Coverage: coverage,
+		}
+		if err := service.publishSegment(ctx, camera, captureStartedAt, joined); err != nil {
+			return err
+		}
 	}
 	buffer.publishedUntil = last.endAt
 	for _, path := range paths {
@@ -500,8 +524,7 @@ func (service *RtspRecorderService) publishSegment(ctx context.Context, camera d
 	if err != nil {
 		return err
 	}
-	idHash := sha256.Sum256([]byte(camera.ID + "\x00" + startAt.Format(time.RFC3339Nano) + "\x00" + filepath.Base(segment.Path)))
-	recordingID := hex.EncodeToString(idHash[:16])
+	recordingID := rtspRecordingID(camera.ID, startAt, segment.Path)
 	fileName := startAt.Format("20060102T150405.000Z") + "-" + recordingID[:12] + ".mkv"
 	nativeName := filepath.ToSlash(filepath.Join("Rtsp", startAt.Format("2006"), startAt.Format("01"), startAt.Format("02"), fileName))
 	settings, err := loadApplicationSettings(ctx, service.settings)
@@ -531,6 +554,11 @@ func (service *RtspRecorderService) publishSegment(ctx context.Context, camera d
 		RawMetadata: rawMetadata, DiscoveredAtUtc: completedAt, UpdatedAtUtc: completedAt,
 		LocalPath: filepath.ToSlash(relativePath), Sha256: digest,
 	})
+}
+
+func rtspRecordingID(cameraID string, startAt time.Time, sourcePath string) string {
+	idHash := sha256.Sum256([]byte(cameraID + "\x00" + startAt.Format(time.RFC3339Nano) + "\x00" + filepath.Base(sourcePath)))
+	return hex.EncodeToString(idHash[:16])
 }
 
 func (service *RtspRecorderService) eventTypesForRange(ctx context.Context, camera domain.Camera, startAt, endAt time.Time) ([]domain.EventType, error) {

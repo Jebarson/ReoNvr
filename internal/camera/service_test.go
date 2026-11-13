@@ -150,6 +150,70 @@ func TestRegistrationRequiresReceiptAndRetainsCredentialForPolicyEdit(t *testing
 	}
 }
 
+func TestConcurrentPolicySavesApplyLifecycleInCommitOrder(t *testing.T) {
+	ctx := context.Background()
+	store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "policy-order.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(store, &fakeTester{result: testCameraResult()}, cipher)
+	draft := validDraft()
+	receipt, err := service.Test(ctx, "", draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft.TestID = receipt.TestID
+	camera, err := service.Create(ctx, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft.TestID, draft.Password = "", ""
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	applied := make(chan domain.RecordingMode, 2)
+	service.SetLifecycleHooks(func(saved domain.Camera) {
+		if saved.RecordingMode == domain.RecordingModeContinuous {
+			close(entered)
+			<-release
+		}
+		applied <- saved.RecordingMode
+	}, nil)
+	older, newer := draft, draft
+	older.RecordingMode, newer.RecordingMode = domain.RecordingModeContinuous, domain.RecordingModeEvents
+	results := make(chan error, 2)
+	go func() { _, err := service.Update(ctx, camera.ID, older); results <- err }()
+	<-entered
+	started := make(chan struct{})
+	go func() { close(started); _, err := service.Update(ctx, camera.ID, newer); results <- err }()
+	<-started
+	select {
+	case <-results:
+		t.Fatal("newer save bypassed an unfinished lifecycle update")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	current, err := store.GetCamera(ctx, camera.ID)
+	if err != nil || current.RecordingMode != domain.RecordingModeEvents || <-applied != domain.RecordingModeContinuous || <-applied != domain.RecordingModeEvents {
+		t.Fatal("saved policy and applied lifecycle diverged")
+	}
+}
+
 func TestClockWarningDoesNotBlockRegistration(test *testing.T) {
 	for _, timezone := range []string{"Camera/Unverified", "Camera/custom-rule-payload"} {
 		test.Run(timezone, func(test *testing.T) {

@@ -35,6 +35,12 @@ func (service *RecordingService) Get(ctx context.Context) (domain.RecordingContr
 	return service.store.GetRecordingControl(ctx)
 }
 
+func (service *RecordingService) ApplyCameraChange(apply func()) {
+	service.updateMu.Lock()
+	defer service.updateMu.Unlock()
+	apply()
+}
+
 func (service *RecordingService) Update(ctx context.Context, enabled bool) (domain.RecordingControl, error) {
 	service.updateMu.Lock()
 	defer service.updateMu.Unlock()

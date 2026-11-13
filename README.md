@@ -143,7 +143,11 @@ mode. Recovery keeps whole native clips, which can overlap live recordings;
 Playback remains a recording list, not a seamlessly stitched timeline.
 
 Captured event time is not proof of archived footage: known selected events
-still require verified media for their saved pre/post-roll windows. Adjacent
+still require verified media for their saved pre/post-roll windows.
+Previously linked selected SD clips remain required even if a later search no
+longer returns them. Permanently invalid native media becomes **Failed**, allowing
+older downloads to proceed without pretending the missing footage was recovered;
+temporary probe failures remain retryable. Adjacent
 quiet checks are coalesced within their recording-policy period. Recovery history
 shows unresolved intervals first; terminal history expires after 30 days while
 unresolved intervals and archived media are preserved.
@@ -157,12 +161,18 @@ not guaranteed to be recovered, and no camera SD media is removed.
 
 ## Reliability and limits
 
-Recording-control updates apply in order. Events mode periodically publishes
+Camera policy saves apply their lifecycle hooks in commit order, and camera
+worker changes serialize with global recording-control updates. Intent-bookkeeping
+failures are retried separately and do not block applying camera worker changes.
+Events mode periodically publishes
 long events and flushes valid buffered footage on pause or stream interruption.
 RTSP publication journals reconcile unfinished media/index/coverage commits at
 startup or the next camera-worker retry. Replays verify the native file hash
 and do not resurrect intentionally retained tombstones. Retention leaves other
 queued clips in the same recovery interval eligible for download.
+Event flush retries replay existing publications rather than remuxing their media.
+Publication errors resolve only after all outstanding journals for that camera
+have recovered or been cleared; failures for other cameras remain open.
 
 A forced process/host shutdown can still lose the unjournaled active tail.
 Missing or corrupt journaled media is reported rather than marked recovered.

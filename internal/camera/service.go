@@ -93,6 +93,7 @@ type Service struct {
 	onChanged   func(domain.Camera)
 	onDeleted   func(string)
 	discoveryMu sync.Mutex
+	mutationMu  sync.Mutex
 }
 
 func NewService(store Store, tester CameraTester, cipher CredentialCipher) *Service {
@@ -192,6 +193,8 @@ func snapshotDataURL(snapshot []byte) string {
 }
 
 func (service *Service) Create(ctx context.Context, draft Draft) (domain.Camera, error) {
+	service.mutationMu.Lock()
+	defer service.mutationMu.Unlock()
 	normalizeRecordingPolicy(&draft)
 	if err := validateDraft(draft); err != nil {
 		return domain.Camera{}, err
@@ -229,6 +232,8 @@ func (service *Service) Create(ctx context.Context, draft Draft) (domain.Camera,
 }
 
 func (service *Service) Update(ctx context.Context, id string, draft Draft) (domain.Camera, error) {
+	service.mutationMu.Lock()
+	defer service.mutationMu.Unlock()
 	normalizeRecordingPolicy(&draft)
 	if err := validateDraft(draft); err != nil {
 		return domain.Camera{}, err
@@ -301,6 +306,8 @@ func (service *Service) Update(ctx context.Context, id string, draft Draft) (dom
 }
 
 func (service *Service) Delete(ctx context.Context, id string) error {
+	service.mutationMu.Lock()
+	defer service.mutationMu.Unlock()
 	err := service.store.RetireCamera(ctx, id, service.now().UTC())
 	if errors.Is(err, repository.ErrNotFound) {
 		return ErrNotFound
