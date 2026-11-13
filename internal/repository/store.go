@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"reonavr/internal/domain"
+	"reonavr/internal/reolink"
 
 	_ "modernc.org/sqlite"
 )
@@ -138,7 +139,10 @@ func (store *Store) initialize(ctx context.Context) error {
 	if err := store.migrateAutomaticCameraStorageImport(ctx); err != nil {
 		return err
 	}
-	return store.migrateStorageSettings(ctx)
+	if err := store.migrateStorageSettings(ctx); err != nil {
+		return err
+	}
+	return store.migrateRecovery(ctx)
 }
 
 func (store *Store) migrateActiveCameraUniqueness(ctx context.Context) error {
@@ -424,11 +428,16 @@ func (store *Store) GetRecordingControl(ctx context.Context) (domain.RecordingCo
 }
 
 func (store *Store) SetRecordingControl(ctx context.Context, enabled bool, updatedAt time.Time) error {
-	_, err := store.db.ExecContext(ctx, `UPDATE ApplicationSettings SET RecordingEnabled = ?, UpdatedAtUtc = ? WHERE Id = 1`, enabled, formatTime(&updatedAt))
-	if err != nil {
-		return fmt.Errorf("set recording control: %w", err)
-	}
-	return nil
+	return store.withTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE ApplicationSettings SET RecordingEnabled = ?, UpdatedAtUtc = ? WHERE Id = 1`, enabled, formatTime(&updatedAt)); err != nil {
+			return err
+		}
+		if !enabled {
+			_, err := tx.ExecContext(ctx, `UPDATE RecoveryPeriods SET EndedAtUtc = ? WHERE EndedAtUtc IS NULL`, formatTime(&updatedAt))
+			return err
+		}
+		return nil
+	})
 }
 
 func (store *Store) GetApplicationSettings(ctx context.Context) (domain.ApplicationSettings, error) {
@@ -466,14 +475,14 @@ func (store *Store) CreateCamera(ctx context.Context, camera domain.Camera, cred
 			Id, Name, Host, Port, Channel, Timezone, Enabled, ArchiveEnabled,
 			ArchiveStream, RecordingSource, RecordingMode, HistoricalImport,
 			PreEventSeconds, PostEventSeconds, ArchiveFromUtc, Model, Firmware,
-			CapabilitiesJson, ConnectionStatus, LastTestedAtUtc, CreatedAtUtc, UpdatedAtUtc
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			CapabilitiesJson, ConnectionStatus, LastTestedAtUtc, CreatedAtUtc, UpdatedAtUtc, RecoveryEnabled
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			camera.ID, camera.Name, camera.Host, camera.Port, camera.Channel,
 			camera.Timezone, camera.Enabled, camera.ArchiveEnabled, camera.ArchiveStream,
 			camera.RecordingSource, camera.RecordingMode, camera.HistoricalImport,
 			camera.PreEventSeconds, camera.PostEventSeconds, formatTime(camera.ArchiveFromUtc),
 			camera.Model, camera.Firmware, string(capabilities), camera.ConnectionStatus,
-			formatTime(camera.LastTestedAtUtc), formatTime(&camera.CreatedAtUtc), formatTime(&camera.UpdatedAtUtc))
+			formatTime(camera.LastTestedAtUtc), formatTime(&camera.CreatedAtUtc), formatTime(&camera.UpdatedAtUtc), camera.RecoveryEnabled)
 		if err != nil {
 			return fmt.Errorf("insert camera: %w", err)
 		}
@@ -516,14 +525,14 @@ func (store *Store) UpdateCamera(ctx context.Context, camera domain.Camera, cred
 			ArchiveEnabled = ?, ArchiveStream = ?, RecordingSource = ?, RecordingMode = ?,
 			HistoricalImport = ?, PreEventSeconds = ?, PostEventSeconds = ?, ArchiveFromUtc = ?, Model = ?, Firmware = ?,
 			CapabilitiesJson = ?, ConnectionStatus = ?, LastTestedAtUtc = ?, UpdatedAtUtc = ?,
-			LastSearchWatermarkAtUtc = CASE WHEN ? THEN NULL ELSE LastSearchWatermarkAtUtc END
+			LastSearchWatermarkAtUtc = CASE WHEN ? THEN NULL ELSE LastSearchWatermarkAtUtc END, RecoveryEnabled = ?
 			WHERE Id = ? AND RetiredAtUtc IS NULL`,
 			camera.Name, camera.Host, camera.Port, camera.Channel, camera.Timezone,
 			camera.Enabled, camera.ArchiveEnabled, camera.ArchiveStream,
 			camera.RecordingSource, camera.RecordingMode, camera.HistoricalImport,
 			camera.PreEventSeconds, camera.PostEventSeconds, formatTime(camera.ArchiveFromUtc),
 			camera.Model, camera.Firmware, string(capabilities), camera.ConnectionStatus,
-			formatTime(camera.LastTestedAtUtc), formatTime(&camera.UpdatedAtUtc), resetSearch, camera.ID)
+			formatTime(camera.LastTestedAtUtc), formatTime(&camera.UpdatedAtUtc), resetSearch, camera.RecoveryEnabled, camera.ID)
 		if err != nil {
 			return fmt.Errorf("update camera: %w", err)
 		}
@@ -575,7 +584,10 @@ func queueEligibleDiscovered(ctx context.Context, tx *sql.Tx, cameraID string, m
 }
 
 func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, cameraID, timezone string, updatedAt time.Time) error {
-	location, err := time.LoadLocation(timezone)
+	if timezone == "Camera/Unverified" {
+		return nil
+	}
+	location, err := reolink.CameraLocation(timezone)
 	if err != nil {
 		return errors.New("camera timezone is invalid")
 	}
@@ -732,7 +744,7 @@ const cameraSelect = `SELECT
 	Cameras.RecordingMode, Cameras.HistoricalImport, Cameras.PreEventSeconds,
 	Cameras.PostEventSeconds, Cameras.ArchiveFromUtc, Cameras.Model,
 	Cameras.Firmware, Cameras.CapabilitiesJson, Cameras.ConnectionStatus,
-	Cameras.LastTestedAtUtc, Cameras.LastEventAtUtc, Cameras.CreatedAtUtc, Cameras.UpdatedAtUtc
+	Cameras.LastTestedAtUtc, Cameras.LastEventAtUtc, Cameras.CreatedAtUtc, Cameras.UpdatedAtUtc, Cameras.RecoveryEnabled
 	FROM Cameras JOIN CameraCredentials ON CameraCredentials.CameraId = Cameras.Id
 	WHERE Cameras.RetiredAtUtc IS NULL`
 
@@ -750,7 +762,7 @@ func scanCamera(row rowScanner) (domain.Camera, error) {
 		&camera.RecordingSource, &camera.RecordingMode, &camera.HistoricalImport,
 		&camera.PreEventSeconds, &camera.PostEventSeconds, &archiveFrom,
 		&model, &firmware, &capabilitiesJSON, &camera.ConnectionStatus, &lastTested,
-		&lastEvent, &created, &updated); err != nil {
+		&lastEvent, &created, &updated, &camera.RecoveryEnabled); err != nil {
 		return domain.Camera{}, err
 	}
 	camera.Enabled = enabled == 1
@@ -816,12 +828,12 @@ func (store *Store) loadArchiveStats(ctx context.Context, camera *domain.Camera)
 	err := store.db.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(CASE WHEN State = 'Complete' AND LocalPath IS NOT NULL AND LocalPath != '' THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN State IN ('Queued', 'Downloading', 'Verifying', 'RetryWait') THEN 1 ELSE 0 END), 0)
-		FROM Recordings WHERE CameraId = ? AND Source = ? AND State != 'Deleted'`, camera.ID, camera.RecordingSource).Scan(
+		FROM Recordings WHERE CameraId = ? AND State != 'Deleted'`, camera.ID).Scan(
 		&camera.RecordingCount, &camera.PendingDownloadCount)
 	if err != nil {
 		return fmt.Errorf("load camera archive statistics: %w", err)
 	}
-	return nil
+	return store.loadRecoveryStats(ctx, camera)
 }
 
 func (store *Store) withTransaction(ctx context.Context, action func(*sql.Tx) error) error {
@@ -1238,6 +1250,9 @@ func (store *Store) ClaimNextDownload(ctx context.Context, cameraID string, now 
 		WHERE Id = (
 			SELECT Id FROM Recordings
 			WHERE CameraId = ? AND Source = 'CameraStorage' AND State IN ('Queued', 'RetryWait')
+			AND (EXISTS (SELECT 1 FROM Cameras WHERE Cameras.Id = Recordings.CameraId AND Cameras.RecordingSource = 'CameraStorage')
+			OR EXISTS (SELECT 1 FROM RecoveryGapRecordings Links JOIN RecoveryGaps Gaps ON Gaps.Id = Links.GapId
+				WHERE Links.RecordingId = Recordings.Id AND Gaps.Status NOT IN ('Recovered', 'RecoveredEvents', 'CheckedEvents')))
 			ORDER BY StartAtUtc DESC LIMIT 1
 		)
 		RETURNING Id, CameraId, NativeName, Source, Stream, IFNULL(Codec, ''),
@@ -1433,8 +1448,11 @@ func (store *Store) ListArchivedEvents(ctx context.Context, cameraID string, lim
 		FROM Events WHERE Events.CameraId = ? AND EXISTS (
 			SELECT 1 FROM Recordings WHERE Recordings.CameraId = Events.CameraId
 			AND Recordings.State = 'Complete' AND Recordings.LocalPath IS NOT NULL AND Recordings.LocalPath != ''
+			AND EXISTS (SELECT 1 FROM RecordingCoverage Coverage WHERE Coverage.RecordingId = Recordings.Id
+				AND julianday(Coverage.StartAtUtc) <= julianday(COALESCE(Events.EndedAtUtc, Events.StartedAtUtc))
+				AND julianday(Coverage.EndAtUtc) > julianday(Events.StartedAtUtc))
 			AND (Recordings.NativeName = Events.NativeRecordingName OR (
-				Recordings.Source = 'Rtsp'
+				Recordings.Source IN ('Rtsp', 'CameraStorage')
 				AND julianday(Recordings.StartAtUtc) <= julianday(COALESCE(Events.EndedAtUtc, Events.StartedAtUtc))
 				AND julianday(Recordings.EndAtUtc) >= julianday(Events.StartedAtUtc)
 			))

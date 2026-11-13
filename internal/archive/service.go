@@ -196,6 +196,19 @@ func (service *Service) ListRecordings(ctx context.Context, cameraID string, lim
 	return service.store.ListArchivedRecordings(ctx, cameraID, limit)
 }
 
+func (service *Service) ListRecoveryGaps(ctx context.Context, cameraID string, limit int) ([]domain.RecoveryGap, error) {
+	if _, err := service.store.GetCamera(ctx, cameraID); err != nil {
+		return nil, err
+	}
+	reader, ok := service.store.(interface {
+		ListRecoveryHistory(context.Context, string, int) ([]domain.RecoveryGap, error)
+	})
+	if !ok {
+		return nil, errors.New("recovery history is unavailable")
+	}
+	return reader.ListRecoveryHistory(ctx, cameraID, limit)
+}
+
 func hasSelectedType(types []domain.EventType, selected map[domain.EventType]bool) bool {
 	for _, eventType := range types {
 		if selected[eventType] {

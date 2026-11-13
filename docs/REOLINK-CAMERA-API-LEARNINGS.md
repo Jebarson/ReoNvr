@@ -112,10 +112,22 @@ Useful commands include:
 
 ### Time handling
 
-Camera search parameters are local naive timestamps. ReoNvr uses `GetTime` and
-the discovered DST rules to convert recording and event timestamps to UTC.
-Database and API timestamps remain UTC; browser-local conversion is only a
-presentation concern.
+Camera search parameters are local naive timestamps. `GetTime` is the HTTP API
+equivalent; the current CLI adapter reads `config get time-zone` and raw command
+`106` for offset/DST rules. It uses a matching named timezone when possible,
+otherwise preserves verified custom rules as `Camera/<base64url JSON>`. Custom
+rules are converted with a generated timezone definition, not an assumed UTC
+offset. Ambiguous custom-clock rollback intervals and unsupported search years
+are rejected rather than guessed.
+
+The adapter reads `config get system-general` to compare actual current time
+when using custom rules. Custom rules alone do not trigger advice. An observed
+difference greater than one minute produces an optional warning; unreadable
+current time is not evidence of mismatch. Unreadable offset/DST rules disable
+SD recovery, not RTSP-only registration. These getters do not change the camera.
+Database and API timestamps remain UTC; RTSP capture uses the host's UTC clock,
+while camera-storage conversion uses the camera's verified rules. Neither
+timezone conversion nor the warning corrects clock skew.
 
 ### Recording search
 
@@ -123,9 +135,12 @@ presentation concern.
 can include a monthly day bitmap plus each recording's name, size, stream,
 start, and end. Availability and metadata differ across firmware.
 
-Camera Storage reconciliation uses overlapping searches and a persisted UTC
-watermark. Results are upserted by camera and native name, then eligible rows
-are queued newest first. Repeated discovery must not duplicate media.
+RTSP-primary recovery searches bounded missing intervals from durable recording
+intent rather than importing all available camera history. Results are filtered
+to the saved stream, overlapping missing coverage, and selected event tags when
+applicable. Native names remain the idempotent identity for repeated searches.
+Connection testing probes a recent one-minute search for the selected stream;
+search readiness is separate from RTSP readiness.
 
 ### Exact download
 
@@ -160,8 +175,10 @@ size, stream, and record types such as `md`, `people`, `vehicle`, and
 search and filename flags are the reliable reconciliation sources.
 
 Live notifications can be missed during app, gateway, camera, network, or host
-outages. Overlapping VOD reconciliation recovers recordings that remain on the
-SD card.
+outages. Bounded VOD searches can recover matching recordings that remain on
+the SD card. An empty event search during an unobserved capture interval does
+not establish that nothing happened; ReoNvr keeps that interval `Unknown`.
+Historical tags are firmware-dependent, not a frame-accurate event timeline.
 
 ## Official CLI and gateway
 
@@ -205,8 +222,8 @@ tested model.
 
 ## Current archive behavior
 
-Camera Storage and RTSP use the same path planner. The operator chooses one of
-four layouts:
+Primary RTSP recordings and native camera-storage recovery files use the same
+path planner. The operator chooses one of four layouts:
 
 ```text
 CameraDate: folder/Camera-shortid/YYYY/MM/DD/file
@@ -223,8 +240,26 @@ change.
 SQLite is the metadata source of truth. Camera Storage and RTSP publication
 also write portable JSON sidecars beside media; retention treats each sidecar
 as part of the recording artifact set. The current implementation does not
-generate thumbnails. Public lists expose only complete local media and
-media-backed events.
+generate thumbnails. Public recording lists expose only complete local media.
+The event query requires verified coverage, so recording bounds alone do not
+expose events inside media holes. Event capture flushes valid fragments on
+interruption and checkpoints long windows; retention tombstones do not suppress
+other pending recovery clips. New RTSP publications use durable replay journals
+to reconcile media, sidecars, indexing, and coverage after a failed commit. See
+[the review fixes and validation limits](APPLICATION-SPEC.md#12-review-fixes-and-validation-limits).
+
+Media inspection uses video packet timestamps and keyframes to persist usable
+coverage with a two-second tolerance. Whole native recovery clips can overlap
+RTSP segments; downloaded length alone is not evidence of full recovery. RTSP
+wall-clock timestamps must be enabled both on the credential-safe concat input
+and its outer FFmpeg input, with `-copyts` on output, to preserve UTC alignment.
+The segmenter also requires `-segment_atclocktime 1` for epoch-based timestamps;
+otherwise relative segment boundaries can cause a cut at every keyframe.
+Per-file Matroska `avoid_negative_ts=make_zero` keeps media presentation time
+relative for seeking without changing the UTC segment metadata in the index.
+The first segment's CSV start can be zero even when its end is absolute; derive
+that start from the inspected duration. Camera and host clocks still need to
+be synchronized; timezone conversion does not correct clock skew.
 
 ## Browser playback
 
@@ -247,7 +282,7 @@ copies, or transcoded derivatives.
 - Treat an event notification as provisional until a finalized recording is
   discovered.
 - Expect files to disappear when camera loop overwrite reaches them.
-- Keep reconciliation windows comfortably inside the shortest observed SD-card
+- Keep recovery scans comfortably inside the shortest observed SD-card
   retention period.
 - Never expose format, delete, schedule-change, or stream-change operations.
 

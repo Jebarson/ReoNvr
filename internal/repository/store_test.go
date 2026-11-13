@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,9 @@ import (
 	"time"
 
 	"reonavr/internal/domain"
+	"reonavr/internal/reolink"
+
+	"reonavr/internal/testconfig"
 )
 
 func TestStorePersistsCameraAndCredentialCiphertext(t *testing.T) {
@@ -24,14 +29,14 @@ func TestStorePersistsCameraAndCredentialCiphertext(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front Drive", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front Drive", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true,
 		ArchiveStream: domain.StreamMain, EventTypes: []domain.EventType{domain.EventMotion, domain.EventVehicle},
 		Model: "RLC-810A", Firmware: "test", ConnectionStatus: "Online",
 		Capabilities:    &domain.CameraCapabilities{MainStream: "3840x2160", SupportedEventTypes: []domain.EventType{domain.EventMotion, domain.EventVehicle}},
 		LastTestedAtUtc: &now, CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("opaque-ciphertext"), Nonce: []byte("opaque-nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("opaque-ciphertext"), Nonce: []byte("opaque-nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.Capabilities.SupportedEventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +63,200 @@ func TestStorePersistsCameraAndCredentialCiphertext(t *testing.T) {
 	}
 	if bytes.Contains(databaseBytes, []byte("clear-text-password")) {
 		t.Fatal("database contains clear-text password")
+	}
+}
+
+func TestRecoveryIntentAndCoverageSurviveRestartAndPause(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "recovery.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	camera := domain.Camera{ID: "recovery-camera", Name: "Recovery", Host: "camera", Port: 9000, Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous, CreatedAtUtc: now, UpdatedAtUtc: now}
+	if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCaptureCoverage(ctx, camera.ID, camera.ArchiveStream, []domain.TimeRange{{StartAtUtc: now, EndAtUtc: now.Add(time.Minute)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SyncRecordingIntent(ctx, camera, true, now.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	periods, err := store.ListRecoveryPeriods(ctx, camera.ID, now.Add(10*time.Minute))
+	if err != nil || len(periods) != 1 || !periods[0].StartAtUtc.Equal(now) {
+		t.Fatalf("intent lost across restart: %#v %v", periods, err)
+	}
+	if err := store.SetRecordingControl(ctx, false, now.Add(6*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, now.Add(7*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	periods, err = store.ListRecoveryPeriods(ctx, camera.ID, now.Add(10*time.Minute))
+	if err != nil || len(periods) != 1 || periods[0].EndAtUtc == nil || !periods[0].EndAtUtc.Equal(now.Add(6*time.Minute)) {
+		t.Fatalf("pause boundary missing: %#v %v", periods, err)
+	}
+	if err := store.SetRecordingControl(ctx, true, now.Add(8*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, now.Add(8*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	periods, err = store.ListRecoveryPeriods(ctx, camera.ID, now.Add(10*time.Minute))
+	if err != nil || len(periods) != 2 || !periods[1].StartAtUtc.Equal(now.Add(8*time.Minute)) {
+		t.Fatalf("stale intent included deliberately paused footage: %#v %v", periods, err)
+	}
+	coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, domain.TimeRange{StartAtUtc: now, EndAtUtc: now.Add(10 * time.Minute)}, true)
+	if err != nil || len(coverage) != 1 {
+		t.Fatalf("coverage not persisted: %#v %v", coverage, err)
+	}
+}
+
+func TestRecoveryHistoryCoalescesQuietIntervalsAndRetainsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "recovery-history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	start := now.AddDate(0, 0, -40)
+	camera := domain.Camera{ID: "history-camera", Name: "History", Host: testconfig.Host(1), Port: 9000, Timezone: "UTC", Enabled: true,
+		ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceRtsp,
+		RecordingMode: domain.RecordingModeEvents, CreatedAtUtc: start, UpdatedAtUtc: start}
+	if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, start); err != nil {
+		t.Fatal(err)
+	}
+	periods, err := store.ListRecoveryPeriods(ctx, camera.ID, now)
+	if err != nil || len(periods) != 1 {
+		t.Fatalf("missing history intent: %v", err)
+	}
+	periodID := periods[0].ID
+	gaps := []domain.RecoveryGap{
+		{ID: "unresolved", TimeRange: domain.TimeRange{StartAtUtc: start, EndAtUtc: start.Add(time.Minute)}},
+		{ID: "old-terminal", TimeRange: domain.TimeRange{StartAtUtc: start.Add(time.Minute), EndAtUtc: start.Add(2 * time.Minute)}},
+	}
+	if err := store.SaveRecoveryScan(ctx, periodID, start.Add(2*time.Minute), gaps); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRecoveryGap(ctx, "old-terminal", "Recovered", 0, start.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 120 {
+		from := now.Add(time.Duration(index-120) * time.Minute)
+		gap := domain.RecoveryGap{ID: fmt.Sprintf("quiet-%d", index), TimeRange: domain.TimeRange{StartAtUtc: from, EndAtUtc: from.Add(time.Minute)}}
+		if err := store.SaveRecoveryScan(ctx, periodID, gap.EndAtUtc, []domain.RecoveryGap{gap}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateRecoveryGap(ctx, gap.ID, "CheckedEvents", 0, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history, err := store.ListRecoveryHistory(ctx, camera.ID, 100)
+	if err != nil || len(history) != 2 || history[0].ID != "unresolved" || history[1].Status != "CheckedEvents" {
+		t.Fatalf("quiet growth hid unresolved history or retained aged terminal rows: %#v %v", history, err)
+	}
+	if !history[1].StartAtUtc.Equal(now.Add(-2*time.Hour)) || !history[1].EndAtUtc.Equal(now) {
+		t.Fatalf("quiet intervals were not coalesced: %#v", history[1])
+	}
+	recording := domain.Recording{ID: "linked-media", CameraID: camera.ID, NativeName: "linked.mkv", Source: domain.RecordingSourceRtsp,
+		Stream: domain.StreamMain, State: domain.RecordingComplete, StartAtUtc: now.Add(-time.Minute), EndAtUtc: now,
+		DiscoveredAtUtc: now, UpdatedAtUtc: now}
+	if err := store.SaveRtspRecording(ctx, recording); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO RecoveryGapRecordings (GapId, RecordingId) VALUES (?, ?)`, history[1].ID, recording.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRecoveryGap(ctx, history[1].ID, "CheckedEvents", 0, now); err != nil {
+		t.Fatalf("linked history must remain valid without coalescing: %v", err)
+	}
+}
+
+func TestRetentionPreservesUnfinishedRecoveryAndRechecksLegacySuppression(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "retained-recovery.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	camera := domain.Camera{ID: "camera-one", Name: "Recovery", Host: "camera", Port: 9000, Enabled: true, ArchiveEnabled: true,
+		RecoveryEnabled: true, ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceRtsp,
+		RecordingMode: domain.RecordingModeContinuous, CreatedAtUtc: now, UpdatedAtUtc: now}
+	if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, now); err != nil {
+		t.Fatal(err)
+	}
+	periods, err := store.ListRecoveryPeriods(ctx, camera.ID, now.Add(time.Hour))
+	if err != nil || len(periods) != 1 {
+		t.Fatalf("intent: %#v %v", periods, err)
+	}
+	gap := domain.RecoveryGap{ID: "gap-one", PeriodID: periods[0].ID, CameraID: camera.ID,
+		TimeRange: domain.TimeRange{StartAtUtc: now, EndAtUtc: now.Add(time.Minute)}}
+	if err := store.SaveRecoveryScan(ctx, gap.PeriodID, gap.EndAtUtc, []domain.RecoveryGap{gap}); err != nil {
+		t.Fatal(err)
+	}
+	clips := []domain.Recording{
+		{ID: "retained", CameraID: camera.ID, NativeName: "first", Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain,
+			StartAtUtc: now, EndAtUtc: now.Add(20 * time.Second), State: domain.RecordingQueued, DiscoveredAtUtc: now, UpdatedAtUtc: now},
+		{ID: "pending", CameraID: camera.ID, NativeName: "second", Source: domain.RecordingSourceCameraStorage, Stream: domain.StreamMain,
+			StartAtUtc: now.Add(20 * time.Second), EndAtUtc: now.Add(time.Minute), State: domain.RecordingQueued, DiscoveredAtUtc: now, UpdatedAtUtc: now},
+	}
+	if err := store.QueueRecoveryRecordings(ctx, gap, clips, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteRecording(ctx, "retained", "first.mp4", "hash", 1, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRecordingCoverage(ctx, "retained", []domain.TimeRange{{StartAtUtc: now, EndAtUtc: now.Add(20 * time.Second)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRecoveryGap(ctx, gap.ID, "Downloading", 40, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkRecordingDeleted(ctx, "retained", now); err != nil {
+		t.Fatal(err)
+	}
+	gaps, err := store.ListRecoveryGaps(ctx, camera.ID, 10)
+	if err != nil || len(gaps) != 1 || gaps[0].MissingSeconds != 40 || gaps[0].Status != "Downloading" {
+		t.Fatalf("retention hid unrelated missing time: %#v %v", gaps, err)
+	}
+	coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, gap.TimeRange, false)
+	if err != nil || len(coverage) != 1 {
+		t.Fatalf("tombstone coverage lost: %#v %v", coverage, err)
+	}
+	if final, err := store.RecoveryRecordingFinal(ctx, "retained"); err != nil || !final {
+		t.Fatalf("deleted clip eligible for reimport: %v", err)
+	}
+	if err := store.UpdateRecoveryGap(ctx, gap.ID, "Suppressed", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	gaps, err = store.ListRecoveryGaps(ctx, camera.ID, 10)
+	if err != nil || len(gaps) != 1 {
+		t.Fatalf("legacy suppression not rechecked: %#v %v", gaps, err)
+	}
+	claimed, err := store.ClaimNextDownload(ctx, camera.ID, now)
+	if err != nil || claimed == nil || claimed.ID != "pending" {
+		t.Fatalf("other recovery clip blocked: %#v %v", claimed, err)
 	}
 }
 
@@ -182,10 +381,7 @@ func TestOpenMigratesRecordingPoliciesAndUnstartedQueue(t *testing.T) {
 			UpdatedAtUtc TEXT NOT NULL, LocalPath TEXT, Etag TEXT, Sha256 TEXT,
 			CompletedAtUtc TEXT, DeletedAtUtc TEXT, UNIQUE(CameraId, NativeName)
 		)`,
-		`INSERT INTO Cameras (
-			Id, Name, Host, Timezone, ArchiveStream, CreatedAtUtc, UpdatedAtUtc
-		) VALUES ('camera-one', 'Front', '10.0.0.152', 'UTC', 'Main',
-			'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+		testconfig.Expand("INSERT INTO Cameras (\n\t\t\tId, Name, Host, Timezone, ArchiveStream, CreatedAtUtc, UpdatedAtUtc\n\t\t) VALUES ('camera-one', 'Front', '{{host2}}', 'UTC', 'Main',\n\t\t\t'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"),
 		`INSERT INTO Recordings (
 			Id, CameraId, NativeName, Stream, StartAtUtc, EndAtUtc, SizeBytes,
 			State, RawMetadataJson, DiscoveredAtUtc, UpdatedAtUtc
@@ -212,11 +408,12 @@ func TestOpenMigratesRecordingPoliciesAndUnstartedQueue(t *testing.T) {
 	defer store.Close()
 	var source, mode, historicalImport string
 	var archiveFrom sql.NullString
-	if err := store.db.QueryRowContext(ctx, `SELECT RecordingSource, RecordingMode, HistoricalImport, ArchiveFromUtc FROM Cameras WHERE Id = 'camera-one'`).Scan(
-		&source, &mode, &historicalImport, &archiveFrom); err != nil {
+	var recoveryEnabled bool
+	if err := store.db.QueryRowContext(ctx, `SELECT RecordingSource, RecordingMode, HistoricalImport, ArchiveFromUtc, RecoveryEnabled FROM Cameras WHERE Id = 'camera-one'`).Scan(
+		&source, &mode, &historicalImport, &archiveFrom, &recoveryEnabled); err != nil {
 		t.Fatal(err)
 	}
-	if source != "CameraStorage" || mode != "Events" || historicalImport != "AllAvailable" || archiveFrom.Valid {
+	if source != "Rtsp" || mode != "Events" || historicalImport != "NewOnly" || !archiveFrom.Valid || !recoveryEnabled {
 		t.Fatalf("unexpected migrated policy: %s %s %s", source, mode, historicalImport)
 	}
 	var queuedState, completeState string
@@ -240,14 +437,14 @@ func TestOpenMigratesCameraStorageMetadataToAutomaticImport(t *testing.T) {
 	}
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000, Timezone: "UTC",
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000, Timezone: "UTC",
 		Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
 		HistoricalImport: domain.HistoricalImportNewOnly, EventTypes: []domain.EventType{domain.EventPerson},
 		Capabilities: &domain.CameraCapabilities{SupportedEventTypes: []domain.EventType{domain.EventPerson, domain.EventVehicle}},
 		CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.Capabilities.SupportedEventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -329,13 +526,7 @@ func TestOpenMigratesCameraUniquenessToActiveRegistrations(t *testing.T) {
 			UNIQUE(Host, Channel)
 		)`,
 		`INSERT INTO SchemaMigrations (Version, AppliedAtUtc) VALUES (1, CURRENT_TIMESTAMP)`,
-		`INSERT INTO Cameras (
-			Id, Name, Host, Port, Channel, Timezone, Enabled, ArchiveEnabled,
-			ArchiveStream, ConnectionStatus, CreatedAtUtc, UpdatedAtUtc, RetiredAtUtc
-		) VALUES (
-			'retired-camera', 'East', '10.0.0.153', 9000, 0, 'UTC', 0, 1,
-			'Main', 'Offline', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
-		)`,
+		testconfig.Expand("INSERT INTO Cameras (\n\t\t\tId, Name, Host, Port, Channel, Timezone, Enabled, ArchiveEnabled,\n\t\t\tArchiveStream, ConnectionStatus, CreatedAtUtc, UpdatedAtUtc, RetiredAtUtc\n\t\t) VALUES (\n\t\t\t'retired-camera', 'East', '{{host3}}', 9000, 0, 'UTC', 0, 1,\n\t\t\t'Main', 'Offline', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'\n\t\t)"),
 	}
 	for _, statement := range statements {
 		if _, err := legacy.ExecContext(ctx, statement); err != nil {
@@ -354,13 +545,13 @@ func TestOpenMigratesCameraUniquenessToActiveRegistrations(t *testing.T) {
 	defer store.Close()
 	now := time.Now().UTC()
 	replacement := domain.Camera{
-		ID: "replacement-camera", Name: "East", Host: "10.0.0.153", Port: 9000,
+		ID: "replacement-camera", Name: "East", Host: testconfig.Host(3), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true,
 		ArchiveStream: domain.StreamMain, EventTypes: []domain.EventType{domain.EventMotion},
 		ConnectionStatus: "Online", Capabilities: &domain.CameraCapabilities{SupportedEventTypes: []domain.EventType{domain.EventMotion}},
 		LastTestedAtUtc: &now, CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, replacement, credential, replacement.EventTypes); err != nil {
 		t.Fatalf("retired registration keys were not released: %v", err)
 	}
@@ -387,13 +578,13 @@ func TestSaveReconciliationIsIdempotentAndAdvancesWatermark(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true,
 		ArchiveStream: domain.StreamMain, EventTypes: []domain.EventType{domain.EventMotion},
 		ConnectionStatus: "Online", Capabilities: &domain.CameraCapabilities{SupportedEventTypes: []domain.EventType{domain.EventMotion}},
 		CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -452,14 +643,14 @@ func TestUpdateCameraPolicyChangeResetsSearchWatermark(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000, Timezone: "UTC",
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000, Timezone: "UTC",
 		Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
 		HistoricalImport: domain.HistoricalImportNewOnly, EventTypes: []domain.EventType{domain.EventMotion},
 		Capabilities: &domain.CameraCapabilities{SupportedEventTypes: []domain.EventType{domain.EventMotion, domain.EventPerson}},
 		CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.Capabilities.SupportedEventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -509,11 +700,11 @@ func TestRecordingDownloadLifecycleIsDurable(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		EventTypes: []domain.EventType{domain.EventPerson}, CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -571,11 +762,11 @@ func TestClaimNextDownloadPrefersNewestRecording(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -606,12 +797,12 @@ func TestSaveRtspRecordingIndexesPublishedMediaAndTags(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
 		EventTypes: []domain.EventType{domain.EventPerson}, CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -645,12 +836,12 @@ func TestCameraArchiveStatsOnlyCountTheActiveSource(t *testing.T) {
 	defer store.Close()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
 		EventTypes: []domain.EventType{domain.EventPerson}, CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -696,12 +887,12 @@ func TestUpdateCameraProbeReinterpretsDiscoveredMetadataAfterTimezoneChange(t *t
 	defer store.Close()
 	now := time.Date(2026, 9, 12, 2, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents,
 		EventTypes: []domain.EventType{domain.EventVehicle}, CreatedAtUtc: now, UpdatedAtUtc: now,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -737,6 +928,35 @@ func TestUpdateCameraProbeReinterpretsDiscoveredMetadataAfterTimezoneChange(t *t
 	if len(items) != 1 || !items[0].StartAtUtc.Equal(expected) {
 		t.Fatalf("recording timestamp was not reinterpreted in the new timezone: %#v", items)
 	}
+	rules, err := json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: -8 * 3600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := "Camera/" + base64.RawURLEncoding.EncodeToString(rules)
+	for _, probe := range []bool{false, true} {
+		for _, timezone := range []string{custom, "Camera/Unverified"} {
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture camera", "test", "UTC", domain.CameraCapabilities{}, "Online", updatedAt); err != nil {
+				t.Fatal(err)
+			}
+			if probe {
+				err = store.UpdateCameraProbe(ctx, camera.ID, "Fixture camera", "test", timezone, domain.CameraCapabilities{}, "Online", updatedAt)
+			} else {
+				camera.Timezone = timezone
+				err = store.UpdateCamera(ctx, camera, nil, camera.EventTypes)
+			}
+			if err != nil {
+				t.Fatalf("camera-clock update blocked: %v", err)
+			}
+			items, err = store.ListRecordings(ctx, camera.ID, 10)
+			expected = recording.StartAtUtc
+			if timezone == custom {
+				expected = expected.Add(8 * time.Hour)
+			}
+			if err != nil || len(items) != 1 || !items[0].StartAtUtc.Equal(expected) {
+				t.Fatalf("custom/unverified timestamp handling failed: %#v %v", items, err)
+			}
+		}
+	}
 }
 
 func TestApplyEventTransitionPersistsAndClosesEventsIdempotently(t *testing.T) {
@@ -748,11 +968,11 @@ func TestApplyEventTransitionPersistsAndClosesEventsIdempotently(t *testing.T) {
 	defer store.Close()
 	started := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		EventTypes: []domain.EventType{domain.EventPerson}, CreatedAtUtc: started, UpdatedAtUtc: started,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -803,13 +1023,13 @@ func TestArchivedViewsExposeEventsOnlyAfterTheirMediaIsLocal(t *testing.T) {
 	started := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
 	ended := started.Add(time.Minute)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Front", Host: "10.0.0.152", Port: 9000,
+		ID: "camera-one", Name: "Front", Host: testconfig.Host(2), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 		RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
 		HistoricalImport: domain.HistoricalImportAll, EventTypes: []domain.EventType{domain.EventVehicle},
 		CreatedAtUtc: started, UpdatedAtUtc: started,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -853,6 +1073,9 @@ func TestArchivedViewsExposeEventsOnlyAfterTheirMediaIsLocal(t *testing.T) {
 	if err := store.CompleteRecording(ctx, recording.ID, "camera-one/vehicle.mp4", "abc123", recording.SizeBytes, ended.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SaveRecordingCoverage(ctx, recording.ID, []domain.TimeRange{{StartAtUtc: recording.StartAtUtc, EndAtUtc: recording.EndAtUtc}}); err != nil {
+		t.Fatal(err)
+	}
 	archivedRecordings, err = store.ListArchivedRecordings(ctx, camera.ID, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -875,12 +1098,12 @@ func TestArchivedEventsIncludeOnlyEventsCoveredByLocalRtspSegments(t *testing.T)
 	defer store.Close()
 	started := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
 	camera := domain.Camera{
-		ID: "camera-one", Name: "Living", Host: "10.0.0.156", Port: 9000,
+		ID: "camera-one", Name: "Living", Host: testconfig.Host(6), Port: 9000,
 		Timezone: "UTC", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamSub,
 		RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
 		EventTypes: []domain.EventType{domain.EventPerson}, CreatedAtUtc: started, UpdatedAtUtc: started,
 	}
-	credential := domain.EncryptedCredential{Username: "admin", Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
+	credential := domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("ciphertext"), Nonce: []byte("nonce"), KeyVersion: 1}
 	if err := store.CreateCamera(ctx, camera, credential, camera.EventTypes); err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +1120,7 @@ func TestArchivedEventsIncludeOnlyEventsCoveredByLocalRtspSegments(t *testing.T)
 	recording := domain.Recording{
 		ID: "rtsp-one", CameraID: camera.ID, NativeName: "Rtsp/segment.mkv",
 		Source: domain.RecordingSourceRtsp, Stream: domain.StreamSub,
-		StartAtUtc: started.Add(-time.Second), EndAtUtc: ended.Add(time.Second), SizeBytes: 1024,
+		StartAtUtc: started.Add(-time.Second), EndAtUtc: started.Add(time.Minute), SizeBytes: 1024,
 		EventTypes: []domain.EventType{domain.EventPerson}, State: domain.RecordingComplete,
 		RawMetadata: json.RawMessage(`{}`), DiscoveredAtUtc: ended, UpdatedAtUtc: ended,
 		LocalPath: "camera-one/Rtsp/segment.mkv", Sha256: "abc123",
@@ -905,9 +1128,34 @@ func TestArchivedEventsIncludeOnlyEventsCoveredByLocalRtspSegments(t *testing.T)
 	if err := store.SaveRtspRecording(ctx, recording); err != nil {
 		t.Fatal(err)
 	}
+	if events, err := store.ListArchivedEvents(ctx, camera.ID, 10); err != nil || len(events) != 0 {
+		t.Fatalf("unverified recording bounds were treated as event coverage: %#v %v", events, err)
+	}
+	if err := store.SaveRecordingCoverage(ctx, recording.ID, []domain.TimeRange{
+		{StartAtUtc: started, EndAtUtc: ended},
+		{StartAtUtc: started.Add(50 * time.Second), EndAtUtc: started.Add(time.Minute)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: started.Add(30 * time.Second), EventType: domain.EventPerson, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: started.Add(35 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
 	events, err := store.ListArchivedEvents(ctx, camera.ID, 10)
 	if err != nil || len(events) != 1 || events[0].EventType != domain.EventPerson {
 		t.Fatalf("event covered by local RTSP media was not exposed: %#v %v", events, err)
+	}
+	if !events[0].StartedAtUtc.Equal(started) {
+		t.Fatalf("event inside verified video hole was exposed: %#v", events)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE Recordings SET Source = 'CameraStorage', NativeName = 'recovered-native.mp4' WHERE Id = ?`, recording.ID); err != nil {
+		t.Fatal(err)
+	}
+	events, err = store.ListArchivedEvents(ctx, camera.ID, 10)
+	if err != nil || len(events) != 1 || !events[0].StartedAtUtc.Equal(started) {
+		t.Fatalf("verified recovered SD coverage did not back the event: %#v %v", events, err)
 	}
 }
 

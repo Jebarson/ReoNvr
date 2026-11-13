@@ -2,6 +2,7 @@ package reolink
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"slices"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"reonavr/internal/domain"
+
+	"reonavr/internal/testconfig"
 )
 
 type fixtureRunner struct {
@@ -49,11 +52,45 @@ func (runner *fixtureRunner) Run(_ context.Context, password string, arguments .
 		return []byte(`{"ok":true}`), nil
 	}
 	for key, response := range runner.responses {
+		if key == "vod search" && slices.Contains(arguments, "vod") && slices.Contains(arguments, "search") {
+			return []byte(response), nil
+		}
 		if strings.HasSuffix(strings.Join(arguments, " "), key) {
 			return []byte(response), nil
 		}
 	}
 	return nil, context.DeadlineExceeded
+}
+
+func TestClientDiscoveryIsBoundedAndDoesNotUseCredentials(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload string
+		wantErr bool
+	}{
+		{name: "empty scan", payload: `{"ok":true,"data":{"count":0,"devices":[]}}`},
+		{name: "missing devices", payload: `{"ok":true,"data":{}}`, wantErr: true},
+		{name: "invalid response", payload: `not-json`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &fixtureRunner{responses: map[string]string{"discover --timeout-secs 3 --output json": test.payload}}
+			devices, err := NewClient(runner, time.Second).Discover(context.Background())
+			if (err != nil) != test.wantErr {
+				t.Fatalf("unexpected result: devices=%#v err=%v", devices, err)
+			}
+			if len(runner.calls) != 1 || runner.passwords[0] != "" || slices.Contains(runner.calls[0], "--host") {
+				t.Fatalf("discovery used camera credentials or registration: %#v", runner.calls)
+			}
+		})
+	}
+}
+
+func TestClientDiscoveryNormalizesNativeReplyAndRejectsUnsafeEndpoints(t *testing.T) {
+	runner := &fixtureRunner{responses: map[string]string{"discover --timeout-secs 3 --output json": testconfig.Expand("{\"ok\":true,\"data\":{\"devices\":[\n\t\t{\"host\":\"{{host2}}:9000\",\"transport\":\"tcp\",\"uid\":\"private-identifier\",\"mac\":\"private-mac\",\"scopes\":[\"reolink-lan://name/Front%20Door\"]},\n\t\t{\"host\":\"{{host2}}:9000\",\"transport\":\"tcp\"},\n\t\t{\"host\":\"{{host3}}:9001\",\"transport\":\"tcp\"},\n\t\t{\"host\":\"8.8.8.8:9000\",\"transport\":\"tcp\"},\n\t\t{\"host\":\"camera.example:9000\",\"transport\":\"tcp\"},\n\t\t{\"host\":\"{{host4}}:0\",\"transport\":\"tcp\"},\n\t\t{\"host\":\"{{host5}}:9000\",\"transport\":\"udp\"},\n\t\t{\"host\":\"invalid\",\"transport\":\"tcp\"}\n\t]}}")}}
+	devices, err := NewClient(runner, time.Second).Discover(context.Background())
+	if err != nil || len(devices) != 2 || devices[0].Host != testconfig.Host(2) || devices[0].Port != 9000 || devices[0].Name != "Front Door" || devices[1].Port != 9001 {
+		t.Fatalf("unexpected normalized discovery: %#v %v", devices, err)
+	}
 }
 
 func TestClientNormalizesCameraCapabilitiesWithoutPasswordArgument(t *testing.T) {
@@ -65,12 +102,13 @@ func TestClientNormalizesCameraCapabilitiesWithoutPasswordArgument(t *testing.T)
 		"encode get":                           `{"data":{"main":{"width":3840,"height":2160,"bitrate":6144,"fps":25},"sub":{"width":640,"height":360,"bitrate":256,"fps":10}}}`,
 		"record config get":                    `{"data":{"preRecordSecs":10,"postRecordSecs":15,"schedule":{"TIMING":"00000000"}}}`,
 		"storage status":                       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":0.779296875,"totalGB":238}]}}`,
+		"vod search":                           `{"data":{"items":[]}}`,
 		"capabilities":                         `{"data":{"item":{"motion":"1","aitype":"1847"}}}`,
-		"stream url --kind rtsp --stream main": `{"data":{"urls":["rtsp://10.0.0.152/Preview_01_main"]}}`,
+		"stream url --kind rtsp --stream main": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{host2}}/Preview_01_main\"]}}"),
 	}}
 	client := NewClient(runner, time.Second)
 	client.captureSnapshot = true
-	result, err := client.Test(context.Background(), Connection{Host: "10.0.0.152", Port: 9000, Timezone: "America/Los_Angeles", Username: "admin", Password: "secret"})
+	result, err := client.Test(context.Background(), Connection{Host: testconfig.Host(2), Port: 9000, Timezone: "America/Los_Angeles", Username: testconfig.Username(), Password: testconfig.Password()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +118,7 @@ func TestClientNormalizesCameraCapabilitiesWithoutPasswordArgument(t *testing.T)
 	if !result.TimezoneConfiguration.DstEnabled || result.TimezoneConfiguration.DstStart.Month != 3 || result.TimezoneConfiguration.DstEnd.Month != 11 {
 		t.Fatalf("unexpected timezone configuration: %#v", result.TimezoneConfiguration)
 	}
-	if !result.Capabilities.StorageAvailable || !result.Capabilities.RtspAvailable || result.Capabilities.ContinuousAvailable {
+	if !result.Capabilities.StorageAvailable || !result.Capabilities.StoragePlaybackAvailable || !result.Capabilities.RtspAvailable || result.Capabilities.ContinuousAvailable {
 		t.Fatalf("unexpected recording capabilities: %#v", result.Capabilities)
 	}
 	if result.Capabilities.MainBitrateKbps != 6144 || result.Capabilities.SubBitrateKbps != 256 {
@@ -97,12 +135,212 @@ func TestClientNormalizesCameraCapabilitiesWithoutPasswordArgument(t *testing.T)
 		t.Fatalf("unexpected events: %#v", result.Capabilities.SupportedEventTypes)
 	}
 	for index, call := range runner.calls {
-		if slices.Contains(call, "secret") {
+		if slices.Contains(call, testconfig.Password()) {
 			t.Fatalf("password present in command arguments: %#v", call)
 		}
-		if !slices.Contains(call, "--password-stdin") || runner.passwords[index] != "secret" {
+		if !slices.Contains(call, "--password-stdin") || runner.passwords[index] != testconfig.Password() {
 			t.Fatalf("password was not sent through stdin: %#v", call)
 		}
+	}
+}
+
+func TestConnectionTestKeepsStreamsAvailableWhenClockIsUnverified(test *testing.T) {
+	runner := &fixtureRunner{responses: map[string]string{
+		"info":                                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+		"config get time-zone":                 `{"data":{"timeZone":28800}}`,
+		"raw 106":                              `{"data":{}}`,
+		"storage status":                       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+		"stream url --kind rtsp --stream main": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{host1}}/Preview_01_main\"]}}"),
+	}}
+	result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
+	if err != nil || !result.Capabilities.RtspAvailable || result.Capabilities.ClockWarning != "" || result.Timezone != "Camera/Unverified" {
+		test.Fatalf("unverified clock blocked a valid connection or claimed a time mismatch: %#v %v", result, err)
+	}
+	if result.Capabilities.StoragePlaybackAvailable {
+		test.Fatal("unverified timestamps must not enable storage recovery")
+	}
+	for _, call := range runner.calls {
+		if slices.Contains(call, "vod") {
+			test.Fatal("unverified timestamps triggered a historical search")
+		}
+	}
+}
+
+func TestCustomCameraClockPreservesRulesAcrossSeasons(test *testing.T) {
+	configuration := TimezoneConfiguration{
+		BaseOffsetSeconds: -8 * 3600, DstEnabled: true, DstOffsetSeconds: 3600,
+		DstStart: DstTransition{Month: 3, Week: 2, Weekday: 0, Hour: 1},
+		DstEnd:   DstTransition{Month: 11, Week: 1, Weekday: 0, Hour: 3},
+	}
+	name, err := customCameraTimezone(configuration)
+	if err != nil {
+		test.Fatal(err)
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		test.Fatal(err)
+	}
+	for _, sample := range []struct {
+		instant string
+		offset  int
+	}{
+		{"2026-01-15T12:00:00Z", -8 * 3600},
+		{"2026-07-15T12:00:00Z", -7 * 3600},
+		{"2026-03-08T08:59:59Z", -8 * 3600},
+		{"2026-03-08T09:00:00Z", -7 * 3600},
+		{"2026-11-01T09:59:59Z", -7 * 3600},
+		{"2026-11-01T10:00:00Z", -8 * 3600},
+	} {
+		instant, err := time.Parse(time.RFC3339, sample.instant)
+		if err != nil || zoneOffset(location, instant) != sample.offset {
+			test.Errorf("custom offset at %s: got %d, want %d (%v)", sample.instant, zoneOffset(location, instant), sample.offset, err)
+		}
+	}
+	local, err := time.ParseInLocation("2006-01-02T15:04:05", "2026-07-15T05:00:00", location)
+	if err != nil || local.UTC().Format(time.RFC3339) != "2026-07-15T12:00:00Z" {
+		test.Fatalf("custom recording timestamp conversion failed: %v %v", local, err)
+	}
+	from := time.Date(2026, 11, 1, 9, 30, 0, 0, time.UTC)
+	if validateCameraSearchClock(name, from, from.Add(time.Minute)) == nil {
+		test.Fatal("ambiguous repeated local timestamps must not be guessed")
+	}
+	if _, err := cameraLocation("Camera/Unverified"); err == nil {
+		test.Fatal("unverified clock must not silently become UTC")
+	}
+}
+
+func TestCustomCameraClockHandlesSouthernAndFixedOffsets(test *testing.T) {
+	for _, fixture := range []struct {
+		name          string
+		configuration TimezoneConfiguration
+		samples       map[string]int
+	}{
+		{
+			name: "southern daylight saving",
+			configuration: TimezoneConfiguration{
+				BaseOffsetSeconds: 37800, DstEnabled: true, DstOffsetSeconds: 3600,
+				DstStart: DstTransition{Month: 10, Week: 1, Weekday: 0, Hour: 1},
+				DstEnd:   DstTransition{Month: 4, Week: 1, Weekday: 0, Hour: 3},
+			},
+			samples: map[string]int{
+				"2026-01-15T12:00:00Z": 41400,
+				"2026-07-15T12:00:00Z": 37800,
+				"2026-04-04T15:29:59Z": 41400,
+				"2026-04-04T15:30:00Z": 37800,
+				"2026-10-03T14:29:59Z": 37800,
+				"2026-10-03T14:30:00Z": 41400,
+			},
+		},
+		{
+			name:          "nonstandard fixed offset",
+			configuration: TimezoneConfiguration{BaseOffsetSeconds: 12345},
+			samples: map[string]int{
+				"2026-01-15T12:00:00Z": 12345,
+				"2026-07-15T12:00:00Z": 12345,
+			},
+		},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			name, err := customCameraTimezone(fixture.configuration)
+			if err != nil {
+				test.Fatal(err)
+			}
+			location, err := cameraLocation(name)
+			if err != nil {
+				test.Fatal(err)
+			}
+			for sample, expected := range fixture.samples {
+				instant, err := time.Parse(time.RFC3339, sample)
+				if err != nil || zoneOffset(location, instant) != expected {
+					test.Errorf("custom offset at %s: got %d, want %d (%v)", sample, zoneOffset(location, instant), expected, err)
+				}
+			}
+		})
+	}
+}
+
+func TestConnectionTestAcceptsCustomClockAndStorageSearch(test *testing.T) {
+	runner := &fixtureRunner{responses: map[string]string{
+		"info":                                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+		"config get time-zone":                 `{"data":{"timeZone":28800}}`,
+		"raw 106":                              `{"data":{"Dst":{"enable":1,"offset":1,"startMon":3,"startWeek":2,"startWeekday":0,"startHour":1,"startMin":0,"startSec":0,"endMon":11,"endWeek":1,"endWeekday":0,"endHour":3,"endMin":0,"endSec":0}}}`,
+		"storage status":                       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+		"stream url --kind rtsp --stream main": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{host1}}/Preview_01_main\"]}}"),
+		"vod search":                           `{"data":{"items":[]}}`,
+	}}
+	result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
+	if err != nil || !result.Capabilities.RtspAvailable || result.Capabilities.ClockWarning != "" || !strings.HasPrefix(result.Timezone, cameraClockPrefix) {
+		test.Fatalf("custom clock blocked the connection: %#v %v", result, err)
+	}
+	configuration, err := decodeCameraClock(result.Timezone)
+	if err != nil || configuration.DstStart.Hour != 1 || configuration.DstEnd.Hour != 3 {
+		test.Fatalf("custom clock rules were not preserved: %#v %v", configuration, err)
+	}
+	client := NewClient(runner, time.Second)
+	from := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	_, err = client.SearchRecordings(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password(), Timezone: result.Timezone}, domain.StreamMain, from, from.Add(time.Minute))
+	if err != nil {
+		test.Fatal(err)
+	}
+	call := runner.calls[len(runner.calls)-1]
+	if !slices.Contains(call, "2026-07-15T05:00:00") || !slices.Contains(call, "2026-07-15T05:01:00") {
+		test.Fatalf("search did not use the reported daylight-saving offset: %v", call)
+	}
+}
+
+func TestCustomClockWarningRequiresCurrentTimeMismatch(test *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		skew    time.Duration
+		missing bool
+		warning bool
+	}{
+		{name: "matching time"},
+		{name: "small clock drift", skew: 30 * time.Second},
+		{name: "camera ahead", skew: 3 * time.Minute, warning: true},
+		{name: "camera behind", skew: -3 * time.Minute, warning: true},
+		{name: "unreadable time", missing: true},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			configuration := TimezoneConfiguration{BaseOffsetSeconds: -8 * 3600, DstEnabled: true, DstOffsetSeconds: 3600,
+				DstStart: DstTransition{Month: 3, Week: 2, Weekday: 0, Hour: 1}, DstEnd: DstTransition{Month: 11, Week: 1, Weekday: 0, Hour: 3}}
+			name, err := customCameraTimezone(configuration)
+			if err != nil {
+				test.Fatal(err)
+			}
+			location, err := cameraLocation(name)
+			if err != nil {
+				test.Fatal(err)
+			}
+			local := time.Now().Add(fixture.skew).In(location)
+			payload, err := json.Marshal(map[string]any{"data": map[string]any{"Time": map[string]int{
+				"year": local.Year(), "month": int(local.Month()), "day": local.Day(), "hour": local.Hour(), "minute": local.Minute(), "second": local.Second(),
+			}}})
+			if err != nil {
+				test.Fatal(err)
+			}
+			if fixture.missing {
+				payload = []byte(`{"data":{}}`)
+			}
+			runner := &fixtureRunner{responses: map[string]string{
+				"info":                                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+				"config get time-zone":                 `{"data":{"timeZone":28800}}`,
+				"raw 106":                              `{"data":{"Dst":{"enable":1,"offset":1,"startMon":3,"startWeek":2,"startWeekday":0,"startHour":1,"startMin":0,"startSec":0,"endMon":11,"endWeek":1,"endWeekday":0,"endHour":3,"endMin":0,"endSec":0}}}`,
+				"config get system-general":            string(payload),
+				"stream url --kind rtsp --stream main": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{host1}}/Preview_01_main\"]}}"),
+			}}
+			result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
+			if err != nil || !result.Capabilities.RtspAvailable {
+				test.Fatalf("clock comparison blocked the connection: %v", err)
+			}
+			expected := ""
+			if fixture.warning {
+				expected = "Your camera's time doesn't match your machine. ReoNvr will use the camera's clock."
+			}
+			if result.Capabilities.ClockWarning != expected {
+				test.Fatalf("unexpected clock warning: got %q, want %q", result.Capabilities.ClockWarning, expected)
+			}
+		})
 	}
 }
 
@@ -136,9 +374,18 @@ func TestResolveCameraTimezoneRejectsMismatchedPreference(t *testing.T) {
 	}
 }
 
+func TestTimezoneMismatchRetainsOnlyParsedClockConfiguration(test *testing.T) {
+	configuration := TimezoneConfiguration{BaseOffsetSeconds: 12345}
+	_, err := resolveCameraTimezone(configuration, "UTC", time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC))
+	var mismatch *TimezoneMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Configuration != configuration {
+		test.Fatalf("expected a typed clock mismatch with its parsed configuration: %v", err)
+	}
+}
+
 func TestClientRequiresPrivateAddress(t *testing.T) {
 	client := NewClient(&fixtureRunner{}, time.Second)
-	_, err := client.Test(context.Background(), Connection{Host: "8.8.8.8", Port: 9000, Username: "admin", Password: "secret"})
+	_, err := client.Test(context.Background(), Connection{Host: "8.8.8.8", Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
 	if err == nil || !strings.Contains(err.Error(), "private network") {
 		t.Fatalf("expected private-network error, got %v", err)
 	}
@@ -152,27 +399,27 @@ func TestDecodeDataRejectsMalformedPayload(t *testing.T) {
 }
 
 func TestSafeCommandErrorRedactsPassword(t *testing.T) {
-	message := safeCommandError("login failed for password camera-secret", "camera-secret")
-	if strings.Contains(message, "camera-secret") || !strings.Contains(message, "[redacted]") {
+	message := safeCommandError(testconfig.Expand("login failed for password {{password}}"), testconfig.Password())
+	if strings.Contains(message, testconfig.Password()) || !strings.Contains(message, "[redacted]") {
 		t.Fatalf("password was not redacted: %q", message)
 	}
 }
 
 func TestClientGetsRtspURLWithoutReturningEmbeddedCredentials(t *testing.T) {
 	runner := &fixtureRunner{responses: map[string]string{
-		"stream url --kind rtsp --stream sub": `{"data":{"urls":["rtsp://camera-user:camera-secret@10.0.0.152:554/Preview_01_sub"]}}`,
+		"stream url --kind rtsp --stream sub": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{username}}:{{password}}@{{host2}}:554/Preview_01_sub\"]}}"),
 	}}
 	client := NewClient(runner, time.Second)
 	streamURL, err := client.RtspURL(context.Background(), Connection{
-		Host: "10.0.0.152", Port: 9000, Username: "camera-user", Password: "camera-secret",
+		Host: testconfig.Host(2), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password(),
 	}, domain.StreamSub)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if streamURL != "rtsp://10.0.0.152:554/Preview_01_sub" {
+	if streamURL != testconfig.Expand("rtsp://{{host2}}:554/Preview_01_sub") {
 		t.Fatalf("unexpected RTSP URL: %q", streamURL)
 	}
-	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], "camera-secret") || runner.passwords[0] != "camera-secret" {
+	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], testconfig.Password()) || runner.passwords[0] != testconfig.Password() {
 		t.Fatalf("RTSP lookup did not preserve password-stdin handling: %#v", runner.calls)
 	}
 }
@@ -187,7 +434,7 @@ func TestClientStreamsNormalizedEventTransitionsWithoutPasswordArgument(t *testi
 	client := NewClient(runner, time.Second)
 	var transitions []domain.EventTransition
 	err := client.StreamEvents(context.Background(), Connection{
-		Host: "10.0.0.152", Port: 9000, Username: "admin", Password: "secret",
+		Host: testconfig.Host(2), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password(),
 	}, func(transition domain.EventTransition) error {
 		transitions = append(transitions, transition)
 		return nil
@@ -198,7 +445,7 @@ func TestClientStreamsNormalizedEventTransitionsWithoutPasswordArgument(t *testi
 	if len(transitions) != 2 || transitions[0].EventType != domain.EventPerson || !transitions[0].Active || transitions[1].Active {
 		t.Fatalf("unexpected transitions: %#v", transitions)
 	}
-	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], "secret") || runner.passwords[0] != "secret" {
+	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], testconfig.Password()) || runner.passwords[0] != testconfig.Password() {
 		t.Fatalf("event stream exposed or omitted the password: %#v", runner.calls)
 	}
 	if !slices.Contains(runner.calls[0], "--password-stdin") {
@@ -213,7 +460,7 @@ func TestClientReplaysBufferedEventsAfterCursor(t *testing.T) {
 	client := NewClient(runner, time.Second)
 	var transitions []domain.EventTransition
 	err := client.QueryEvents(context.Background(), Connection{
-		Host: "10.0.0.152", Port: 9000, Username: "admin", Password: "secret",
+		Host: testconfig.Host(2), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password(),
 	}, time.Unix(1776765504, 0), func(transition domain.EventTransition) error {
 		transitions = append(transitions, transition)
 		return nil
@@ -224,7 +471,7 @@ func TestClientReplaysBufferedEventsAfterCursor(t *testing.T) {
 	if len(transitions) != 2 || transitions[0].EventType != domain.EventPerson || transitions[1].Active {
 		t.Fatalf("unexpected replay transitions: %#v", transitions)
 	}
-	if slices.Contains(runner.calls[0], "secret") || runner.passwords[0] != "secret" {
+	if slices.Contains(runner.calls[0], testconfig.Password()) || runner.passwords[0] != testconfig.Password() {
 		t.Fatal("event replay did not keep the password on stdin")
 	}
 }
@@ -258,7 +505,7 @@ func TestClientSearchRecordingsNormalizesCLIResults(t *testing.T) {
 	}}
 	client := NewClient(runner, time.Second)
 	items, err := client.SearchRecordings(context.Background(), Connection{
-		Host: "10.0.0.152", Port: 9000, Username: "admin", Password: "secret",
+		Host: testconfig.Host(2), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password(),
 	}, domain.StreamMain, time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC), time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
@@ -273,7 +520,7 @@ func TestClientSearchRecordingsNormalizesCLIResults(t *testing.T) {
 	if len(items[0].ID) != 32 {
 		t.Fatalf("expected stable recording ID, got %q", items[0].ID)
 	}
-	if slices.Contains(runner.calls[0], "secret") || runner.passwords[0] != "secret" {
+	if slices.Contains(runner.calls[0], testconfig.Password()) || runner.passwords[0] != testconfig.Password() {
 		t.Fatal("search did not keep the password on stdin")
 	}
 }
@@ -284,12 +531,12 @@ func TestClientDownloadsNativeRecordingWithoutPasswordArgument(t *testing.T) {
 	}}
 	client := NewClient(runner, time.Second)
 	err := client.DownloadRecording(context.Background(), Connection{
-		Host: "10.0.0.152", Port: 9000, Username: "admin", Password: "secret",
+		Host: testconfig.Host(2), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password(),
 	}, "clip.mp4", domain.StreamMain, "/archive/clip.mp4.partial")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], "secret") || runner.passwords[0] != "secret" {
+	if len(runner.calls) != 1 || slices.Contains(runner.calls[0], testconfig.Password()) || runner.passwords[0] != testconfig.Password() {
 		t.Fatalf("download exposed or omitted the password: %#v", runner.calls)
 	}
 }

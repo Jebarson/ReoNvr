@@ -1,0 +1,22 @@
+{
+  "username": "",
+  "password": "",
+  "probeCamera": "probe",
+  "storageCamera": "storage",
+  "cameras": [
+    { "id": "probe", "name": "Probe camera", "host": "", "port": 9000, "channel": 0 },
+    { "id": "storage", "name": "Storage camera", "host": "", "port": 9000, "channel": 0 }
+  ],
+  "fixtures": {
+    "username": "",
+    "password": "",
+    "hosts": [
+      "192.168.253.10",
+      "192.168.253.11",
+      "192.168.253.12",
+      "192.168.253.13",
+      "192.168.253.14",
+      "192.168.253.15"
+    ]
+  }
+}

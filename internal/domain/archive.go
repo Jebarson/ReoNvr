@@ -5,6 +5,37 @@ import (
 	"time"
 )
 
+type TimeRange struct {
+	StartAtUtc time.Time `json:"startAtUtc"`
+	EndAtUtc   time.Time `json:"endAtUtc"`
+}
+
+type RecoveryPeriod struct {
+	ID               string
+	CameraID         string
+	Stream           ArchiveStream
+	Mode             RecordingMode
+	EventTypes       []EventType
+	PreEventSeconds  int
+	PostEventSeconds int
+	StartAtUtc       time.Time
+	EndAtUtc         *time.Time
+	ScannedUntilUtc  time.Time
+}
+
+type RecoveryGap struct {
+	ID         string        `json:"id"`
+	PeriodID   string        `json:"-"`
+	CameraID   string        `json:"cameraId"`
+	Stream     ArchiveStream `json:"stream"`
+	Mode       RecordingMode `json:"mode"`
+	EventTypes []EventType   `json:"eventTypes"`
+	TimeRange
+	Status           string     `json:"status"`
+	MissingSeconds   float64    `json:"missingSeconds"`
+	LastCheckedAtUtc *time.Time `json:"lastCheckedAtUtc,omitempty"`
+}
+
 type RecordingState string
 
 const (

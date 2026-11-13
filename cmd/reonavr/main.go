@@ -73,12 +73,15 @@ func run(logger *slog.Logger) error {
 	downloadService := archive.NewDownloadService(store, sharedClient, credentialCipher, archiveRoot)
 	downloadService.SetApplicationSettingsProvider(store)
 	downloadService.SetCapacityGuard(retentionService)
+	mediaInspector := &archive.FFmpegSegmenter{
+		Path:      environment("REONVR_FFMPEG_PATH", "/usr/bin/ffmpeg"),
+		ProbePath: environment("REONVR_FFPROBE_PATH", "/usr/bin/ffprobe"),
+	}
+	downloadService.SetMediaInspector(mediaInspector)
+	recoveryService := archive.NewRecoveryService(store, sharedClient, credentialCipher)
 	rtspRecorderService := archive.NewRtspRecorderService(
 		store, sharedClient, credentialCipher,
-		&archive.FFmpegSegmenter{
-			Path:      environment("REONVR_FFMPEG_PATH", "/usr/bin/ffmpeg"),
-			ProbePath: environment("REONVR_FFPROBE_PATH", "/usr/bin/ffprobe"),
-		},
+		mediaInspector,
 		archiveRoot,
 		environment("REONVR_RTSP_BUFFER_ROOT", "/archive/.rtsp-buffer"),
 	)
@@ -96,90 +99,63 @@ func run(logger *slog.Logger) error {
 		return retentionService.EnsureCapacity(workerContext, 0)
 	}})
 	supervisor.Add(workers.Spec{Name: "HealthAggregationWorker", Interval: 30 * time.Second, Run: func(context.Context) error { return nil }})
-	manageCameraWorker := func(item domain.Camera) {
-		if !item.Enabled {
-			supervisor.Remove("CameraLifecycleWorker", item.ID)
-			supervisor.Remove("LiveEventWorker", item.ID)
-			supervisor.Remove("ReconciliationWorker", item.ID)
-			supervisor.Remove("DownloadWorker", item.ID)
-			supervisor.Remove("RtspRecorderWorker", item.ID)
-			return
-		}
-		supervisor.Add(workers.Spec{
-			Name: "CameraLifecycleWorker", ScopeKey: item.ID, Interval: time.Minute,
-			Run: func(workerContext context.Context) error { return service.Probe(workerContext, item.ID) },
-		})
-		if !recordingEnabled.Load() {
-			supervisor.Remove("LiveEventWorker", item.ID)
-			supervisor.Remove("ReconciliationWorker", item.ID)
-			supervisor.Remove("DownloadWorker", item.ID)
-			supervisor.Remove("RtspRecorderWorker", item.ID)
-			return
-		}
-		supervisor.Remove("LiveEventWorker", item.ID)
-		if item.ArchiveEnabled && len(item.EventTypes) > 0 {
-			supervisor.Add(workers.Spec{
-				Name: "LiveEventWorker", ScopeKey: item.ID, Interval: 2 * time.Second,
-				Run: func(workerContext context.Context) error { return eventService.Watch(workerContext, item.ID) },
-			})
-		}
-		if item.ArchiveEnabled && item.RecordingSource == domain.RecordingSourceCameraStorage &&
-			(item.RecordingMode == domain.RecordingModeContinuous || len(item.EventTypes) > 0) {
-			supervisor.Add(workers.Spec{
-				Name: "ReconciliationWorker", ScopeKey: item.ID, Interval: time.Hour,
-				Run: func(workerContext context.Context) error { return archiveService.Reconcile(workerContext, item.ID) },
-			})
-			supervisor.Add(workers.Spec{
-				Name: "DownloadWorker", ScopeKey: item.ID, Interval: 5 * time.Second,
-				Run: func(workerContext context.Context) error { return downloadService.DownloadNext(workerContext, item.ID) },
-			})
-		} else {
-			supervisor.Remove("ReconciliationWorker", item.ID)
-			supervisor.Remove("DownloadWorker", item.ID)
-		}
-		supervisor.Remove("RtspRecorderWorker", item.ID)
-		if item.ArchiveEnabled && item.RecordingSource == domain.RecordingSourceRtsp &&
-			(item.RecordingMode == domain.RecordingModeContinuous ||
-				(item.RecordingMode == domain.RecordingModeEvents && len(item.EventTypes) > 0)) {
-			supervisor.Add(workers.Spec{
-				Name: "RtspRecorderWorker", ScopeKey: item.ID, Interval: 5 * time.Second,
-				Run: func(workerContext context.Context) error { return rtspRecorderService.Record(workerContext, item.ID) },
-			})
-		}
+	cameraWorkers := &cameraWorkerManager{
+		registry: supervisor, enabled: recordingEnabled.Load, logger: logger,
+		syncIntent: func(intentContext context.Context, item domain.Camera) error {
+			return store.SyncRecordingIntent(intentContext, item, recordingEnabled.Load(), time.Now().UTC())
+		},
+		probe: service.Probe, watch: eventService.Watch, recover: recoveryService.Reconcile,
+		download: downloadService.DownloadNext, record: rtspRecorderService.Record,
 	}
-	service.SetLifecycleHooks(manageCameraWorker, func(id string) {
-		supervisor.Remove("CameraLifecycleWorker", id)
-		supervisor.Remove("LiveEventWorker", id)
-		supervisor.Remove("ReconciliationWorker", id)
-		supervisor.Remove("DownloadWorker", id)
-		supervisor.Remove("RtspRecorderWorker", id)
+	service.SetLifecycleHooks(func(item domain.Camera) {
+		recordingControlService.ApplyCameraChange(func() { cameraWorkers.Apply(item) })
+	}, func(id string) {
+		recordingControlService.ApplyCameraChange(func() {
+			if err := store.CloseRecordingIntents(context.Background(), id, time.Now().UTC()); err != nil {
+				logger.Error("close recording intent", "error", err)
+			}
+			supervisor.Remove("RecoveryWorker", id)
+			supervisor.Remove("CameraLifecycleWorker", id)
+			supervisor.Remove("LiveEventWorker", id)
+			supervisor.Remove("ReconciliationWorker", id)
+			supervisor.Remove("DownloadWorker", id)
+			supervisor.Remove("RtspRecorderWorker", id)
+		})
 	})
 	applyRecordingControl := func(enabled bool) {
 		recordingEnabled.Store(enabled)
 		if !enabled {
-			supervisor.RemoveAll("EventFinalizationWorker", "LiveEventWorker", "ReconciliationWorker", "DownloadWorker", "RtspRecorderWorker")
+			supervisor.RemoveAll("RecoveryWorker", "EventFinalizationWorker", "LiveEventWorker", "ReconciliationWorker", "DownloadWorker", "RtspRecorderWorker")
 			return
 		}
-		supervisor.Add(workers.Spec{Name: "EventFinalizationWorker", Interval: 5 * time.Second, Run: eventService.FinalizeNext})
 		items, listErr := service.List(context.Background())
 		if listErr != nil {
 			logger.Error("restore camera recording workers", "error", listErr)
 			return
 		}
 		for _, item := range items {
-			manageCameraWorker(item)
+			cameraWorkers.Apply(item)
 		}
 	}
 	recordingControlService.SetLifecycleHook(applyRecordingControl)
+	supervisor.Add(workers.Spec{Name: "RecordingIntentWorker", Interval: time.Minute, Run: func(workerContext context.Context) error {
+		var result error
+		recordingControlService.ApplyCameraChange(func() {
+			items, err := service.List(workerContext)
+			if err != nil {
+				result = err
+				return
+			}
+			result = cameraWorkers.ReconcileIntents(workerContext, items)
+		})
+		return result
+	}})
 	registered, err := service.List(ctx)
 	if err != nil {
 		return err
 	}
 	for _, item := range registered {
-		manageCameraWorker(item)
-	}
-	if recordingEnabled.Load() {
-		supervisor.Add(workers.Spec{Name: "EventFinalizationWorker", Interval: 5 * time.Second, Run: eventService.FinalizeNext})
+		recordingControlService.ApplyCameraChange(func() { cameraWorkers.Apply(item) })
 	}
 	assets, err := webui.Files()
 	if err != nil {

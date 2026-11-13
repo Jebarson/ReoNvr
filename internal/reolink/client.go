@@ -32,6 +32,8 @@ type Connection struct {
 	Password string
 }
 
+var ErrInvalidConnection = errors.New("invalid camera connection")
+
 type TestResult struct {
 	Model                 string
 	Firmware              string
@@ -42,12 +44,26 @@ type TestResult struct {
 	SnapshotJPEG          []byte
 }
 
+type DiscoveredCamera struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	Name string `json:"name"`
+}
+
 type TimezoneConfiguration struct {
 	BaseOffsetSeconds int           `json:"baseOffsetSeconds"`
 	DstEnabled        bool          `json:"dstEnabled"`
 	DstOffsetSeconds  int           `json:"dstOffsetSeconds"`
 	DstStart          DstTransition `json:"dstStart"`
 	DstEnd            DstTransition `json:"dstEnd"`
+}
+
+type TimezoneMismatchError struct {
+	Configuration TimezoneConfiguration
+}
+
+func (failure *TimezoneMismatchError) Error() string {
+	return "camera timezone rules do not match an installed IANA timezone"
 }
 
 type DstTransition struct {
@@ -175,9 +191,66 @@ func NewValidationClient(runner *ExecRunner, gatewayPath string, timeout time.Du
 	return &Client{runner: runner, timeout: timeout, isolatedGatewayPath: gatewayPath, captureSnapshot: true}
 }
 
+func (client *Client) Discover(ctx context.Context) ([]DiscoveredCamera, error) {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	payload, err := client.runner.Run(ctx, "", "discover", "--timeout-secs", "3", "--output", "json")
+	if err != nil {
+		return nil, errors.New("camera discovery failed; check local network access and try again")
+	}
+	var result struct {
+		Devices []struct {
+			Host      string   `json:"host"`
+			Transport string   `json:"transport"`
+			Scopes    []string `json:"scopes"`
+		} `json:"devices"`
+	}
+	if err := decodeData(payload, &result); err != nil || result.Devices == nil {
+		return nil, errors.New("camera discovery returned an invalid device list")
+	}
+	devices := make([]DiscoveredCamera, 0, len(result.Devices))
+	seen := make(map[string]bool)
+	for _, device := range result.Devices {
+		if device.Transport != "" && device.Transport != "tcp" {
+			continue
+		}
+		host, rawPort, err := net.SplitHostPort(device.Host)
+		if err != nil {
+			continue
+		}
+		address := net.ParseIP(host)
+		port, err := strconv.Atoi(rawPort)
+		if address == nil || (!address.IsPrivate() && !address.IsLinkLocalUnicast()) || err != nil || port < 1 || port > 65535 {
+			continue
+		}
+		host = address.String()
+		key := net.JoinHostPort(host, strconv.Itoa(port))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		name := ""
+		for _, scope := range device.Scopes {
+			value, err := url.Parse(scope)
+			if err == nil && value.Scheme == "reolink-lan" && value.Host == "name" {
+				name = strings.TrimPrefix(value.Path, "/")
+				break
+			}
+		}
+		devices = append(devices, DiscoveredCamera{Host: host, Port: port, Name: name})
+	}
+	sort.Slice(devices, func(first, second int) bool {
+		if devices[first].Host == devices[second].Host {
+			return devices[first].Port < devices[second].Port
+		}
+		return devices[first].Host < devices[second].Host
+	})
+	return devices, nil
+}
+
 func (client *Client) Test(ctx context.Context, connection Connection) (TestResult, error) {
 	if err := validateConnection(connection); err != nil {
-		return TestResult{}, err
+		return TestResult{}, fmt.Errorf("%w: %v", ErrInvalidConnection, err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, client.timeout)
 	defer cancel()
@@ -213,33 +286,7 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 		return TestResult{}, errors.New("camera returned incomplete device information")
 	}
 
-	timezoneBytes, err := commandClient.run(ctx, connection, "config", "get", "time-zone")
-	if err != nil {
-		return TestResult{}, fmt.Errorf("read camera timezone: %w", err)
-	}
-	cameraTimezoneOffsetSeconds, err := parseTimezoneOffset(timezoneBytes)
-	if err != nil {
-		return TestResult{}, err
-	}
-	dstBytes, err := commandClient.run(ctx, connection, "raw", "106")
-	if err != nil {
-		return TestResult{}, fmt.Errorf("read camera daylight-saving configuration: %w", err)
-	}
-	timezoneConfiguration, err := parseDstConfiguration(dstBytes)
-	if err != nil {
-		return TestResult{}, err
-	}
-	timezoneConfiguration.BaseOffsetSeconds = -cameraTimezoneOffsetSeconds
-	timezone, err := resolveCameraTimezone(timezoneConfiguration, connection.Timezone, time.Now().UTC())
-	if err != nil {
-		return TestResult{}, err
-	}
-
-	result := TestResult{
-		Model: info.Model, Firmware: info.Firmware, Timezone: timezone,
-		TimezoneOffsetSeconds: timezoneConfiguration.BaseOffsetSeconds,
-		TimezoneConfiguration: timezoneConfiguration,
-	}
+	result := TestResult{Model: info.Model, Firmware: info.Firmware}
 	if payload, err := commandClient.run(ctx, connection, "encode", "get"); err == nil {
 		parseEncode(payload, &result.Capabilities)
 	}
@@ -259,6 +306,27 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 	if payload, err := commandClient.run(ctx, connection, "stream", "url", "--kind", "rtsp", "--stream", strings.ToLower(string(stream))); err == nil {
 		result.Capabilities.RtspAvailable = containsRtspURL(payload)
 	}
+	configuration, timezone, clockErr := commandClient.readCameraClock(ctx, connection)
+	result.TimezoneConfiguration = configuration
+	result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
+	result.Timezone = timezone
+	if clockErr != nil {
+		result.Timezone = "Camera/Unverified"
+	} else if strings.HasPrefix(timezone, cameraClockPrefix) {
+		started := time.Now().UTC()
+		payload, err := commandClient.run(ctx, connection, "config", "get", "system-general")
+		finished := time.Now().UTC()
+		if err == nil && cameraClockDiffers(payload, timezone, started, finished) {
+			result.Capabilities.ClockWarning = "Your camera's time doesn't match your machine. ReoNvr will use the camera's clock."
+		}
+	}
+	if result.Capabilities.StorageAvailable && clockErr == nil {
+		searchConnection := connection
+		searchConnection.Timezone = result.Timezone
+		now := time.Now().UTC()
+		_, err := commandClient.SearchRecordings(ctx, searchConnection, stream, now.Add(-time.Minute), now)
+		result.Capabilities.StoragePlaybackAvailable = err == nil
+	}
 	if len(result.Capabilities.SupportedEventTypes) == 0 {
 		result.Capabilities.SupportedEventTypes = []domain.EventType{domain.EventMotion}
 	}
@@ -268,6 +336,32 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 		}
 	}
 	return result, nil
+}
+
+func (client *Client) readCameraClock(ctx context.Context, connection Connection) (TimezoneConfiguration, string, error) {
+	timezoneBytes, err := client.run(ctx, connection, "config", "get", "time-zone")
+	if err != nil {
+		return TimezoneConfiguration{}, "", err
+	}
+	offset, err := parseTimezoneOffset(timezoneBytes)
+	if err != nil {
+		return TimezoneConfiguration{}, "", err
+	}
+	dstBytes, err := client.run(ctx, connection, "raw", "106")
+	if err != nil {
+		return TimezoneConfiguration{}, "", err
+	}
+	configuration, err := parseDstConfiguration(dstBytes)
+	if err != nil {
+		return TimezoneConfiguration{}, "", err
+	}
+	configuration.BaseOffsetSeconds = -offset
+	timezone, err := resolveCameraTimezone(configuration, connection.Timezone, time.Now().UTC())
+	var mismatch *TimezoneMismatchError
+	if errors.As(err, &mismatch) {
+		timezone, err = customCameraTimezone(configuration)
+	}
+	return configuration, timezone, err
 }
 
 func (client *Client) captureSnapshotJPEG(ctx context.Context, connection Connection) ([]byte, error) {
@@ -315,12 +409,15 @@ func (client *Client) SearchRecordings(ctx context.Context, connection Connectio
 	if !from.Before(to) {
 		return nil, errors.New("recording search start must be before its end")
 	}
+	if err := validateCameraSearchClock(connection.Timezone, from, to); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, client.timeout)
 	defer cancel()
 	location := time.UTC
 	if connection.Timezone != "" {
 		var err error
-		location, err = time.LoadLocation(connection.Timezone)
+		location, err = cameraLocation(connection.Timezone)
 		if err != nil {
 			return nil, errors.New("camera timezone is invalid")
 		}
@@ -1013,7 +1110,7 @@ func resolveCameraTimezone(configuration TimezoneConfiguration, preferred string
 			return name, nil
 		}
 	}
-	return "", errors.New("camera timezone rules do not match an installed IANA timezone")
+	return "", &TimezoneMismatchError{Configuration: configuration}
 }
 
 func installedTimezoneNames() []string {

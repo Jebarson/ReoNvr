@@ -7,6 +7,8 @@ import (
 
 	"reonavr/internal/domain"
 	"reonavr/internal/reolink"
+
+	"reonavr/internal/testconfig"
 )
 
 type eventStore struct {
@@ -97,11 +99,11 @@ func TestEventServicePersistsOnlySelectedStartsAndAllEndTransitions(t *testing.T
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	store := &eventStore{
 		camera: domain.Camera{
-			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Channel: 1,
+			ID: "camera-one", Host: testconfig.Host(2), Port: 9000, Channel: 1,
 			Timezone: "UTC", Enabled: true, ArchiveEnabled: true,
 			ArchiveStream: domain.StreamMain, EventTypes: []domain.EventType{domain.EventPerson},
 		},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 	}
 	streamer := &eventStreamer{transitions: []domain.EventTransition{
 		{OccurredAtUtc: now, EventType: domain.EventMotion, Active: true},
@@ -115,7 +117,7 @@ func TestEventServicePersistsOnlySelectedStartsAndAllEndTransitions(t *testing.T
 	if len(store.transitions) != 2 || store.transitions[0].EventType != domain.EventPerson || store.transitions[1].Active {
 		t.Fatalf("unexpected persisted transitions: %#v", store.transitions)
 	}
-	if streamer.connection.Password != "secret" || streamer.connection.Channel != 1 {
+	if streamer.connection.Password != testconfig.Password() || streamer.connection.Channel != 1 {
 		t.Fatalf("unexpected stream connection: %#v", streamer.connection)
 	}
 }
@@ -124,10 +126,10 @@ func TestEventServiceReplaysFromOverlappingDurableCursorBeforeStreaming(t *testi
 	cursor := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	store := &eventStore{
 		camera: domain.Camera{
-			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Enabled: true, ArchiveEnabled: true,
+			ID: "camera-one", Host: testconfig.Host(2), Port: 9000, Enabled: true, ArchiveEnabled: true,
 			ArchiveStream: domain.StreamMain, EventTypes: []domain.EventType{domain.EventPerson}, LastEventAtUtc: &cursor,
 		},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 	}
 	streamer := &replayingEventStreamer{
 		eventStreamer: eventStreamer{},
@@ -148,12 +150,12 @@ func TestEventServiceFinalizesCameraStorageRecordingAfterPostDelay(t *testing.T)
 	ended := now.Add(-30 * time.Second)
 	store := &eventStore{
 		camera: domain.Camera{
-			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Timezone: "UTC",
+			ID: "camera-one", Host: testconfig.Host(2), Port: 9000, Timezone: "UTC",
 			Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 			RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
 			Capabilities: &domain.CameraCapabilities{PreRecordSeconds: 10, PostRecordSeconds: 5},
 		},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 		events: []domain.Event{{
 			ID: "event-one", CameraID: "camera-one", EventType: domain.EventPerson,
 			StartedAtUtc: started, EndedAtUtc: &ended, CreatedAtUtc: started,
@@ -173,7 +175,7 @@ func TestEventServiceFinalizesCameraStorageRecordingAfterPostDelay(t *testing.T)
 	if len(store.recordings) != 1 || store.recordings[0].State != domain.RecordingQueued || store.events[0].NativeRecordingName != "person.mp4" {
 		t.Fatalf("unexpected event finalization: %#v %#v", store.recordings, store.events[0])
 	}
-	if store.run.Kind != "EventFinalization" || searcher.connection.Password != "secret" {
+	if store.run.Kind != "EventFinalization" || searcher.connection.Password != testconfig.Password() {
 		t.Fatalf("unexpected finalization run: %#v connection=%#v", store.run, searcher.connection)
 	}
 }
@@ -183,11 +185,11 @@ func TestEventServiceFinalizesEventWithoutUnavailableNativeMedia(t *testing.T) {
 	ended := now.Add(-30 * time.Second)
 	store := &eventStore{
 		camera: domain.Camera{
-			ID: "camera-one", Host: "10.0.0.152", Port: 9000, Timezone: "UTC",
+			ID: "camera-one", Host: testconfig.Host(2), Port: 9000, Timezone: "UTC",
 			Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
 			RecordingSource: domain.RecordingSourceCameraStorage, RecordingMode: domain.RecordingModeEvents,
 		},
-		credential: domain.EncryptedCredential{Username: "admin", KeyVersion: 1},
+		credential: domain.EncryptedCredential{Username: testconfig.Username(), KeyVersion: 1},
 		events: []domain.Event{{
 			ID: "event-one", CameraID: "camera-one", EventType: domain.EventPerson,
 			StartedAtUtc: now.Add(-time.Minute), EndedAtUtc: &ended, CreatedAtUtc: now.Add(-time.Minute),

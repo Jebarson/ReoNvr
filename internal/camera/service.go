@@ -19,10 +19,17 @@ import (
 )
 
 var (
-	ErrInvalid  = errors.New("invalid camera configuration")
-	ErrRetest   = errors.New("test this connection before saving it")
-	ErrNotFound = errors.New("camera not found")
+	ErrInvalid              = errors.New("invalid camera configuration")
+	ErrRetest               = errors.New("test this connection before saving it")
+	ErrNotFound             = errors.New("camera not found")
+	ErrDiscoveryBusy        = errors.New("camera discovery is already running")
+	ErrDiscoveryUnavailable = errors.New("camera discovery is unavailable")
 )
+
+type DiscoveredCamera struct {
+	reolink.DiscoveredCamera
+	Registered bool `json:"registered"`
+}
 
 type Draft struct {
 	Name             string                  `json:"name"`
@@ -36,6 +43,7 @@ type Draft struct {
 	ArchiveEnabled   bool                    `json:"archiveEnabled"`
 	ArchiveStream    domain.ArchiveStream    `json:"archiveStream"`
 	RecordingSource  domain.RecordingSource  `json:"recordingSource"`
+	RecoveryEnabled  bool                    `json:"recoveryEnabled"`
 	RecordingMode    domain.RecordingMode    `json:"recordingMode"`
 	HistoricalImport domain.HistoricalImport `json:"historicalImport"`
 	PreEventSeconds  int                     `json:"preEventSeconds"`
@@ -84,6 +92,8 @@ type Service struct {
 	now         func() time.Time
 	onChanged   func(domain.Camera)
 	onDeleted   func(string)
+	discoveryMu sync.Mutex
+	mutationMu  sync.Mutex
 }
 
 func NewService(store Store, tester CameraTester, cipher CredentialCipher) *Service {
@@ -104,6 +114,39 @@ func (service *Service) SetLifecycleHooks(onChanged func(domain.Camera), onDelet
 
 func (service *Service) List(ctx context.Context) ([]domain.Camera, error) {
 	return service.store.ListCameras(ctx)
+}
+
+func (service *Service) Discover(ctx context.Context) ([]DiscoveredCamera, error) {
+	if !service.discoveryMu.TryLock() {
+		return nil, ErrDiscoveryBusy
+	}
+	defer service.discoveryMu.Unlock()
+	discoverer, ok := service.probeTester.(interface {
+		Discover(context.Context) ([]reolink.DiscoveredCamera, error)
+	})
+	if !ok {
+		return nil, ErrDiscoveryUnavailable
+	}
+	devices, err := discoverer.Discover(ctx)
+	if err != nil {
+		return nil, err
+	}
+	registered, err := service.store.ListCameras(ctx)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]DiscoveredCamera, 0, len(devices))
+	for _, device := range devices {
+		result := DiscoveredCamera{DiscoveredCamera: device}
+		for _, existing := range registered {
+			if strings.EqualFold(strings.Trim(existing.Host, "[]"), device.Host) && existing.Port == device.Port {
+				result.Registered = true
+				break
+			}
+		}
+		results = append(results, result)
+	}
+	return results, nil
 }
 
 func (service *Service) Get(ctx context.Context, id string) (domain.Camera, error) {
@@ -150,6 +193,9 @@ func snapshotDataURL(snapshot []byte) string {
 }
 
 func (service *Service) Create(ctx context.Context, draft Draft) (domain.Camera, error) {
+	service.mutationMu.Lock()
+	defer service.mutationMu.Unlock()
+	normalizeRecordingPolicy(&draft)
 	if err := validateDraft(draft); err != nil {
 		return domain.Camera{}, err
 	}
@@ -186,6 +232,9 @@ func (service *Service) Create(ctx context.Context, draft Draft) (domain.Camera,
 }
 
 func (service *Service) Update(ctx context.Context, id string, draft Draft) (domain.Camera, error) {
+	service.mutationMu.Lock()
+	defer service.mutationMu.Unlock()
+	normalizeRecordingPolicy(&draft)
 	if err := validateDraft(draft); err != nil {
 		return domain.Camera{}, err
 	}
@@ -195,13 +244,13 @@ func (service *Service) Update(ctx context.Context, id string, draft Draft) (dom
 	}
 	credentialChanged := draft.Host != existing.Host || draft.Port != existing.Port ||
 		draft.Channel != existing.Channel || draft.Username != existing.Username || draft.Password != ""
-	requiresTest := credentialChanged
+	requiresTest := credentialChanged || draft.ArchiveStream != existing.ArchiveStream
 	result := reolink.TestResult{Model: existing.Model, Firmware: existing.Firmware, Timezone: existing.Timezone}
 	if existing.Capabilities != nil {
 		result.Capabilities = *existing.Capabilities
 	}
 	var encrypted *domain.EncryptedCredential
-	if requiresTest {
+	if requiresTest || draft.TestID != "" {
 		password, err := service.resolvePassword(ctx, id, draft.Password)
 		if err != nil {
 			return domain.Camera{}, err
@@ -233,7 +282,7 @@ func (service *Service) Update(ctx context.Context, id string, draft Draft) (dom
 	if draft.RecordingSource == existing.RecordingSource && draft.HistoricalImport == existing.HistoricalImport {
 		camera.ArchiveFromUtc = existing.ArchiveFromUtc
 	}
-	if !requiresTest {
+	if !requiresTest && draft.TestID == "" {
 		camera.LastTestedAtUtc = existing.LastTestedAtUtc
 		camera.ConnectionStatus = existing.ConnectionStatus
 		if !existing.Enabled && camera.Enabled {
@@ -257,6 +306,8 @@ func (service *Service) Update(ctx context.Context, id string, draft Draft) (dom
 }
 
 func (service *Service) Delete(ctx context.Context, id string) error {
+	service.mutationMu.Lock()
+	defer service.mutationMu.Unlock()
 	err := service.store.RetireCamera(ctx, id, service.now().UTC())
 	if errors.Is(err, repository.ErrNotFound) {
 		return ErrNotFound
@@ -359,6 +410,12 @@ func validateRecordingPolicy(draft Draft, capabilities domain.CameraCapabilities
 	if !draft.ArchiveEnabled {
 		return nil
 	}
+	if draft.RecoveryEnabled && !capabilities.StorageAvailable {
+		return fmt.Errorf("%w: mounted, formatted camera storage is required for recovery", ErrInvalid)
+	}
+	if draft.RecoveryEnabled && !capabilities.StoragePlaybackAvailable {
+		return fmt.Errorf("%w: camera recording search must be available for recovery", ErrInvalid)
+	}
 	switch draft.RecordingSource {
 	case domain.RecordingSourceCameraStorage:
 		if !capabilities.StorageAvailable {
@@ -379,9 +436,8 @@ func validateRecordingPolicy(draft Draft, capabilities domain.CameraCapabilities
 }
 
 func normalizeRecordingPolicy(draft *Draft) {
-	if draft.RecordingSource == domain.RecordingSourceCameraStorage {
-		draft.HistoricalImport = domain.HistoricalImportAll
-	}
+	draft.RecordingSource = domain.RecordingSourceRtsp
+	draft.HistoricalImport = domain.HistoricalImportNewOnly
 }
 
 func validateEventTypes(selected, supported []domain.EventType) error {
@@ -410,6 +466,7 @@ func cameraFromDraft(id string, draft Draft, result reolink.TestResult, created,
 		Username: strings.TrimSpace(draft.Username), Enabled: draft.Enabled,
 		ArchiveEnabled: draft.ArchiveEnabled, ArchiveStream: draft.ArchiveStream,
 		RecordingSource: draft.RecordingSource, RecordingMode: draft.RecordingMode,
+		RecoveryEnabled:  draft.RecoveryEnabled,
 		HistoricalImport: draft.HistoricalImport, PreEventSeconds: draft.PreEventSeconds,
 		PostEventSeconds: draft.PostEventSeconds, ArchiveFromUtc: historicalBoundary(draft.HistoricalImport, updated),
 		EventTypes: append([]domain.EventType(nil), draft.EventTypes...), Model: result.Model,
@@ -437,7 +494,7 @@ func historicalBoundary(value domain.HistoricalImport, now time.Time) *time.Time
 }
 
 func fingerprint(draft Draft, password string) [32]byte {
-	value, _ := json.Marshal([]any{strings.TrimSpace(draft.Host), draft.Port, draft.Channel, strings.TrimSpace(draft.Username), password})
+	value, _ := json.Marshal([]any{strings.TrimSpace(draft.Host), draft.Port, draft.Channel, draft.ArchiveStream, strings.TrimSpace(draft.Username), password})
 	return sha256.Sum256(value)
 }
 
