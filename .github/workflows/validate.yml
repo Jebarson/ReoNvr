@@ -1,0 +1,138 @@
+name: Validate
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      version:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests and workflow checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Validate workflow syntax
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7
+      - name: Validate PowerShell startup and orchestration syntax
+        run: |
+          docker run --rm -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$tokens = $null; $parseErrors = $null; foreach ($file in @("/src/packaging/start.ps1", "/src/tools/protect-main.ps1", "/src/web/tests/run.ps1")) { [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$parseErrors) | Out-Null; if ($parseErrors.Count) { $parseErrors | Write-Error; exit 1 } }'
+      - name: Check Go formatting
+        run: |
+          files=$(docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine gofmt -l cmd internal tools web/tests/credentials)
+          test -z "$files" || { printf '%s\n' "$files"; exit 1; }
+      - name: Run all Go tests with race detection and coverage
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src golang:1.27-bookworm sh -c '
+            set -eu
+            mkdir -p runtime/reports
+            go run ./tools/gotest -race -count=1 -coverprofile=runtime/reports/coverage.out ./...
+            go run ./tools/gotest vet ./...
+          '
+      - name: Preserve coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: backend-coverage
+          path: runtime/reports/coverage.out
+          retention-days: 14
+
+  frontend:
+    name: Frontend lint build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Validate frontend
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/web node:26-alpine sh -c '
+            set -eu
+            npm ci
+            npm run lint
+            npm test
+            npm run build
+          '
+
+  package:
+    name: Package and smoke test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ inputs.version || format('v0.0.0-ci.{0}', github.run_number) }}
+      ARCH: ${{ matrix.arch }}
+      COMPOSE_PROJECT_NAME: reonvr-ci-${{ github.run_id }}-${{ matrix.arch }}
+      REONVR_HTTP_PORT: '18080'
+      REONVR_DISCOVERY_PORT: '23000'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Build every runtime image and media tests
+        run: |
+          revision=$(git rev-parse HEAD)
+          docker build --platform "linux/$ARCH" -f docker/app.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/app:$VERSION-$ARCH" .
+          docker build --platform "linux/$ARCH" -f docker/gateway.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/gateway:$VERSION-$ARCH" .
+          docker build --platform "linux/$ARCH" -f docker/discovery-relay.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/discovery-relay:$VERSION-$ARCH" .
+          docker build --platform "linux/$ARCH" -f docker/app.Dockerfile --target test-artifacts --output type=local,dest=runtime/ci-tools .
+          docker run --rm -v "$PWD/runtime/ci-tools:/tools:ro" --entrypoint /tools/archive.test "reonvr/app:$VERSION-$ARCH" '-test.run=TestClockAlignedSegmentsUseRelativeMediaTime|TestMediaInspectionWithRealFFmpeg' -test.v
+      - name: Assemble offline ZIP
+        run: |
+          docker image save -o runtime/images.tar "reonvr/app:$VERSION-$ARCH" "reonvr/gateway:$VERSION-$ARCH" "reonvr/discovery-relay:$VERSION-$ARCH"
+          revision=$(git rev-parse HEAD)
+          docker run --rm -v "$PWD:/src" -w /src golang:1.27-alpine go run ./tools/release -version "$VERSION" -arch "$ARCH" -revision "$revision" -images runtime/images.tar
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -c 'mkdir -p runtime/package; unzip -q runtime/dist/*.zip -d runtime/package'
+      - name: Start exact ZIP contents
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/src" -w /src/runtime/package -e COMPOSE_PROJECT_NAME -e REONVR_HTTP_PORT -e REONVR_DISCOVERY_PORT docker:28-cli sh ./start.sh
+      - name: Browser acceptance without physical cameras
+        run: |
+          docker run --rm --network "${COMPOSE_PROJECT_NAME}_default" -e "REONVR_TEST_URL=http://${COMPOSE_PROJECT_NAME}-app-1:8080" -v "$PWD:/src" -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble sh -c 'npm ci && npm run test:smoke'
+      - name: Verify discovery relay executable
+        run: |
+          container=$(docker run -d --network none "reonvr/discovery-relay:$VERSION-$ARCH")
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          test "$(docker inspect --format '{{.State.Running}}' "$container")" = true
+      - name: Upload tested release assets
+        if: inputs.version != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.arch }}
+          path: runtime/dist/*
+          if-no-files-found: error
+          retention-days: 1
+      - name: Preserve smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: screenshots-${{ matrix.arch }}
+          path: runtime/reports/*.png
+          retention-days: 7
+      - name: Remove isolated test deployment
+        if: always()
+        run: |
+          if test -f runtime/package/compose.yaml; then
+            docker compose --env-file runtime/package/.env -f runtime/package/compose.yaml down -v --remove-orphans
+          fi

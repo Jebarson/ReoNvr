@@ -497,7 +497,7 @@ not automatically discovered; the journal protects new publications.
 
 Changes should pass:
 
-- `go test ./...`
+- `go run ./tools/gotest -count=1 ./...` (Go tests in adjacent `tests/` folders)
 - `npm run lint` and `npm run build` in `web/`
 - `docker compose config --quiet`
 - API tests for camera, recording control, settings, event, and media behavior
@@ -507,7 +507,7 @@ Changes should pass:
 - `npm run test:e2e` in the Playwright container against a paused deployment
   with a registered storage-capable camera and bundled Chromium
 
-Execute builds and tests only in containers. The README documents PowerShell
+Execute builds and tests only in containers. The contribution guide documents PowerShell
 commands with isolated dependency/cache volumes; no host tool installation is
 required. Live camera targets and shared credentials come from an ignored local
 JSON configuration based on `internal/testconfig/config.example.json`; checked-in

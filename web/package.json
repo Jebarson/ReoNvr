@@ -7,8 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test:e2e": "node --test --test-concurrency=1 e2e/recovery.spec.mjs",
-    "test:e2e:full": "node e2e/full.spec.mjs",
+    "test": "node --test tests/pause-guard.test.mjs",
+    "test:smoke": "node --test --test-concurrency=1 tests/smoke.spec.mjs",
+    "test:e2e": "node --test --test-concurrency=1 tests/recovery.spec.mjs",
+    "test:e2e:full": "node tests/full.spec.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

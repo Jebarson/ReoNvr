@@ -1,0 +1,63 @@
+name: reonvr
+
+services:
+  gateway:
+    image: reonvr/gateway:${REONVR_VERSION:?Missing release version}-${REONVR_ARCH:?Missing architecture}
+    pull_policy: never
+    restart: unless-stopped
+    volumes:
+      - gateway:/var/lib/reolink
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  app:
+    image: reonvr/app:${REONVR_VERSION:?Missing release version}-${REONVR_ARCH:?Missing architecture}
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      REONVR_ADDRESS: ":8080"
+      REONVR_DATABASE_PATH: /data/reonavr.db
+      REONVR_MASTER_KEY_FILE: /run/secrets/master.key
+      REONVR_CLI_PATH: /usr/local/bin/reolink-cli
+      REONVR_GATEWAY_ADDR: gateway:9000
+      REONVR_VALIDATION_GATEWAY_PATH: /usr/local/bin/reolink-gateway
+      REONVR_ARCHIVE_ROOT: /archive
+      REONVR_RTSP_BUFFER_ROOT: /archive/.rtsp-buffer
+    ports:
+      - "${REONVR_BIND_ADDRESS:-127.0.0.1}:${REONVR_HTTP_PORT:-8080}:8080"
+      - "${REONVR_DISCOVERY_PORT:-3000}:3000/udp"
+    volumes:
+      - data:/data
+      - secrets:/run/secrets
+      - ${REONVR_RECORDINGS_PATH:-archive}:/archive
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  discovery-relay:
+    image: reonvr/discovery-relay:${REONVR_VERSION:?Missing release version}-${REONVR_ARCH:?Missing architecture}
+    pull_policy: never
+    profiles:
+      - discovery
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    environment:
+      REONVR_DISCOVERY_BROADCASTS: ${REONVR_DISCOVERY_BROADCASTS:-}
+
+volumes:
+  data:
+  secrets:
+  archive:
+  gateway:
