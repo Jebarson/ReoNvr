@@ -145,12 +145,13 @@ Playback remains a recording list, not a seamlessly stitched timeline.
 Captured event time is not proof of archived footage: known selected events
 still require verified media for their saved pre/post-roll windows.
 Previously linked selected SD clips remain required even if a later search no
-longer returns them. Permanently invalid native media becomes **Failed**, allowing
-older downloads to proceed without pretending the missing footage was recovered;
-temporary probe failures remain retryable. Adjacent
-quiet checks are coalesced within their recording-policy period. Recovery history
-shows unresolved intervals first; terminal history expires after 30 days while
-unresolved intervals and archived media are preserved.
+longer returns them. Permanently invalid native media becomes **Failed** only
+after its rejected partial file, or final file and sidecar, are removed and the
+directory is flushed. This allows older downloads to proceed without pretending
+the missing footage was recovered. Cleanup failures and temporary probe failures
+remain retryable. Adjacent quiet checks are coalesced within their recording-policy
+period. Recovery history shows unresolved intervals first; terminal history
+expires after 30 days while unresolved intervals and archived media are preserved.
 
 Upgrading preserves completed local media. Existing camera-storage policies
 become RTSP-primary with recovery enabled from the migration boundary, without
