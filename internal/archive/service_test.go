@@ -276,8 +276,8 @@ func TestRecoveryDownloadsOnlyMissingStreamAndKeepsPartialGaps(t *testing.T) {
 }
 
 func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
-	for _, observed := range []bool{true, false} {
-		t.Run(map[bool]string{true: "quiet", false: "outage"}[observed], func(t *testing.T) {
+	for _, scenario := range []string{"quiet", "outage", "unpublished selected event", "overlapping selected events", "unselected event"} {
+		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "events.db"))
 			if err != nil {
@@ -287,6 +287,7 @@ func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
 			start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
 			camera := domain.Camera{ID: "events", Name: "Events", Host: "camera", Port: 9000, Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecoveryEnabled: true,
 				RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents, ArchiveStream: domain.StreamMain,
+				PreEventSeconds: 3, PostEventSeconds: 7,
 				EventTypes: []domain.EventType{domain.EventPerson}, Capabilities: &domain.CameraCapabilities{StorageAvailable: true}, CreatedAtUtc: start, UpdatedAtUtc: start}
 			if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, camera.EventTypes); err != nil {
 				t.Fatal(err)
@@ -298,9 +299,29 @@ func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
 			if err := store.CloseRecordingIntents(ctx, camera.ID, end); err != nil {
 				t.Fatal(err)
 			}
-			if observed {
+			if scenario != "outage" {
 				if err := store.SaveCaptureCoverage(ctx, camera.ID, camera.ArchiveStream, []domain.TimeRange{{StartAtUtc: start, EndAtUtc: end}}); err != nil {
 					t.Fatal(err)
+				}
+			}
+			if scenario == "unpublished selected event" || scenario == "overlapping selected events" || scenario == "unselected event" {
+				eventType := domain.EventPerson
+				if scenario == "unselected event" {
+					eventType = domain.EventMotion
+				}
+				if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: start.Add(5 * time.Second), EventType: eventType, Active: true}); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: start.Add(15 * time.Second)}); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "overlapping selected events" {
+					if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: start.Add(16 * time.Second), EventType: eventType, Active: true}); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.ApplyEventTransition(ctx, camera.ID, domain.EventTransition{OccurredAtUtc: start.Add(20 * time.Second)}); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			service := NewRecoveryService(store, &serviceSearcher{}, serviceCipher{})
@@ -312,11 +333,17 @@ func TestEventRecoveryDistinguishesQuietCaptureFromUnknownOutage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if observed && len(gaps) != 0 {
+			if (scenario == "quiet" || scenario == "unselected event") && len(gaps) != 0 {
 				t.Fatalf("quiet time treated as missing event: %#v", gaps)
 			}
-			if !observed && (len(gaps) != 1 || gaps[0].Status != "Unknown") {
+			if scenario == "outage" && (len(gaps) != 1 || gaps[0].Status != "Unknown") {
 				t.Fatalf("outage declared recovered without evidence: %#v", gaps)
+			}
+			if scenario == "unpublished selected event" && (len(gaps) != 1 || gaps[0].Status == "CheckedEvents" || gaps[0].MissingSeconds != 20) {
+				t.Fatalf("known missing event footage was declared quiet: %#v", gaps)
+			}
+			if scenario == "overlapping selected events" && (len(gaps) != 1 || gaps[0].MissingSeconds != 25) {
+				t.Fatalf("overlapping pre/post windows were counted twice: %#v", gaps)
 			}
 		})
 	}

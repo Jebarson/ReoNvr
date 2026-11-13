@@ -142,6 +142,12 @@ left provisional for two minutes in Continuous mode or ten minutes in Events
 mode. Recovery keeps whole native clips, which can overlap live recordings;
 Playback remains a recording list, not a seamlessly stitched timeline.
 
+Captured event time is not proof of archived footage: known selected events
+still require verified media for their saved pre/post-roll windows. Adjacent
+quiet checks are coalesced within their recording-policy period. Recovery history
+shows unresolved intervals first; terminal history expires after 30 days while
+unresolved intervals and archived media are preserved.
+
 Upgrading preserves completed local media. Existing camera-storage policies
 become RTSP-primary with recovery enabled from the migration boundary, without
 automatically importing older camera history. Legacy queued or in-progress
@@ -160,6 +166,8 @@ queued clips in the same recovery interval eligible for download.
 
 A forced process/host shutdown can still lose the unjournaled active tail.
 Missing or corrupt journaled media is reported rather than marked recovered.
+Failed journals and their buffered fragments remain available for retry without
+blocking startup, other publications, or subsequent camera capture.
 Unindexed files from versions before publication journaling are not discovered
 automatically. Physical outages, power loss, full disks, and destructive
 retention drills remain separate from the deterministic regression tests.
@@ -270,8 +278,11 @@ layouts and are written under ignored `runtime/e2e-*.png`, with password inputs
 masked. Screenshots can contain private camera images; do not publish them.
 
 The browser suite restores local settings, removes its temporary cameras, and
-pauses recording. An independent container also pauses recording after five
-minutes, and the runner's finalizer requests pause again. Native test recordings
+pauses recording. Just before capture, the suite arms and verifies an independent
+container's five-minute pause deadline. That guard keeps retrying pause after
+expiry or an explicit cleanup request, including while the application is
+temporarily unavailable. The runner removes it only after confirming recording
+is paused; failed confirmation leaves the guard running. Native test recordings
 are intentionally retained in the isolated fresh archive after camera removal;
 this also exercises archive ownership preservation. The original installation
 is not mutated. Camera settings and camera SD media are never changed or deleted.

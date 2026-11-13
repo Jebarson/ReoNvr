@@ -87,6 +87,10 @@ func decodeCameraClock(name string) (TimezoneConfiguration, error) {
 	return configuration, nil
 }
 
+func CameraLocation(name string) (*time.Location, error) {
+	return cameraLocation(name)
+}
+
 func cameraLocation(name string) (*time.Location, error) {
 	if !strings.HasPrefix(name, cameraClockPrefix) {
 		return time.LoadLocation(name)

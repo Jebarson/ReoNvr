@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"reonavr/internal/domain"
+	"reonavr/internal/reolink"
 
 	_ "modernc.org/sqlite"
 )
@@ -583,7 +584,10 @@ func queueEligibleDiscovered(ctx context.Context, tx *sql.Tx, cameraID string, m
 }
 
 func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, cameraID, timezone string, updatedAt time.Time) error {
-	location, err := time.LoadLocation(timezone)
+	if timezone == "Camera/Unverified" {
+		return nil
+	}
+	location, err := reolink.CameraLocation(timezone)
 	if err != nil {
 		return errors.New("camera timezone is invalid")
 	}
@@ -1448,7 +1452,7 @@ func (store *Store) ListArchivedEvents(ctx context.Context, cameraID string, lim
 				AND julianday(Coverage.StartAtUtc) <= julianday(COALESCE(Events.EndedAtUtc, Events.StartedAtUtc))
 				AND julianday(Coverage.EndAtUtc) > julianday(Events.StartedAtUtc))
 			AND (Recordings.NativeName = Events.NativeRecordingName OR (
-				Recordings.Source = 'Rtsp'
+				Recordings.Source IN ('Rtsp', 'CameraStorage')
 				AND julianday(Recordings.StartAtUtc) <= julianday(COALESCE(Events.EndedAtUtc, Events.StartedAtUtc))
 				AND julianday(Recordings.EndAtUtc) >= julianday(Events.StartedAtUtc)
 			))

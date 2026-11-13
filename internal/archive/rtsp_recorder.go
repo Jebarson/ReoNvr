@@ -135,19 +135,27 @@ func (service *RtspRecorderService) Recover(ctx context.Context) error {
 		return err
 	}
 	defer root.Close()
+	pendingDirectories := make(map[string]bool)
 	for _, path := range publications {
 		relative, err := filepath.Rel(archiveRoot, path)
 		if err != nil {
 			return err
 		}
 		if err := service.recoverRtspPublication(ctx, root, relative); err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			pendingDirectories[filepath.Dir(relative)] = true
+			service.reportPublicationFailure(ctx, relative)
 		}
 	}
 	for _, path := range partials {
 		relative, err := filepath.Rel(archiveRoot, path)
 		if err != nil {
 			return err
+		}
+		if pendingDirectories[filepath.Dir(relative)] {
+			continue
 		}
 		if err := root.Remove(relative); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -372,6 +380,7 @@ func (service *RtspRecorderService) publishEventBuffer(ctx context.Context, came
 		return nil
 	}
 	paths := make([]string, 0, len(buffer.segments))
+	var coverage []domain.TimeRange
 	var first, last *bufferedRtspSegment
 	for index := range buffer.segments {
 		item := &buffer.segments[index]
@@ -379,6 +388,7 @@ func (service *RtspRecorderService) publishEventBuffer(ctx context.Context, came
 			continue
 		}
 		paths = append(paths, item.segment.Path)
+		coverage = append(coverage, item.segment.Coverage...)
 		if first == nil {
 			first = item
 		}
@@ -407,11 +417,7 @@ func (service *RtspRecorderService) publishEventBuffer(ctx context.Context, came
 	joined := RtspSegment{
 		Path: joinedPath, StartOffset: first.startAt.Sub(captureStartedAt),
 		EndOffset: last.endAt.Sub(captureStartedAt), StartAtUtc: first.startAt, EndAtUtc: last.endAt,
-	}
-	for _, item := range buffer.segments {
-		if !item.endAt.Before(first.startAt) && !item.startAt.After(last.endAt) {
-			joined.Coverage = append(joined.Coverage, item.segment.Coverage...)
-		}
+		Coverage: coverage,
 	}
 	if err := service.publishSegment(ctx, camera, captureStartedAt, joined); err != nil {
 		return err

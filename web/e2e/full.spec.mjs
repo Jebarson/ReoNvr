@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { after, before, test } from 'node:test'
 import { chromium, request } from 'playwright'
+import { armPauseGuard } from './pause-guard.mjs'
 
 const baseURL = process.env.REONVR_E2E_URL ?? 'http://reonvr-fresh-app:8080'
 const target = new URL(baseURL)
@@ -333,13 +334,15 @@ test('camera removal cancel and confirm affect only the selected test camera', {
 })
 
 test('bounded RTSP recording, pause, original download, byte ranges, playback and seeking', { timeout: 180000 }, async () => {
-  assert.equal(process.env.REONVR_E2E_RECORDING_GUARD, '1', 'Run through run.ps1 so an independent pause guard is active')
+  const guardURL = process.env.REONVR_E2E_GUARD_URL
+  assert.ok(guardURL && new URL(guardURL).hostname === 'reonvr-e2e-pause-guard', 'Run through run.ps1 with the independent pause guard')
   const camera = [...created.values()].find((item) => item.host === storageCamera.host)
   const current = await json(`/api/cameras/${camera.id}`)
   assert.equal((await api.put(`/api/cameras/${camera.id}`, { data: existingDraft(current, { archiveEnabled: true, recoveryEnabled: false, recordingMode: 'Continuous' }) })).status(), 200)
   let clip
   try {
     await withPage(1440, async (page) => {
+      await armPauseGuard(guardURL)
       const resumed = page.waitForResponse((response) => response.url().endsWith('/api/system/recording') && response.request().method() === 'PUT')
       await page.getByRole('switch', { name: 'Record all cameras', exact: true }).click()
       assert.equal((await resumed).status(), 200)

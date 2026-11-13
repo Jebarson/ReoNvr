@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"reonavr/internal/domain"
+	"reonavr/internal/reolink"
 
 	"reonavr/internal/testconfig"
 )
@@ -96,16 +99,93 @@ func TestRecoveryIntentAndCoverageSurviveRestartAndPause(t *testing.T) {
 	if err != nil || len(periods) != 1 || !periods[0].StartAtUtc.Equal(now) {
 		t.Fatalf("intent lost across restart: %#v %v", periods, err)
 	}
-	if err := store.CloseRecordingIntents(ctx, camera.ID, now.Add(6*time.Minute)); err != nil {
+	if err := store.SetRecordingControl(ctx, false, now.Add(6*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, now.Add(7*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	periods, err = store.ListRecoveryPeriods(ctx, camera.ID, now.Add(10*time.Minute))
-	if err != nil || periods[0].EndAtUtc == nil || !periods[0].EndAtUtc.Equal(now.Add(6*time.Minute)) {
+	if err != nil || len(periods) != 1 || periods[0].EndAtUtc == nil || !periods[0].EndAtUtc.Equal(now.Add(6*time.Minute)) {
 		t.Fatalf("pause boundary missing: %#v %v", periods, err)
+	}
+	if err := store.SetRecordingControl(ctx, true, now.Add(8*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, now.Add(8*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	periods, err = store.ListRecoveryPeriods(ctx, camera.ID, now.Add(10*time.Minute))
+	if err != nil || len(periods) != 2 || !periods[1].StartAtUtc.Equal(now.Add(8*time.Minute)) {
+		t.Fatalf("stale intent included deliberately paused footage: %#v %v", periods, err)
 	}
 	coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, domain.TimeRange{StartAtUtc: now, EndAtUtc: now.Add(10 * time.Minute)}, true)
 	if err != nil || len(coverage) != 1 {
 		t.Fatalf("coverage not persisted: %#v %v", coverage, err)
+	}
+}
+
+func TestRecoveryHistoryCoalescesQuietIntervalsAndRetainsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "recovery-history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	start := now.AddDate(0, 0, -40)
+	camera := domain.Camera{ID: "history-camera", Name: "History", Host: testconfig.Host(1), Port: 9000, Timezone: "UTC", Enabled: true,
+		ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceRtsp,
+		RecordingMode: domain.RecordingModeEvents, CreatedAtUtc: start, UpdatedAtUtc: start}
+	if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, start); err != nil {
+		t.Fatal(err)
+	}
+	periods, err := store.ListRecoveryPeriods(ctx, camera.ID, now)
+	if err != nil || len(periods) != 1 {
+		t.Fatalf("missing history intent: %v", err)
+	}
+	periodID := periods[0].ID
+	gaps := []domain.RecoveryGap{
+		{ID: "unresolved", TimeRange: domain.TimeRange{StartAtUtc: start, EndAtUtc: start.Add(time.Minute)}},
+		{ID: "old-terminal", TimeRange: domain.TimeRange{StartAtUtc: start.Add(time.Minute), EndAtUtc: start.Add(2 * time.Minute)}},
+	}
+	if err := store.SaveRecoveryScan(ctx, periodID, start.Add(2*time.Minute), gaps); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRecoveryGap(ctx, "old-terminal", "Recovered", 0, start.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 120 {
+		from := now.Add(time.Duration(index-120) * time.Minute)
+		gap := domain.RecoveryGap{ID: fmt.Sprintf("quiet-%d", index), TimeRange: domain.TimeRange{StartAtUtc: from, EndAtUtc: from.Add(time.Minute)}}
+		if err := store.SaveRecoveryScan(ctx, periodID, gap.EndAtUtc, []domain.RecoveryGap{gap}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateRecoveryGap(ctx, gap.ID, "CheckedEvents", 0, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history, err := store.ListRecoveryHistory(ctx, camera.ID, 100)
+	if err != nil || len(history) != 2 || history[0].ID != "unresolved" || history[1].Status != "CheckedEvents" {
+		t.Fatalf("quiet growth hid unresolved history or retained aged terminal rows: %#v %v", history, err)
+	}
+	if !history[1].StartAtUtc.Equal(now.Add(-2*time.Hour)) || !history[1].EndAtUtc.Equal(now) {
+		t.Fatalf("quiet intervals were not coalesced: %#v", history[1])
+	}
+	recording := domain.Recording{ID: "linked-media", CameraID: camera.ID, NativeName: "linked.mkv", Source: domain.RecordingSourceRtsp,
+		Stream: domain.StreamMain, State: domain.RecordingComplete, StartAtUtc: now.Add(-time.Minute), EndAtUtc: now,
+		DiscoveredAtUtc: now, UpdatedAtUtc: now}
+	if err := store.SaveRtspRecording(ctx, recording); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO RecoveryGapRecordings (GapId, RecordingId) VALUES (?, ?)`, history[1].ID, recording.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateRecoveryGap(ctx, history[1].ID, "CheckedEvents", 0, now); err != nil {
+		t.Fatalf("linked history must remain valid without coalescing: %v", err)
 	}
 }
 
@@ -848,6 +928,35 @@ func TestUpdateCameraProbeReinterpretsDiscoveredMetadataAfterTimezoneChange(t *t
 	if len(items) != 1 || !items[0].StartAtUtc.Equal(expected) {
 		t.Fatalf("recording timestamp was not reinterpreted in the new timezone: %#v", items)
 	}
+	rules, err := json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: -8 * 3600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := "Camera/" + base64.RawURLEncoding.EncodeToString(rules)
+	for _, probe := range []bool{false, true} {
+		for _, timezone := range []string{custom, "Camera/Unverified"} {
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture camera", "test", "UTC", domain.CameraCapabilities{}, "Online", updatedAt); err != nil {
+				t.Fatal(err)
+			}
+			if probe {
+				err = store.UpdateCameraProbe(ctx, camera.ID, "Fixture camera", "test", timezone, domain.CameraCapabilities{}, "Online", updatedAt)
+			} else {
+				camera.Timezone = timezone
+				err = store.UpdateCamera(ctx, camera, nil, camera.EventTypes)
+			}
+			if err != nil {
+				t.Fatalf("camera-clock update blocked: %v", err)
+			}
+			items, err = store.ListRecordings(ctx, camera.ID, 10)
+			expected = recording.StartAtUtc
+			if timezone == custom {
+				expected = expected.Add(8 * time.Hour)
+			}
+			if err != nil || len(items) != 1 || !items[0].StartAtUtc.Equal(expected) {
+				t.Fatalf("custom/unverified timestamp handling failed: %#v %v", items, err)
+			}
+		}
+	}
 }
 
 func TestApplyEventTransitionPersistsAndClosesEventsIdempotently(t *testing.T) {
@@ -1040,6 +1149,13 @@ func TestArchivedEventsIncludeOnlyEventsCoveredByLocalRtspSegments(t *testing.T)
 	}
 	if !events[0].StartedAtUtc.Equal(started) {
 		t.Fatalf("event inside verified video hole was exposed: %#v", events)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE Recordings SET Source = 'CameraStorage', NativeName = 'recovered-native.mp4' WHERE Id = ?`, recording.ID); err != nil {
+		t.Fatal(err)
+	}
+	events, err = store.ListArchivedEvents(ctx, camera.ID, 10)
+	if err != nil || len(events) != 1 || !events[0].StartedAtUtc.Equal(started) {
+		t.Fatalf("verified recovered SD coverage did not back the event: %#v %v", events, err)
 	}
 }
 

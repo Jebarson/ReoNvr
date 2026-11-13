@@ -23,6 +23,7 @@ type RecoveryStore interface {
 	UpdateRecoveryGap(context.Context, string, string, float64, time.Time) error
 	QueueRecoveryRecordings(context.Context, domain.RecoveryGap, []domain.Recording, time.Time) error
 	RecoveryRecordingFinal(context.Context, string) (bool, error)
+	ListRequiredEventCoverage(context.Context, domain.RecoveryGap) ([]domain.TimeRange, error)
 }
 
 type RecoveryService struct {
@@ -134,6 +135,12 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 	}
 	var queued []domain.Recording
 	var expectedEvents []domain.TimeRange
+	if gap.Mode == domain.RecordingModeEvents {
+		expectedEvents, err = service.store.ListRequiredEventCoverage(ctx, gap)
+		if err != nil {
+			return err
+		}
+	}
 	for _, item := range items {
 		if item.Stream != gap.Stream || !item.EndAtUtc.After(gap.StartAtUtc) || !item.StartAtUtc.Before(gap.EndAtUtc) || item.EndAtUtc.After(now.Add(-30*time.Second)) {
 			continue
@@ -178,7 +185,18 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 	remaining := missingDuration(missing)
 	if gap.Mode == domain.RecordingModeEvents {
 		remaining = 0
+		sort.Slice(expectedEvents, func(first, second int) bool {
+			return expectedEvents[first].StartAtUtc.Before(expectedEvents[second].StartAtUtc)
+		})
+		var requiredUntil time.Time
 		for _, span := range expectedEvents {
+			if span.StartAtUtc.Before(requiredUntil) {
+				span.StartAtUtc = requiredUntil
+			}
+			if !span.StartAtUtc.Before(span.EndAtUtc) {
+				continue
+			}
+			requiredUntil = span.EndAtUtc
 			remaining += missingDuration(missingCoverage(span, coverage))
 		}
 		status = "RecoveredEvents"

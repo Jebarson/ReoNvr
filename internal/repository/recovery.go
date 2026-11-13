@@ -53,6 +53,10 @@ func (store *Store) migrateRecovery(ctx context.Context) error {
 
 func (store *Store) SyncRecordingIntent(ctx context.Context, camera domain.Camera, enabled bool, now time.Time) error {
 	return store.withTransaction(ctx, func(tx *sql.Tx) error {
+		var recordingEnabled bool
+		if err := tx.QueryRowContext(ctx, `SELECT RecordingEnabled FROM ApplicationSettings WHERE Id = 1`).Scan(&recordingEnabled); err != nil {
+			return err
+		}
 		selected, err := json.Marshal(camera.EventTypes)
 		if err != nil {
 			return err
@@ -64,7 +68,7 @@ func (store *Store) SyncRecordingIntent(ctx context.Context, camera domain.Camer
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		active := enabled && camera.Enabled && camera.ArchiveEnabled && camera.RecoveryEnabled
+		active := enabled && recordingEnabled && camera.Enabled && camera.ArchiveEnabled && camera.RecoveryEnabled
 		if err == nil && active && stream == string(camera.ArchiveStream) && mode == string(camera.RecordingMode) &&
 			eventTypes == string(selected) && pre == camera.PreEventSeconds && post == camera.PostEventSeconds {
 			return nil
@@ -226,6 +230,60 @@ func (store *Store) ListVerifiedCoverage(ctx context.Context, cameraID string, s
 	return ranges, rows.Err()
 }
 
+func (store *Store) ListRequiredEventCoverage(ctx context.Context, gap domain.RecoveryGap) ([]domain.TimeRange, error) {
+	rows, err := store.db.QueryContext(ctx, `SELECT Events.StartedAtUtc, Events.EndedAtUtc, Events.EventType,
+		Periods.PreEventSeconds, Periods.PostEventSeconds FROM Events
+		JOIN RecoveryPeriods Periods ON Periods.Id = ? AND Periods.CameraId = Events.CameraId
+		WHERE Events.CameraId = ?
+		AND julianday(Events.StartedAtUtc) <= julianday(?) + Periods.PreEventSeconds / 86400.0
+		AND (Events.EndedAtUtc IS NULL OR julianday(Events.EndedAtUtc) >= julianday(?) - Periods.PostEventSeconds / 86400.0)`,
+		gap.PeriodID, gap.CameraID, formatTime(&gap.EndAtUtc), formatTime(&gap.StartAtUtc))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	selected := make(map[domain.EventType]bool)
+	for _, eventType := range gap.EventTypes {
+		selected[eventType] = true
+	}
+	var coverage []domain.TimeRange
+	for rows.Next() {
+		var start string
+		var end sql.NullString
+		var eventType domain.EventType
+		var pre, post int
+		if err := rows.Scan(&start, &end, &eventType, &pre, &post); err != nil {
+			return nil, err
+		}
+		if !selected[eventType] {
+			continue
+		}
+		from, err := time.Parse(time.RFC3339Nano, start)
+		if err != nil {
+			return nil, err
+		}
+		from = from.Add(-time.Duration(pre) * time.Second)
+		to := gap.EndAtUtc
+		if end.Valid {
+			to, err = time.Parse(time.RFC3339Nano, end.String)
+			if err != nil {
+				return nil, err
+			}
+			to = to.Add(time.Duration(post) * time.Second)
+		}
+		if from.Before(gap.StartAtUtc) {
+			from = gap.StartAtUtc
+		}
+		if to.After(gap.EndAtUtc) {
+			to = gap.EndAtUtc
+		}
+		if from.Before(to) {
+			coverage = append(coverage, domain.TimeRange{StartAtUtc: from, EndAtUtc: to})
+		}
+	}
+	return coverage, rows.Err()
+}
+
 func (store *Store) ListRecoveryGaps(ctx context.Context, cameraID string, limit int) ([]domain.RecoveryGap, error) {
 	return store.listRecoveryGaps(ctx, cameraID, limit, false)
 }
@@ -240,7 +298,8 @@ func (store *Store) listRecoveryGaps(ctx context.Context, cameraID string, limit
 		FROM RecoveryGaps Gaps JOIN RecoveryPeriods Periods ON Periods.Id = Gaps.PeriodId
 		WHERE Periods.CameraId = ?`
 	if history {
-		query += ` ORDER BY Gaps.StartAtUtc DESC LIMIT ?`
+		query += ` ORDER BY CASE WHEN Gaps.Status IN ('Recovered', 'RecoveredEvents', 'CheckedEvents') THEN 1 ELSE 0 END,
+			Gaps.StartAtUtc DESC LIMIT ?`
 	} else {
 		query += ` AND Gaps.Status NOT IN ('Recovered', 'RecoveredEvents', 'CheckedEvents') ORDER BY Gaps.LastCheckedAtUtc, Gaps.StartAtUtc LIMIT ?`
 	}
@@ -279,8 +338,47 @@ func (store *Store) listRecoveryGaps(ctx context.Context, cameraID string, limit
 }
 
 func (store *Store) UpdateRecoveryGap(ctx context.Context, id, status string, missing float64, now time.Time) error {
-	_, err := store.db.ExecContext(ctx, `UPDATE RecoveryGaps SET Status = ?, MissingSeconds = ?, LastCheckedAtUtc = ? WHERE Id = ?`, status, missing, formatTime(&now), id)
-	return err
+	return store.withTransaction(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE RecoveryGaps SET Status = ?, MissingSeconds = ?, LastCheckedAtUtc = ? WHERE Id = ?`, status, missing, formatTime(&now), id); err != nil {
+			return err
+		}
+		if status == "CheckedEvents" {
+			var linked bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM RecoveryGapRecordings WHERE GapId = ?)`, id).Scan(&linked); err != nil {
+				return err
+			}
+			if linked {
+				return nil
+			}
+			var periodID, start, end string
+			if err := tx.QueryRowContext(ctx, `SELECT PeriodId, StartAtUtc, EndAtUtc FROM RecoveryGaps WHERE Id = ?`, id).Scan(&periodID, &start, &end); err != nil {
+				return err
+			}
+			var mergedStart, mergedEnd string
+			if err := tx.QueryRowContext(ctx, `SELECT MIN(StartAtUtc), MAX(EndAtUtc) FROM RecoveryGaps
+				WHERE PeriodId = ? AND Status = 'CheckedEvents'
+				AND julianday(StartAtUtc) <= julianday(?) AND julianday(EndAtUtc) >= julianday(?)
+				AND NOT EXISTS (SELECT 1 FROM RecoveryGapRecordings WHERE GapId = RecoveryGaps.Id)`, periodID, end, start).Scan(&mergedStart, &mergedEnd); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE RecoveryGaps SET StartAtUtc = ?, EndAtUtc = ? WHERE Id = ?`, mergedStart, mergedEnd, id); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM RecoveryGaps WHERE PeriodId = ? AND Id != ? AND Status = 'CheckedEvents'
+				AND julianday(StartAtUtc) >= julianday(?) AND julianday(EndAtUtc) <= julianday(?)
+				AND NOT EXISTS (SELECT 1 FROM RecoveryGapRecordings WHERE GapId = RecoveryGaps.Id)`, periodID, id, mergedStart, mergedEnd); err != nil {
+				return err
+			}
+		}
+		cutoff := now.AddDate(0, 0, -30)
+		terminal := `SELECT Id FROM RecoveryGaps WHERE Status IN ('Recovered', 'RecoveredEvents', 'CheckedEvents')
+			AND julianday(COALESCE(LastCheckedAtUtc, EndAtUtc)) < julianday(?)`
+		if _, err := tx.ExecContext(ctx, `DELETE FROM RecoveryGapRecordings WHERE GapId IN (`+terminal+`)`, formatTime(&cutoff)); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM RecoveryGaps WHERE Id IN (`+terminal+`)`, formatTime(&cutoff))
+		return err
+	})
 }
 
 func (store *Store) QueueRecoveryRecordings(ctx context.Context, gap domain.RecoveryGap, recordings []domain.Recording, now time.Time) error {

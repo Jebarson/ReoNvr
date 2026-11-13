@@ -174,6 +174,12 @@ type rtspRecordingStore struct {
 	saveErr     error
 	coverageErr error
 	coverage    []domain.TimeRange
+	issues      []domain.OperationalIssue
+}
+
+func (store *rtspRecordingStore) ReportIssue(_ context.Context, issue domain.OperationalIssue) error {
+	store.issues = append(store.issues, issue)
+	return nil
 }
 
 func TestVideoInspectionRejectsDiscontinuitiesAndWaitsForKeyframe(t *testing.T) {
@@ -398,6 +404,36 @@ func TestRtspRecorderFinalizesCoalescedEventWindow(t *testing.T) {
 	}
 }
 
+func TestRtspEventCoverageExcludesUnjoinedAdjacentFragment(t *testing.T) {
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	ended := now.Add(5 * time.Second)
+	store := &rtspRecordingStore{
+		camera: domain.Camera{ID: "camera-one", Enabled: true, ArchiveEnabled: true, ArchiveStream: domain.StreamMain,
+			RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents, EventTypes: []domain.EventType{domain.EventPerson}},
+		credential: domain.EncryptedCredential{KeyVersion: 1},
+		events:     []domain.Event{{EventType: domain.EventPerson, StartedAtUtc: ended, EndedAtUtc: &ended}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	segmenter := &rtspSegmenter{payload: []byte("native-fragment"), cancel: cancel, segments: []RtspSegment{
+		{EndOffset: 4 * time.Second, Coverage: []domain.TimeRange{{StartAtUtc: now, EndAtUtc: now.Add(4 * time.Second)}}},
+		{StartOffset: 4 * time.Second, EndOffset: 6 * time.Second, Coverage: []domain.TimeRange{{StartAtUtc: now.Add(4 * time.Second), EndAtUtc: now.Add(6 * time.Second)}}},
+	}}
+	root := t.TempDir()
+	service := NewRtspRecorderService(store, &rtspURLProvider{}, serviceCipher{}, segmenter, root, filepath.Join(root, ".rtsp-buffer"))
+	service.now = func() time.Time { return now }
+	if err := service.Record(ctx, store.camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.coverage) != 1 || !store.coverage[0].StartAtUtc.Equal(now.Add(4*time.Second)) || !store.coverage[0].EndAtUtc.Equal(now.Add(6*time.Second)) {
+		t.Fatalf("coverage includes unjoined footage: %#v", store.coverage)
+	}
+	payload, err := os.ReadFile(filepath.Join(root, store.recording.LocalPath))
+	if err != nil || len(payload) != len(segmenter.payload) {
+		t.Fatalf("unexpected joined fragments: %v", err)
+	}
+}
+
 func TestRtspRecorderFlushesInterruptedEvents(t *testing.T) {
 	for _, scenario := range []string{"open event pause", "post-roll pause", "stream failure"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -534,7 +570,7 @@ func TestRtspRecoveryRemovesOnlyBufferedPartialFragments(t *testing.T) {
 }
 
 func TestRtspPublicationRecoversEveryCommitStage(t *testing.T) {
-	for _, stage := range []string{"before rename", "after rename", "after indexing", "worker retry", "retained tombstone"} {
+	for _, stage := range []string{"before rename", "after rename", "after indexing", "worker retry", "retained tombstone", "alongside corrupt journal"} {
 		t.Run(stage, func(t *testing.T) {
 			now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
 			root := t.TempDir()
@@ -571,11 +607,17 @@ func TestRtspPublicationRecoversEveryCommitStage(t *testing.T) {
 			}
 			if stage == "retained tombstone" {
 				store.recordings[0].State = domain.RecordingDeleted
+				store.recordings[0].LocalPath = ""
 				if err := os.Remove(filepath.Join(root, store.recording.LocalPath)); err != nil {
 					t.Fatal(err)
 				}
 			}
 			store.lookupErr, store.saveErr, store.coverageErr = nil, nil, nil
+			if stage == "alongside corrupt journal" {
+				if err := os.WriteFile(filepath.Join(buffer, "publication-corrupt.json"), []byte("invalid"), 0o640); err != nil {
+					t.Fatal(err)
+				}
+			}
 			restarted := NewRtspRecorderService(store, nil, nil, &rtspSegmenter{}, root, filepath.Dir(buffer))
 			if stage == "worker retry" {
 				if err := restarted.recoverCameraPublications(context.Background(), camera.ID); err != nil {
@@ -592,12 +634,22 @@ func TestRtspPublicationRecoversEveryCommitStage(t *testing.T) {
 				t.Fatalf("publication lost or duplicated: %#v", store.recordings)
 			}
 			journals, _ := filepath.Glob(filepath.Join(buffer, "publication-*.json"))
-			if len(journals) != 0 {
+			expectedJournals := 0
+			if stage == "alongside corrupt journal" {
+				expectedJournals = 1
+				if len(store.issues) == 0 {
+					t.Fatal("corrupt journal was not reported")
+				}
+			}
+			if len(journals) != expectedJournals {
 				t.Fatal("committed journal retained")
 			}
 			if stage == "retained tombstone" {
 				if _, err := os.Stat(filepath.Join(root, store.recording.LocalPath)); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("retention tombstone resurrected")
+				}
+				if len(store.coverage) != 1 || !store.coverage[0].StartAtUtc.Equal(now) || !store.coverage[0].EndAtUtc.Equal(now.Add(time.Minute)) {
+					t.Fatal("retention discarded pending verified coverage")
 				}
 			} else {
 				actual, err := os.ReadFile(filepath.Join(root, store.recording.LocalPath))
@@ -642,11 +694,20 @@ func TestRtspPublicationRejectsEscapedPathsAndCorruption(t *testing.T) {
 			}
 			store := &rtspRecordingStore{}
 			service := NewRtspRecorderService(store, nil, nil, nil, root, filepath.Dir(buffer))
-			if err := service.Recover(context.Background()); err == nil {
-				t.Fatal("unsafe publication accepted")
+			if err := service.Recover(context.Background()); err != nil {
+				t.Fatalf("unsafe publication blocked startup: %v", err)
 			}
 			if len(store.recordings) != 0 {
 				t.Fatal("unsafe media indexed")
+			}
+			if len(store.issues) != 1 {
+				t.Fatal("unsafe publication was not reported")
+			}
+			if _, err := os.Stat(filepath.Join(buffer, pending.BufferName)); err != nil && scenario != "escaped buffer" {
+				t.Fatal("failed journal source was not preserved")
+			}
+			if err := service.recoverCameraPublications(context.Background(), "camera-one"); err != nil {
+				t.Fatal("unsafe journal blocked camera retry")
 			}
 			entries, err := os.ReadDir(outside)
 			if err != nil || len(entries) != 0 {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,12 +72,39 @@ func (service *RtspRecorderService) recoverCameraPublications(ctx context.Contex
 	}
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), "publication-") && strings.HasSuffix(entry.Name(), ".json") {
-			if err := service.recoverRtspPublication(ctx, root, filepath.Join(buffer, entry.Name())); err != nil {
-				return err
+			journal := filepath.Join(buffer, entry.Name())
+			if err := service.recoverRtspPublication(ctx, root, journal); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				service.reportPublicationFailure(ctx, journal)
 			}
 		}
 	}
 	return nil
+}
+
+func (service *RtspRecorderService) reportPublicationFailure(ctx context.Context, journal string) {
+	digest := sha256.Sum256([]byte(journal))
+	cameraID := filepath.Base(filepath.Dir(journal))
+	if !safePathComponent(cameraID) {
+		cameraID = ""
+	}
+	now := service.now().UTC()
+	issue := domain.OperationalIssue{
+		ID: "rtsp-publication-" + hex.EncodeToString(digest[:16]), Severity: "Error", Source: "RtspPublication",
+		CameraID: cameraID, ErrorCode: "PublicationReplayFailed",
+		Message:        "An RTSP publication could not be recovered. Its journal and buffered media are retained for retry; other recording and playback can continue.",
+		FirstSeenAtUtc: now, LastSeenAtUtc: now,
+	}
+	slog.Error(issue.Message, "issueId", issue.ID, "cameraId", cameraID)
+	if reporter, ok := service.store.(interface {
+		ReportIssue(context.Context, domain.OperationalIssue) error
+	}); ok {
+		if reporter.ReportIssue(ctx, issue) != nil {
+			slog.Error("Could not persist RTSP publication issue", "issueId", issue.ID)
+		}
+	}
 }
 
 func (service *RtspRecorderService) recoverRtspPublication(ctx context.Context, root *os.Root, journal string) error {
@@ -121,11 +149,21 @@ func (service *RtspRecorderService) finishRtspPublication(ctx context.Context, r
 		return err
 	}
 	if indexed {
+		if existing.CameraID != recording.CameraID || existing.Source != recording.Source ||
+			existing.Sha256 != recording.Sha256 || existing.SizeBytes != recording.SizeBytes ||
+			!existing.StartAtUtc.Equal(recording.StartAtUtc) || !existing.EndAtUtc.Equal(recording.EndAtUtc) ||
+			(existing.LocalPath != "" && existing.LocalPath != recording.LocalPath) {
+			return errors.New("RTSP publication conflicts with an indexed recording")
+		}
 		if existing.State == domain.RecordingDeleted || existing.State == domain.RecordingExpired {
+			if writer, ok := service.store.(coverageWriter); ok && len(pending.Coverage) > 0 {
+				if err := writer.SaveRecordingCoverage(ctx, recording.ID, pending.Coverage); err != nil {
+					return err
+				}
+			}
 			return removeRtspJournal(root, journal)
 		}
-		if existing.State != domain.RecordingComplete || existing.CameraID != recording.CameraID || existing.Source != recording.Source ||
-			existing.Sha256 != recording.Sha256 || existing.LocalPath != recording.LocalPath {
+		if existing.State != domain.RecordingComplete || existing.LocalPath != recording.LocalPath {
 			return errors.New("RTSP publication conflicts with an indexed recording")
 		}
 	}
