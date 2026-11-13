@@ -26,7 +26,11 @@ func TestReleaseVersionValidation(t *testing.T) {
 
 func TestReleaseBundleIncludesOnlyDistributionFilesAndChecksums(t *testing.T) {
 	root := t.TempDir()
-	for _, name := range []string{"packaging/compose.yaml", "packaging/start.sh", "packaging/start.ps1", "packaging/THIRD-PARTY-NOTICES.md", "README.md", "docs/CONTRIBUTING.md", "docs/APPLICATION-SPEC.md", "docs/REOLINK-CAMERA-API-LEARNINGS.md", "runtime/test-config.json"} {
+	for _, name := range []string{
+		"packaging/compose.yaml", "packaging/start.sh", "packaging/start.ps1", "packaging/THIRD-PARTY-NOTICES.md", "README.md",
+		"docs/images/cameras.png", "docs/images/automatic-detection.png", "docs/images/camera-setup.png",
+		"docs/CONTRIBUTING.md", "docs/APPLICATION-SPEC.md", "docs/REOLINK-CAMERA-API-LEARNINGS.md", "runtime/test-config.json",
+	} {
 		path := filepath.Join(root, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatal(err)
@@ -61,8 +65,13 @@ func TestReleaseBundleIncludesOnlyDistributionFilesAndChecksums(t *testing.T) {
 			}
 		}
 		archive.Close()
-		if len(entries) != 12 || entries["runtime/test-config.json"] != nil || !strings.Contains(string(entries[".env"]), "REONVR_ARCH="+architecture) {
+		if len(entries) != 15 || entries["runtime/test-config.json"] != nil || !strings.Contains(string(entries[".env"]), "REONVR_ARCH="+architecture) {
 			t.Fatal("bundle includes unexpected data or wrong architecture")
+		}
+		for _, name := range []string{"docs/images/cameras.png", "docs/images/automatic-detection.png", "docs/images/camera-setup.png"} {
+			if string(entries[name]) != "fixture" {
+				t.Fatalf("manual screenshot missing or changed: %s", name)
+			}
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(entries["checksums.sha256"])), "\n") {
 			digest, name, found := strings.Cut(line, "  ")

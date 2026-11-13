@@ -66,6 +66,9 @@ jobs:
             npm test
             npm run build
           '
+      - name: Validate privacy-masked manual screenshots
+        run: |
+          docker run --rm --network none -v "$PWD:/src" -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run test:docs
 
   package:
     name: Package and smoke test (${{ matrix.arch }})

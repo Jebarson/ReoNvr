@@ -65,8 +65,44 @@ Docker to your camera network. The gateway is private to the Compose network.
 
 ## First Camera
 
+The screenshots below use illustrative demo data. Camera addresses, credentials,
+and camera images are covered with solid privacy masks.
+
+![Camera list with recording paused and camera addresses masked](docs/images/cameras.png)
+
+### Detect Automatically
+
+1. Open **Cameras** and choose **Detect Automatically**. ReoNvr scans for
+   reachable Reolink devices and lists them under **Detected cameras**.
+2. Choose **Add camera** beside the device you want. Its name, address, and native
+   port are filled in for you. Devices already registered show **Already added**.
+3. Enter the camera credentials, select the stream, and choose **Test connection**.
+   Review its capabilities and recording options, then save it as described below.
+
+![Automatic detection results with camera addresses masked](docs/images/automatic-detection.png)
+
+Detection does not add cameras, supply credentials, or enable recording by
+itself. It does not change camera settings. If a device is not found, add its
+address manually instead.
+
+For Docker hosts with suitable LAN networking, enable the optional discovery
+relay from the extracted release folder:
+
+```sh
+docker compose --profile discovery up -d --wait
+```
+
+The relay uses host networking and UDP `2000`; the app receives replies on UDP
+`3000` (or `REONVR_DISCOVERY_PORT` on the host). Camera discovery needs broadcast
+reachability and may not cross subnets, VPNs, or Docker Desktop's Linux VM.
+Use manual registration when it cannot reach the camera LAN. ReoNvr does not
+change Docker Desktop, firewall, or camera configuration automatically.
+
+### Add Manually and Configure Recording
+
 1. Open **Cameras**, choose **Add camera**, and enter its name, LAN address, and
-   camera credentials. There are no default camera credentials.
+   camera credentials. Skip entering the address if you selected a detected
+   device. There are no default camera credentials.
 2. Select the stream quality and choose **Test connection**. ReoNvr reads the
    model, clock information, streams, events, and storage/search capabilities.
    Changing stream quality requires another connection test.
@@ -79,11 +115,24 @@ Docker to your camera network. The gateway is private to the Compose network.
 5. Enable the application-wide **Recording** switch when recording should run.
    Disable it to pause ingestion across all cameras.
 
+![Camera connection and recording options with address, credentials, and preview image masked](docs/images/camera-setup.png)
+
 Recovery fills monitored missing intervals, not the camera's entire history. It
 can only recover footage the camera actually recorded and still retains. Keep
-camera and host clocks synchronized yourself. Playback and Events show locally
-verified archived media, not camera-only search results. A discovered event is
+camera and host clocks synchronized yourself. Playback shows locally verified
+archived media, not camera-only search results. A discovered event is
 not proof that its video has been archived.
+
+### Automatic Event Detection
+
+ReoNvr reads the camera's native detections, such as **Motion**, **Person**,
+**Vehicle**, and **Animal**, according to that model's capabilities. It does not
+run a separate AI detector or change the camera's detection rules. Select the
+event types you want while configuring the camera. With recording enabled,
+**Events** mode retains footage around those detections; **Continuous** mode
+retains all footage. Use **Playback** and its event-type filters to find local
+video for those detections. Enable the desired detection features in the Reolink
+application yourself if the camera is not reporting them.
 
 ## Configuration
 
@@ -107,18 +156,6 @@ recordings; preserve the old archive and plan a deliberate migration.
 an internet-facing authentication/TLS boundary. Keep loopback binding, or use a
 trusted network and an authenticated HTTPS reverse proxy. Camera credentials
 are encrypted at rest, but that does not make an exposed web interface safe.
-
-Manual camera registration works without a discovery relay. On a Docker host
-with suitable LAN networking, optional automatic discovery can be enabled with:
-
-```sh
-docker compose --profile discovery up -d --wait
-```
-
-The relay uses host networking and UDP `2000`; the app receives replies on UDP
-`3000`. Docker Desktop runs this networking inside its Linux VM, so discovery
-may not reach the physical LAN. Use manual registration when it does not. No
-Docker Desktop, firewall, or camera configuration changes are made automatically.
 
 ## Operation and Backups
 

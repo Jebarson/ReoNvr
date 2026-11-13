@@ -28,6 +28,18 @@ the complete local non-live gate is:
 .\web\tests\run.ps1 -SkipLive
 ```
 
+After building the frontend with the runner above, regenerate the README images
+with the following command. The real UI uses only mocked demo responses; the
+container has no external network, and opaque IP, credential, and media masks
+are checked in the saved PNGs. Never substitute a live deployment or real data.
+
+```powershell
+docker run --rm --network none -v "${PWD}:/src" -w /src/web -e REONVR_DOCS_OUTPUT=/src/docs/images mcr.microsoft.com/playwright:v1.65.0-noble npm run test:docs
+```
+
+CI runs the same screenshot privacy check, writing temporary captures under
+`runtime/reports/documentation` instead of overwriting the checked-in images.
+
 CI runs on pull requests, every push to `main` (including merged pull requests),
 merge-queue events, and manual dispatch. The required aggregate check is **CI**.
 It covers formatting, workflow lint, Go race tests/coverage/vet, frontend

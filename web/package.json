@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "test": "node --test tests/pause-guard.test.mjs",
+    "test:docs": "node --test tests/documentation.spec.mjs",
     "test:smoke": "node --test --test-concurrency=1 tests/smoke.spec.mjs",
     "test:e2e": "node --test --test-concurrency=1 tests/recovery.spec.mjs",
     "test:e2e:full": "node tests/full.spec.mjs",
