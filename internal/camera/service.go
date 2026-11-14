@@ -164,7 +164,18 @@ func (service *Service) Test(ctx context.Context, cameraID string, draft Draft) 
 	}
 	draft.Password = password
 	connectionFingerprint := fingerprint(draft, password)
-	result, err := service.tester.Test(ctx, draft.connection())
+	connection := draft.connection()
+	connection.Timezone = ""
+	if cameraID != "" {
+		stored, err := service.Get(ctx, cameraID)
+		if err != nil {
+			return TestResponse{}, err
+		}
+		if strings.EqualFold(strings.Trim(stored.Host, "[]"), strings.Trim(connection.Host, "[]")) && stored.Port == connection.Port && stored.Channel == connection.Channel {
+			connection.Timezone = stored.Timezone
+		}
+	}
+	result, err := service.tester.Test(ctx, connection)
 	draft.Password = ""
 	password = ""
 	if err != nil {

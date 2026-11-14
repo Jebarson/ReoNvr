@@ -243,6 +243,109 @@ func TestConnectionTestPreservesPriorClockOnProbeFailure(test *testing.T) {
 	}
 }
 
+func TestConnectionTestRefreshesConflictingPriorClock(test *testing.T) {
+	priorEstimate, err := customCameraTimezone(TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true})
+	if err != nil {
+		test.Fatal(err)
+	}
+	baseOffset := -8 * 3600
+	trackedEstimate, err := customCameraTimezone(TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true, EstimatedBaseOffsetSeconds: &baseOffset})
+	if err != nil {
+		test.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		name     string
+		prior    string
+		base     int
+		observed int
+		readTime bool
+		preserve bool
+	}{
+		{name: "fresh estimate", prior: priorEstimate, base: -8 * 3600, observed: -8 * 3600, readTime: true},
+		{name: "conflicting current time", prior: "UTC", base: 0, observed: 3600, readTime: true},
+		{name: "conflicting base offset", prior: "UTC", base: 3600, observed: 3600},
+		{name: "changed estimated base without current time", prior: trackedEstimate, base: 3600, observed: 3600},
+		{name: "no readable observation", prior: priorEstimate, base: -8 * 3600, observed: -7 * 3600, preserve: true},
+		{name: "compatible verified clock", prior: "UTC", base: 0, readTime: true, preserve: true},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			timezone, err := json.Marshal(map[string]int{"timeZone": -fixture.base})
+			if err != nil {
+				test.Fatal(err)
+			}
+			responses := map[string]string{"info": `{"data":{"model":"Fixture"}}`, "config get time-zone": string(timezone), "raw 106": `{"data":{}}`}
+			if fixture.readTime {
+				wall := time.Now().UTC().Add(time.Duration(fixture.observed) * time.Second)
+				payload, err := json.Marshal(map[string]int{"year": wall.Year(), "month": int(wall.Month()), "day": wall.Day(), "hour": wall.Hour(), "minute": wall.Minute(), "second": wall.Second()})
+				if err != nil {
+					test.Fatal(err)
+				}
+				responses["config get system-general"] = string(payload)
+			}
+			result, err := NewClient(&fixtureRunner{responses: responses}, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: fixture.prior, Username: testconfig.Username(), Password: testconfig.Password()})
+			if err != nil || result.TimezoneOffsetSeconds != fixture.observed || (result.Timezone == fixture.prior) != fixture.preserve {
+				test.Fatalf("readable clock observations were ignored: offset=%d preserved=%t err=%v", result.TimezoneOffsetSeconds, result.Timezone == fixture.prior, err)
+			}
+			if !fixture.preserve && !CameraClockEstimated(result.Timezone) {
+				test.Fatal("conflicting prior clock remained conclusive")
+			}
+		})
+	}
+}
+
+func TestRecordingTimestampQualificationAcrossDST(test *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		start   string
+		end     string
+		invalid bool
+	}{
+		{"qualified repeated start", "2026-11-01T01:45:00-07:00", "2026-11-01T02:15:00", false},
+		{"qualified repeated end", "2026-11-01T00:45:00", "2026-11-01T01:15:00-08:00", false},
+		{"unique endpoints spanning repeat", "2026-11-01T00:45:00", "2026-11-01T02:15:00", false},
+		{"unqualified repeated start", "2026-11-01T01:45:00", "2026-11-01T02:15:00-08:00", true},
+		{"unqualified repeated end", "2026-11-01T00:45:00-07:00", "2026-11-01T01:15:00", true},
+		{"nonexistent unqualified end", "2026-03-08T01:45:00-08:00", "2026-03-08T02:15:00", true},
+	} {
+		test.Run(scenario.name, func(test *testing.T) {
+			payload, err := json.Marshal(map[string]string{"startTime": scenario.start, "endTime": scenario.end})
+			if err != nil {
+				test.Fatal(err)
+			}
+			_, _, err = CameraRecordingTimes("America/Los_Angeles", payload)
+			if (err != nil) != scenario.invalid {
+				test.Fatalf("incorrect timestamp qualification: %v", err)
+			}
+		})
+	}
+}
+
+func TestPriorClockCompatibilityAcrossSeasons(test *testing.T) {
+	for _, fixture := range []struct {
+		name       string
+		instant    time.Time
+		base       int
+		wallOffset int
+		compatible bool
+	}{
+		{name: "summer", instant: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC), base: -8 * 3600, wallOffset: -7 * 3600, compatible: true},
+		{name: "winter", instant: time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC), base: -8 * 3600, wallOffset: -8 * 3600, compatible: true},
+		{name: "changed DST setting", instant: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC), base: -8 * 3600, wallOffset: -8 * 3600},
+		{name: "changed base", instant: time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC), base: 3600, wallOffset: 3600},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			wall := fixture.instant.Add(time.Duration(fixture.wallOffset) * time.Second)
+			payload, err := json.Marshal(map[string]int{"year": wall.Year(), "month": int(wall.Month()), "day": wall.Day(), "hour": wall.Hour(), "minute": wall.Minute(), "second": wall.Second()})
+			if err != nil {
+				test.Fatal(err)
+			}
+			if got := priorCameraClockCompatible("America/Los_Angeles", fixture.base, true, payload, fixture.instant, fixture.instant.Add(time.Second)); got != fixture.compatible {
+				test.Fatalf("prior rule compatibility=%t, want %t", got, fixture.compatible)
+			}
+		})
+	}
+}
+
 func TestConnectionTestContinuesWhenAllClockQueriesAreUnavailable(test *testing.T) {
 	runner := &fixtureRunner{responses: map[string]string{
 		"info":           `{"data":{"model":"Doorbell","firmware":"test"}}`,

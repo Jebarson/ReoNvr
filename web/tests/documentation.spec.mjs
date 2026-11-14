@@ -47,7 +47,8 @@ test('live screenshot masks hide camera inputs, selectors and unconfigured disco
   const browser = await chromium.launch({ channel: 'chromium', headless: true })
   try {
     const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
-    await page.setContent('<input name="name" value="private-camera"><input name="host" value="192.0.2.55"><input name="username" value="private-user"><input name="password" value="private-password"><label>Camera<select><option>private-camera</option></select></label><section aria-label="Detected cameras"><p>Unconfigured camera 192.0.2.99</p></section>')
+    await page.setContent('<label>Name<input value="private-camera" required></label><input name="host" value="192.0.2.55"><input name="username" value="private-user"><input name="password" value="private-password"><label>Camera<select><option>private-camera</option></select></label><section aria-label="Detected cameras"><p>Unconfigured camera 192.0.2.99</p></section>')
+    assert.equal(await page.getByLabel('Name', { exact: true }).getAttribute('name'), null, 'Mirror the actual unnamed camera Name input')
     const controls = page.locator(liveCameraScreenshotSelector)
     assert.equal(await controls.count(), 5, 'Every private form and camera select control must be masked')
     await captureMaskedScreenshot(page, { fullPage: true, mask: [controls, page.getByRole('region', { name: 'Detected cameras', exact: true })] })

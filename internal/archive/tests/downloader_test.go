@@ -61,6 +61,62 @@ func (inspect mediaInspectorFunc) InspectVideo(ctx context.Context, path string)
 	return inspect(ctx, path)
 }
 
+type sidecarRepairStore struct {
+	downloadStore
+	recordings []domain.Recording
+	repaired   map[string]bool
+	deferred   map[string]bool
+}
+
+func (store *sidecarRepairStore) ListSidecarRepairs(context.Context, int) ([]domain.Recording, error) {
+	return store.recordings, nil
+}
+func (store *sidecarRepairStore) CompleteSidecarRepair(_ context.Context, recording domain.Recording) (bool, error) {
+	store.repaired[recording.ID] = true
+	return true, nil
+}
+func (store *sidecarRepairStore) DeferSidecarRepair(_ context.Context, id string, _ time.Time) error {
+	store.deferred[id] = true
+	return nil
+}
+
+func TestSidecarRepairFailureDoesNotStarveOtherFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{"blocked.mp4", "ready.mp4"} {
+		if err := os.WriteFile(filepath.Join(root, path), []byte("video"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(root, "blocked.mp4.json"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	store := &sidecarRepairStore{recordings: []domain.Recording{{ID: "blocked", LocalPath: "blocked.mp4"}, {ID: "ready", LocalPath: "ready.mp4"}},
+		repaired: make(map[string]bool), deferred: make(map[string]bool)}
+	service := NewDownloadService(store, nil, serviceCipher{}, root)
+	if err := service.RepairSidecars(context.Background()); err == nil {
+		t.Fatal("blocked sidecar was acknowledged")
+	}
+	if store.repaired["blocked"] || !store.repaired["ready"] || !store.deferred["blocked"] {
+		t.Fatal("one failed sidecar starved healthy metadata repairs")
+	}
+	if err := os.Remove(filepath.Join(root, "blocked.mp4.json")); err != nil {
+		t.Fatal(err)
+	}
+	store.recordings = store.recordings[:1]
+	if err := service.RepairSidecars(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !store.repaired["blocked"] {
+		t.Fatal("interrupted sidecar did not repair on retry")
+	}
+	for _, path := range []string{"blocked.mp4", "ready.mp4"} {
+		payload, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil || string(payload) != "video" {
+			t.Fatal("metadata repair modified media bytes")
+		}
+	}
+}
+
 func TestDownloadInspectionDistinguishesInvalidMediaFromTransientFailure(t *testing.T) {
 	for _, stage := range []string{"partial", "published", "existing"} {
 		for _, invalid := range []bool{true, false} {

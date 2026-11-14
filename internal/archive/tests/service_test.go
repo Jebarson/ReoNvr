@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,7 +69,17 @@ func (searcher *serviceSearcher) SearchRecordings(_ context.Context, connection 
 	searcher.from = from
 	searcher.to = to
 	searcher.windows = append(searcher.windows, [2]time.Time{from, to})
-	return searcher.items, nil
+	items := append([]reolink.Recording(nil), searcher.items...)
+	for index := range items {
+		if len(items[index].RawMetadata) == 0 {
+			payload, err := json.Marshal(map[string]string{"startTime": items[index].StartAtUtc.Format(time.RFC3339Nano), "endTime": items[index].EndAtUtc.Format(time.RFC3339Nano)})
+			if err != nil {
+				return nil, err
+			}
+			items[index].RawMetadata = payload
+		}
+	}
+	return items, nil
 }
 
 type serviceCipher struct{}
@@ -362,13 +373,264 @@ func TestEstimatedClockRecoveryRemainsRetryableUntilVerified(t *testing.T) {
 	}
 }
 
-func TestEstimatedRecordingCoverageRevalidatesOnClockCorrection(t *testing.T) {
+func TestProvisionalRecoveryBacklogIsBoundedAndRescanned(t *testing.T) {
+	for _, linked := range []bool{false, true} {
+		t.Run(map[bool]string{false: "empty", true: "linked recordings"}[linked], func(t *testing.T) {
+			ctx := context.Background()
+			databasePath := filepath.Join(t.TempDir(), "backlog.db")
+			store, err := repository.Open(ctx, databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = store.Close() }()
+			start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+			configuration, err := json.Marshal(reolink.TimezoneConfiguration{Estimated: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			camera := domain.Camera{ID: "backlog", Name: "Backlog", Host: "camera", Port: 9000,
+				Timezone: "Camera/" + base64.RawURLEncoding.EncodeToString(configuration),
+				Enabled:  true, ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain,
+				RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents,
+				EventTypes: []domain.EventType{domain.EventPerson}, Capabilities: &domain.CameraCapabilities{StorageAvailable: true}, CreatedAtUtc: start, UpdatedAtUtc: start}
+			if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, camera.EventTypes); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SyncRecordingIntent(ctx, camera, true, start); err != nil {
+				t.Fatal(err)
+			}
+			searcher := &serviceSearcher{}
+			service := NewRecoveryService(store, searcher, serviceCipher{})
+			now := start.Add(10 * time.Minute)
+			service.now = func() time.Time { return now }
+			for cycle := 0; cycle < 36; cycle++ {
+				now = now.Add(5 * time.Minute)
+				if linked {
+					clipStart := now.Add(-15 * time.Minute)
+					searcher.items = []reolink.Recording{{NativeName: now.Format("150405") + ".mp4", Stream: camera.ArchiveStream,
+						StartAtUtc: clipStart, EndAtUtc: clipStart.Add(time.Minute), EventTypes: camera.EventTypes}}
+				}
+				if err := service.Reconcile(ctx, camera.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gaps, err := store.ListRecoveryGaps(ctx, camera.ID, 1000)
+			if err != nil || len(gaps) != 1 || gaps[0].Status != "Provisional" {
+				t.Fatalf("unchanged estimate accumulated a backlog: rows=%d err=%v", len(gaps), err)
+			}
+			end := now.Add(-10 * time.Minute)
+			if !gaps[0].StartAtUtc.Equal(start) || !gaps[0].EndAtUtc.Equal(end) {
+				t.Fatal("compaction lost affected history")
+			}
+			if linked {
+				required, err := store.ListRequiredEventCoverage(ctx, gaps[0])
+				if err != nil || len(required) != 36 {
+					t.Fatal("compaction lost recording links")
+				}
+			}
+			if len(searcher.windows) > 55 {
+				t.Fatalf("unchanged estimates queried too often: %d", len(searcher.windows))
+			}
+			if err := store.CloseRecordingIntents(ctx, camera.ID, end); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = repository.Open(ctx, databasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.store = store
+			previousCalls := len(searcher.windows)
+			if err := service.Reconcile(ctx, camera.ID); err != nil {
+				t.Fatal(err)
+			}
+			if len(searcher.windows) != previousCalls {
+				t.Fatal("restart lost unchanged-clock backoff")
+			}
+			configuration, err = json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: 3600, Estimated: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", "Camera/"+base64.RawURLEncoding.EncodeToString(configuration), domain.CameraCapabilities{StorageAvailable: true}, "Online", now); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.Reconcile(ctx, camera.ID); err != nil {
+				t.Fatal(err)
+			}
+			if len(searcher.windows) != previousCalls+1 {
+				t.Fatal("changed estimated offset did not invalidate backoff")
+			}
+			previousCalls = len(searcher.windows)
+			if err := store.SaveCaptureCoverage(ctx, camera.ID, camera.ArchiveStream, []domain.TimeRange{{StartAtUtc: start, EndAtUtc: end}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", "UTC", domain.CameraCapabilities{StorageAvailable: true}, "Online", now); err != nil {
+				t.Fatal(err)
+			}
+			searcher.items = nil
+			for cycle := 0; cycle < 12; cycle++ {
+				if err := service.Reconcile(ctx, camera.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, window := range searcher.windows[previousCalls:] {
+				if window[1].Sub(window[0]) > 30*time.Minute+2*coverageTolerance {
+					t.Fatal("clock correction caused an unbounded native search")
+				}
+			}
+			if !linked {
+				gaps, err = store.ListRecoveryGaps(ctx, camera.ID, 1000)
+				if err != nil || len(gaps) != 0 {
+					t.Fatalf("reliable clock did not completely rescan provisional history: %d %v", len(gaps), err)
+				}
+				var covered []domain.TimeRange
+				for _, window := range searcher.windows[previousCalls:] {
+					covered = append(covered, domain.TimeRange{StartAtUtc: window[0], EndAtUtc: window[1]})
+				}
+				if missingDuration(missingCoverage(domain.TimeRange{StartAtUtc: start, EndAtUtc: end}, covered)) != 0 {
+					t.Fatal("reliable rescan skipped historical intervals")
+				}
+			}
+		})
+	}
+}
+
+func TestRecoveryRescanKeepsAmbiguousDSTResultsProvisional(t *testing.T) {
+	for _, withClip := range []bool{false, true} {
+		t.Run(map[bool]string{false: "empty search", true: "downloaded clip"}[withClip], func(t *testing.T) {
+			ctx := context.Background()
+			store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "ambiguous-rescan.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			start := time.Date(2026, 11, 1, 8, 30, 0, 0, time.UTC)
+			end := start.Add(time.Minute)
+			configuration, err := json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			camera := domain.Camera{ID: "ambiguous", Name: "Ambiguous", Host: "camera", Port: 9000,
+				Timezone: "Camera/" + base64.RawURLEncoding.EncodeToString(configuration),
+				Enabled:  true, ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain,
+				RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeEvents,
+				EventTypes: []domain.EventType{domain.EventPerson}, Capabilities: &domain.CameraCapabilities{StorageAvailable: true}, CreatedAtUtc: start, UpdatedAtUtc: start}
+			if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, camera.EventTypes); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SyncRecordingIntent(ctx, camera, true, start); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CloseRecordingIntents(ctx, camera.ID, end); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveCaptureCoverage(ctx, camera.ID, camera.ArchiveStream, []domain.TimeRange{{StartAtUtc: start, EndAtUtc: end}}); err != nil {
+				t.Fatal(err)
+			}
+			searcher := &serviceSearcher{}
+			if withClip {
+				searcher.items = []reolink.Recording{{NativeName: "ambiguous.mp4", Stream: domain.StreamMain, StartAtUtc: start, EndAtUtc: end,
+					EventTypes: []domain.EventType{domain.EventPerson}, RawMetadata: json.RawMessage(`{"startTime":"2026-11-01T01:30:00","endTime":"2026-11-01T01:31:00"}`)}}
+			}
+			service := NewRecoveryService(store, searcher, serviceCipher{})
+			recoveryNow := start.Add(time.Hour)
+			service.now = func() time.Time { return recoveryNow }
+			if err := service.Reconcile(ctx, camera.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", "America/Los_Angeles", domain.CameraCapabilities{StorageAvailable: true}, "Online", recoveryNow); err != nil {
+				t.Fatal(err)
+			}
+			recoveryNow = recoveryNow.Add(time.Second)
+			if err := service.Reconcile(ctx, camera.ID); err != nil {
+				t.Fatal(err)
+			}
+			if withClip {
+				recording, err := store.GetRecording(ctx, recordingID(camera.ID, "ambiguous.mp4"))
+				if err != nil || !strings.Contains(string(recording.RawMetadata), `"_reonvrEstimatedClock":true`) {
+					t.Fatal("reliable-clock rescan erased ambiguous recording uncertainty")
+				}
+				downloader := NewDownloadService(store, &fileDownloader{payload: []byte("native-video")}, serviceCipher{}, t.TempDir())
+				downloader.SetMediaInspector(recoveryInspection{duration: time.Minute})
+				if err := downloader.DownloadNext(ctx, camera.ID); err != nil {
+					t.Fatal(err)
+				}
+				if err := service.Reconcile(ctx, camera.ID); err != nil {
+					t.Fatal(err)
+				}
+				coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, domain.TimeRange{StartAtUtc: start, EndAtUtc: end}, false)
+				if err != nil || len(coverage) != 0 {
+					t.Fatal("ambiguous native footage became trusted coverage")
+				}
+			}
+			gaps, err := store.ListRecoveryGaps(ctx, camera.ID, 100)
+			if err != nil || len(gaps) != 1 || gaps[0].Status != "Provisional" {
+				t.Fatalf("ambiguous rescan became conclusive: %#v %v", gaps, err)
+			}
+		})
+	}
+}
+
+func TestLateVerifiedCoverageClosesEstimatedClockGap(t *testing.T) {
 	ctx := context.Background()
-	store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "estimated-coverage.db"))
+	store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "late-coverage.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	end := start.Add(time.Minute)
+	configuration, err := json.Marshal(reolink.TimezoneConfiguration{Estimated: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	camera := domain.Camera{ID: "late-coverage", Name: "Late coverage", Host: "camera", Port: 9000,
+		Timezone: "Camera/" + base64.RawURLEncoding.EncodeToString(configuration),
+		Enabled:  true, ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain,
+		RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
+		Capabilities: &domain.CameraCapabilities{StorageAvailable: true}, CreatedAtUtc: start, UpdatedAtUtc: start}
+	if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRecordingIntent(ctx, camera, true, start); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseRecordingIntents(ctx, camera.ID, end); err != nil {
+		t.Fatal(err)
+	}
+	searcher := &serviceSearcher{}
+	service := NewRecoveryService(store, searcher, serviceCipher{})
+	service.now = func() time.Time { return start.Add(time.Hour) }
+	if err := service.Reconcile(ctx, camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRtspRecording(ctx, domain.Recording{ID: "late-rtsp", CameraID: camera.ID, NativeName: "late.mkv",
+		Source: domain.RecordingSourceRtsp, Stream: domain.StreamMain, StartAtUtc: start, EndAtUtc: end,
+		State: domain.RecordingComplete, LocalPath: "late.mkv", DiscoveredAtUtc: end, UpdatedAtUtc: end}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRecordingCoverage(ctx, "late-rtsp", []domain.TimeRange{{StartAtUtc: start, EndAtUtc: end}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Reconcile(ctx, camera.ID); err != nil {
+		t.Fatal(err)
+	}
+	gaps, err := store.ListRecoveryGaps(ctx, camera.ID, 100)
+	if err != nil || len(gaps) != 0 || len(searcher.windows) != 1 {
+		t.Fatalf("trusted late footage still caused provisional searches: gaps=%d searches=%d err=%v", len(gaps), len(searcher.windows), err)
+	}
+}
+
+func TestEstimatedRecordingCoverageRevalidatesOnClockCorrection(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "estimated-coverage.db")
+	store, err := repository.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
 	start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
 	end := start.Add(time.Minute)
 	configuration, err := json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: 3600, Estimated: true})
@@ -394,7 +656,8 @@ func TestEstimatedRecordingCoverageRevalidatesOnClockCorrection(t *testing.T) {
 	service := NewRecoveryService(store, searcher, serviceCipher{})
 	recoveryNow := start.Add(2 * time.Hour)
 	service.now = func() time.Time { return recoveryNow }
-	downloader := NewDownloadService(store, &fileDownloader{payload: []byte("native-video")}, serviceCipher{}, t.TempDir())
+	archiveRoot := t.TempDir()
+	downloader := NewDownloadService(store, &fileDownloader{payload: []byte("native-video")}, serviceCipher{}, archiveRoot)
 	downloader.SetMediaInspector(recoveryInspection{duration: time.Minute})
 	if err := service.Reconcile(ctx, camera.ID); err != nil {
 		t.Fatal(err)
@@ -420,6 +683,60 @@ func TestEstimatedRecordingCoverageRevalidatesOnClockCorrection(t *testing.T) {
 	estimated, err := store.GetRecording(ctx, recordingID(camera.ID, "estimated.mp4"))
 	if err != nil || estimated.State != domain.RecordingComplete || !estimated.StartAtUtc.Equal(start.Add(time.Hour)) {
 		t.Fatalf("downloaded native timestamps were not corrected: %#v %v", estimated, err)
+	}
+	coverage, err = store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream,
+		domain.TimeRange{StartAtUtc: start.Add(time.Hour), EndAtUtc: end.Add(time.Hour)}, false)
+	if err != nil || len(coverage) != 0 {
+		t.Fatal("coverage became conclusive before its sidecar repair completed")
+	}
+	stale := estimated
+	stale.StartAtUtc = start
+	if completed, err := store.CompleteSidecarRepair(ctx, stale); err != nil || completed {
+		t.Fatal("stale sidecar acknowledgement cleared pending repair")
+	}
+	broken := NewDownloadService(store, nil, serviceCipher{}, filepath.Join(archiveRoot, "unavailable"))
+	if err := broken.RepairSidecars(ctx); err == nil {
+		t.Fatal("missing archive root did not fail the repair")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = repository.Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.store = store
+	downloader = NewDownloadService(store, &fileDownloader{payload: []byte("native-video")}, serviceCipher{}, archiveRoot)
+	downloader.SetMediaInspector(recoveryInspection{duration: time.Minute})
+	pending, err := store.ListSidecarRepairs(ctx, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatal("failed sidecar repair did not survive restart")
+	}
+	rescan := pending[0]
+	rescan.RawMetadata = json.RawMessage(`{"startTime":"2026-11-11T11:00:00","endTime":"2026-11-11T11:01:00"}`)
+	if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "pending-sidecar-rescan", CameraID: camera.ID, Kind: "Recovery", Status: "Complete", StartedAtUtc: end}, []domain.Recording{rescan}, end); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.ListSidecarRepairs(ctx, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatal("rescan erased a durable pending sidecar repair")
+	}
+	if err := downloader.RepairSidecars(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sidecarData, err := os.ReadFile(filepath.Join(archiveRoot, filepath.FromSlash(estimated.LocalPath)+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sidecar struct {
+		Start time.Time `json:"startAtUtc"`
+		End   time.Time `json:"endAtUtc"`
+	}
+	if err := json.Unmarshal(sidecarData, &sidecar); err != nil {
+		t.Fatal(err)
+	}
+	if !sidecar.Start.Equal(estimated.StartAtUtc) || !sidecar.End.Equal(estimated.EndAtUtc) {
+		t.Fatal("sidecar timestamps disagree with the corrected recording index")
 	}
 	coverage, err = store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream,
 		domain.TimeRange{StartAtUtc: start.Add(time.Hour), EndAtUtc: end.Add(time.Hour)}, false)

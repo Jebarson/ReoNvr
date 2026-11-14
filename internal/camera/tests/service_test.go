@@ -18,6 +18,7 @@ import (
 
 type fakeTester struct {
 	passwords        []string
+	timezones        []string
 	result           reolink.TestResult
 	rejectedPassword string
 }
@@ -74,6 +75,7 @@ func TestDiscoveryMarksRegisteredDevicesWithoutSavingNewOnes(t *testing.T) {
 
 func (tester *fakeTester) Test(_ context.Context, connection reolink.Connection) (reolink.TestResult, error) {
 	tester.passwords = append(tester.passwords, connection.Password)
+	tester.timezones = append(tester.timezones, connection.Timezone)
 	if tester.rejectedPassword != "" && connection.Password == tester.rejectedPassword {
 		return reolink.TestResult{}, errors.New("authentication failed")
 	}
@@ -299,6 +301,63 @@ func TestConnectionEditCanTestWithStoredPassword(t *testing.T) {
 	}
 	if updated.Host != testconfig.Host(3) {
 		t.Fatalf("host was not updated: %#v", updated)
+	}
+}
+
+func TestRetestUsesPriorClockOnlyForStoredEndpoint(t *testing.T) {
+	ctx := context.Background()
+	store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "clock-endpoint.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tester := &fakeTester{result: testCameraResult()}
+	service := NewService(store, tester, cipher)
+	draft := validDraft()
+	result, err := service.Test(ctx, "", draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("new camera has no trusted prior", func(t *testing.T) {
+		if tester.timezones[0] != "" {
+			t.Fatal("new camera inherited an unverified draft timezone")
+		}
+	})
+	draft.TestID = result.TestID
+	created, err := service.Create(ctx, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		name  string
+		edit  func(*Draft)
+		prior bool
+	}{
+		{name: "same endpoint", edit: func(draft *Draft) {}, prior: true},
+		{name: "normalized endpoint", edit: func(draft *Draft) { draft.Host = " " + draft.Host + " " }, prior: true},
+		{name: "host changed", edit: func(draft *Draft) { draft.Host = testconfig.Host(3) }},
+		{name: "port changed", edit: func(draft *Draft) { draft.Port++ }},
+		{name: "channel changed", edit: func(draft *Draft) { draft.Channel++ }},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			changed := draft
+			changed.Timezone = "America/Los_Angeles"
+			fixture.edit(&changed)
+			if _, err := service.Test(ctx, created.ID, changed); err != nil {
+				t.Fatal(err)
+			}
+			wanted := ""
+			if fixture.prior {
+				wanted = created.Timezone
+			}
+			if tester.timezones[len(tester.timezones)-1] != wanted {
+				t.Fatal("retest trusted clock data from a different endpoint or the draft")
+			}
+		})
 	}
 }
 

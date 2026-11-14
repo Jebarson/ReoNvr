@@ -15,20 +15,63 @@ const cameraClockPrefix = "Camera/"
 func approximateCameraClock(payload []byte, configuration TimezoneConfiguration, started, finished time.Time) TimezoneConfiguration {
 	configuration.Estimated = true
 	configuration.DstEnabled = false
+	if offset, ok := observedCameraOffset(payload, started, finished); ok {
+		configuration.BaseOffsetSeconds = offset
+	}
+	return configuration
+}
+
+func observedCameraOffset(payload []byte, started, finished time.Time) (int, bool) {
 	var decoded any
 	if json.Unmarshal(payload, &decoded) != nil {
-		return configuration
+		return 0, false
 	}
 	cameraTime, ok := cameraCurrentTime(decoded)
 	if !ok {
-		return configuration
+		return 0, false
 	}
 	midpoint := started.Add(finished.Sub(started) / 2).UTC()
 	offset := cameraTime.Sub(midpoint).Round(15 * time.Minute)
 	if offset >= -14*time.Hour && offset <= 14*time.Hour {
-		configuration.BaseOffsetSeconds = int(offset / time.Second)
+		return int(offset / time.Second), true
 	}
-	return configuration
+	return 0, false
+}
+
+func priorCameraClockCompatible(name string, baseOffset int, baseKnown bool, payload []byte, started, finished time.Time) bool {
+	if name == "" {
+		return false
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return false
+	}
+	configuration, customErr := decodeCameraClock(name)
+	_, currentKnown := observedCameraOffset(payload, started, finished)
+	if CameraClockEstimated(name) {
+		if currentKnown {
+			return false
+		}
+		return !baseKnown || configuration.EstimatedBaseOffsetSeconds == nil || *configuration.EstimatedBaseOffsetSeconds == baseOffset
+	}
+	if baseKnown {
+		priorBase := configuration.BaseOffsetSeconds
+		if customErr != nil {
+			instant := finished.In(location)
+			for transitions := 0; instant.IsDST(); transitions++ {
+				_, next := instant.ZoneBounds()
+				if next.IsZero() || transitions >= 8 {
+					return false
+				}
+				instant = next.In(location)
+			}
+			_, priorBase = instant.Zone()
+		}
+		if priorBase != baseOffset {
+			return false
+		}
+	}
+	return !currentKnown || !cameraClockDiffers(payload, name, started, finished)
 }
 
 func cameraClockDiffers(payload []byte, timezone string, started, finished time.Time) bool {
@@ -116,6 +159,65 @@ func CameraClockEstimated(name string) bool {
 	}
 	configuration, err := decodeCameraClock(name)
 	return err != nil || configuration.Estimated
+}
+
+func CameraRecordingTimes(name string, payload []byte) (time.Time, time.Time, error) {
+	var metadata struct {
+		Start string `json:"startTime"`
+		End   string `json:"endTime"`
+	}
+	if err := json.Unmarshal(payload, &metadata); err != nil {
+		return time.Time{}, time.Time{}, errors.New("invalid camera recording metadata")
+	}
+	start, startQualified, err := parseRecordedCameraTime(name, metadata.Start)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, endQualified, err := parseRecordedCameraTime(name, metadata.End)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if !start.Before(end) {
+		return time.Time{}, time.Time{}, errors.New("invalid camera recording time range")
+	}
+	if !startQualified {
+		if err := ValidateCameraTimeRange(name, start, start.Add(time.Nanosecond)); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	if !endQualified {
+		if err := ValidateCameraTimeRange(name, end, end.Add(time.Nanosecond)); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	return start, end, nil
+}
+
+func parseRecordedCameraTime(name, value string) (time.Time, bool, error) {
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), true, nil
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
+		wall, err := time.Parse(layout, value)
+		if err != nil {
+			continue
+		}
+		parsed, err := time.ParseInLocation(layout, value, location)
+		if err != nil {
+			continue
+		}
+		local := parsed.In(location)
+		roundTrip := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), time.UTC)
+		if !roundTrip.Equal(wall) {
+			return time.Time{}, false, errors.New("camera recording wall time does not exist")
+		}
+		return parsed.UTC(), false, nil
+	}
+	return time.Time{}, false, errors.New("unsupported camera recording timestamp")
 }
 
 func ValidateCameraTimeRange(name string, from, to time.Time) error {

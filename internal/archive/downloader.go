@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"reonavr/internal/domain"
@@ -41,6 +42,7 @@ type DownloadService struct {
 	inspector   MediaInspector
 	archiveRoot string
 	now         func() time.Time
+	metadataMu  sync.Mutex
 }
 
 func (service *DownloadService) SetCapacityGuard(capacity CapacityGuard) {
@@ -57,6 +59,102 @@ func (service *DownloadService) SetApplicationSettingsProvider(settings Applicat
 
 func NewDownloadService(store DownloadStore, downloader NativeDownloader, cipher CredentialCipher, archiveRoot string) *DownloadService {
 	return &DownloadService{store: store, downloader: downloader, cipher: cipher, archiveRoot: archiveRoot, now: time.Now}
+}
+
+func (service *DownloadService) RepairSidecars(ctx context.Context) error {
+	store, ok := service.store.(interface {
+		ListSidecarRepairs(context.Context, int) ([]domain.Recording, error)
+		CompleteSidecarRepair(context.Context, domain.Recording) (bool, error)
+		DeferSidecarRepair(context.Context, string, time.Time) error
+	})
+	if !ok {
+		return nil
+	}
+	service.metadataMu.Lock()
+	defer service.metadataMu.Unlock()
+	recordings, err := store.ListSidecarRepairs(ctx, 4)
+	if err != nil || len(recordings) == 0 {
+		return err
+	}
+	root, err := os.OpenRoot(service.archiveRoot)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	var failures []error
+	for _, recording := range recordings {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		err := repairRecordingSidecar(root, recording)
+		if err == nil {
+			completed, completeErr := store.CompleteSidecarRepair(ctx, recording)
+			err = completeErr
+			if err == nil && !completed {
+				err = errors.New("sidecar metadata changed during repair; retry required")
+			}
+		}
+		if err != nil {
+			failures = append(failures, errors.Join(err, store.DeferSidecarRepair(ctx, recording.ID, service.now().UTC())))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func repairRecordingSidecar(root *os.Root, recording domain.Recording) error {
+	path := filepath.FromSlash(recording.LocalPath)
+	if !filepath.IsLocal(path) {
+		return errors.New("sidecar repair path is outside the archive")
+	}
+	if _, err := root.Stat(path); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(path+".json.tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(file).Encode(recordingSidecar(recording)); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := root.Rename(path+".json.tmp", path+".json"); err != nil {
+		return err
+	}
+	directory, err := root.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func recordingSidecar(recording domain.Recording) any {
+	var metadata struct {
+		Estimated bool `json:"_reonvrEstimatedClock"`
+	}
+	_ = json.Unmarshal(recording.RawMetadata, &metadata)
+	return struct {
+		CameraID       string                 `json:"cameraId"`
+		NativeName     string                 `json:"nativeName"`
+		Source         domain.RecordingSource `json:"source"`
+		Codec          string                 `json:"codec,omitempty"`
+		Stream         domain.ArchiveStream   `json:"stream"`
+		StartAtUtc     time.Time              `json:"startAtUtc"`
+		EndAtUtc       time.Time              `json:"endAtUtc"`
+		SizeBytes      int64                  `json:"sizeBytes"`
+		EventTypes     []domain.EventType     `json:"eventTypes"`
+		Sha256         string                 `json:"sha256"`
+		ClockEstimated bool                   `json:"clockEstimated,omitempty"`
+	}{recording.CameraID, recording.NativeName, recording.Source, recording.Codec, recording.Stream,
+		recording.StartAtUtc, recording.EndAtUtc, recording.SizeBytes, recording.EventTypes, recording.Sha256, metadata.Estimated}
 }
 
 func (service *DownloadService) DownloadNext(ctx context.Context, cameraID string) error {
@@ -153,24 +251,9 @@ func (service *DownloadService) download(ctx context.Context, camera domain.Came
 	if err != nil {
 		return err
 	}
-	sidecar := struct {
-		CameraID   string                 `json:"cameraId"`
-		NativeName string                 `json:"nativeName"`
-		Source     domain.RecordingSource `json:"source"`
-		Codec      string                 `json:"codec,omitempty"`
-		Stream     domain.ArchiveStream   `json:"stream"`
-		StartAtUtc time.Time              `json:"startAtUtc"`
-		EndAtUtc   time.Time              `json:"endAtUtc"`
-		SizeBytes  int64                  `json:"sizeBytes"`
-		EventTypes []domain.EventType     `json:"eventTypes"`
-		Sha256     string                 `json:"sha256"`
-	}{
-		CameraID: camera.ID, NativeName: recording.NativeName, Source: recording.Source,
-		Codec: recording.Codec, Stream: recording.Stream, StartAtUtc: recording.StartAtUtc,
-		EndAtUtc: recording.EndAtUtc, SizeBytes: sizeBytes,
-		EventTypes: recording.EventTypes, Sha256: digest,
-	}
-	if err := writeSidecar(finalPath+".json", sidecar); err != nil {
+	published := *recording
+	published.SizeBytes, published.Sha256 = sizeBytes, digest
+	if err := writeSidecar(finalPath+".json", recordingSidecar(published)); err != nil {
 		return err
 	}
 	if err := syncDirectory(filepath.Dir(finalPath)); err != nil {

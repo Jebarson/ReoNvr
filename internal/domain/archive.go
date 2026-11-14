@@ -34,6 +34,9 @@ type RecoveryGap struct {
 	Status           string     `json:"status"`
 	MissingSeconds   float64    `json:"missingSeconds"`
 	LastCheckedAtUtc *time.Time `json:"lastCheckedAtUtc,omitempty"`
+	SearchTimezone   string     `json:"-"`
+	SearchCursorUtc  *time.Time `json:"-"`
+	NextSearchAtUtc  *time.Time `json:"-"`
 }
 
 type RecordingState string

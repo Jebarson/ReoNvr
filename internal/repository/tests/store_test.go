@@ -966,6 +966,7 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 		timezone string
 		raw      string
 		verified bool
+		legacy   bool
 	}{
 		{name: "completed", state: "Complete", timezone: "UTC", verified: true},
 		{name: "deleted tombstone", state: "Deleted", timezone: "UTC", verified: true},
@@ -973,6 +974,9 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 		{name: "active verification", state: "Verifying", timezone: "UTC", verified: true},
 		{name: "invalid wall time", state: "Complete", timezone: "UTC", raw: `{"startTime":"missing","endTime":"missing","_reonvrEstimatedClock":true}`},
 		{name: "repeated DST hour", state: "Complete", timezone: "America/Los_Angeles", raw: `{"startTime":"2026-11-01T01:30:00","endTime":"2026-11-01T01:31:00","_reonvrEstimatedClock":true}`},
+		{name: "spring gap", state: "Complete", timezone: "America/Los_Angeles", raw: `{"startTime":"2026-03-08T02:30:00","endTime":"2026-03-08T02:31:00","_reonvrEstimatedClock":true}`},
+		{name: "offset qualified repeated hour", state: "Complete", timezone: "America/Los_Angeles", raw: `{"startTime":"2026-11-01T01:30:00-07:00","endTime":"2026-11-01T01:31:00-07:00","_reonvrEstimatedClock":true}`, verified: true},
+		{name: "legacy missing timestamps", state: "Discovered", raw: `{}`, legacy: true},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -991,6 +995,10 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 				Timezone: "Camera/" + base64.RawURLEncoding.EncodeToString(configuration), ArchiveStream: domain.StreamMain,
 				RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
 				HistoricalImport: domain.HistoricalImportNewOnly, CreatedAtUtc: start, UpdatedAtUtc: start}
+			if fixture.legacy {
+				fixture.timezone = camera.Timezone
+				camera.Timezone = "Camera/Unverified"
+			}
 			if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
 				t.Fatal(err)
 			}
@@ -1012,9 +1020,32 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", fixture.timezone, domain.CameraCapabilities{}, "Online", end); err != nil {
 				t.Fatal(err)
 			}
-			if fixture.state == "Downloading" || fixture.state == "Verifying" {
+			if fixture.legacy {
+				loaded, err := store.GetCamera(ctx, camera.ID)
+				if err != nil || loaded.Timezone != fixture.timezone {
+					t.Fatal("legacy metadata prevented camera clock recovery")
+				}
 				recording, err := store.GetRecording(ctx, "estimate-recording")
-				if err != nil || !recording.StartAtUtc.Equal(start) {
+				if err != nil || recording.State != domain.RecordingDiscovered || !recording.StartAtUtc.Equal(start) {
+					t.Fatal("uninterpretable legacy timestamps were changed or promoted")
+				}
+				return
+			}
+			if fixture.state == "Downloading" || fixture.state == "Verifying" {
+				rescan, err := store.GetRecording(ctx, "estimate-recording")
+				if err != nil {
+					t.Fatal(err)
+				}
+				rescan.StartAtUtc = start.Add(time.Hour)
+				rescan.EndAtUtc = end.Add(time.Hour)
+				rescan.State = domain.RecordingQueued
+				rescan.RawMetadata = json.RawMessage(`{"startTime":"2026-11-11T11:00:00","endTime":"2026-11-11T11:01:00"}`)
+				if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "rescan-run", CameraID: camera.ID, Kind: "Recovery", Status: "Complete", StartedAtUtc: end},
+					[]domain.Recording{rescan}, end); err != nil {
+					t.Fatal(err)
+				}
+				recording, err := store.GetRecording(ctx, "estimate-recording")
+				if err != nil || !recording.StartAtUtc.Equal(start) || !bytes.Contains(recording.RawMetadata, []byte(`"_reonvrEstimatedClock":true`)) {
 					t.Fatalf("active download timestamps changed: %v", err)
 				}
 				if _, err := store.db.ExecContext(ctx, `UPDATE Recordings SET State = 'Complete' WHERE Id = 'estimate-recording'`); err != nil {
@@ -1035,7 +1066,7 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 				t.Fatal(err)
 			}
 			coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, domain.StreamMain,
-				domain.TimeRange{StartAtUtc: start.Add(-48 * time.Hour), EndAtUtc: end.Add(48 * time.Hour)}, false)
+				domain.TimeRange{StartAtUtc: start.Add(-365 * 24 * time.Hour), EndAtUtc: end.Add(365 * 24 * time.Hour)}, false)
 			if err != nil || metadata.Estimated == fixture.verified || (len(coverage) == 1) != fixture.verified {
 				t.Fatalf("unsafe estimate promoted or stable estimate not revalidated: estimated=%t coverage=%d err=%v", metadata.Estimated, len(coverage), err)
 			}

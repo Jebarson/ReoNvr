@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-export const liveCameraScreenshotSelector = 'input[name=name], input[name=password], input[name=username], input[name=host], select, img, video'
+export const liveCameraScreenshotSelector = 'input:not([type=checkbox]):not([type=radio]), select, img, video'
 
 export async function captureMaskedScreenshot(page, options) {
   await page.evaluate(async () => { await document.fonts.ready; window.scrollTo(0, 0) })

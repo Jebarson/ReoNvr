@@ -22,6 +22,8 @@ type RecoveryStore interface {
 	ListVerifiedCoverage(context.Context, string, domain.ArchiveStream, domain.TimeRange, bool) ([]domain.TimeRange, error)
 	ListRecoveryGaps(context.Context, string, int) ([]domain.RecoveryGap, error)
 	UpdateRecoveryGap(context.Context, string, string, float64, time.Time) error
+	PrepareRecoveryGap(context.Context, domain.RecoveryGap, string) (domain.RecoveryGap, bool, error)
+	UpdateProvisionalRecoveryGap(context.Context, domain.RecoveryGap, time.Time, float64, time.Time) error
 	QueueRecoveryRecordings(context.Context, domain.RecoveryGap, []domain.Recording, time.Time) error
 	RecoveryRecordingFinal(context.Context, string) (bool, error)
 	ListRequiredEventCoverage(context.Context, domain.RecoveryGap) ([]domain.TimeRange, error)
@@ -109,6 +111,13 @@ func (service *RecoveryService) Reconcile(ctx context.Context, cameraID string) 
 	connection := reolink.Connection{Host: camera.Host, Port: camera.Port, Channel: camera.Channel, Timezone: camera.Timezone, Username: credential.Username, Password: password}
 	password = ""
 	for _, gap := range gaps {
+		gap, active, err := service.store.PrepareRecoveryGap(ctx, gap, connection.Timezone)
+		if err != nil {
+			return err
+		}
+		if !active {
+			continue
+		}
 		if err := service.recoverGap(ctx, camera, connection, gap, now); err != nil {
 			return err
 		}
@@ -123,10 +132,22 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 	}
 	missing := missingCoverage(gap.TimeRange, coverage)
 	estimatedClock := reolink.CameraClockEstimated(connection.Timezone)
-	if !estimatedClock && gap.Mode == domain.RecordingModeContinuous && missingDuration(missing) <= coverageTolerance {
+	if gap.Mode == domain.RecordingModeContinuous && missingDuration(missing) <= coverageTolerance {
 		return service.store.UpdateRecoveryGap(ctx, gap.ID, "Recovered", 0, now)
 	}
-	items, err := service.searcher.SearchRecordings(ctx, connection, gap.Stream, gap.StartAtUtc.Add(-coverageTolerance), gap.EndAtUtc.Add(coverageTolerance))
+	if gap.NextSearchAtUtc != nil && now.Before(*gap.NextSearchAtUtc) {
+		return nil
+	}
+	if estimatedClock && gap.SearchCursorUtc != nil && !gap.SearchCursorUtc.Before(gap.StartAtUtc) && gap.SearchCursorUtc.Before(gap.EndAtUtc) {
+		gap.StartAtUtc = *gap.SearchCursorUtc
+	}
+	if limit := gap.StartAtUtc.Add(30 * time.Minute); limit.Before(gap.EndAtUtc) {
+		gap.EndAtUtc = limit
+	}
+	missing = missingCoverage(gap.TimeRange, coverage)
+	searchFrom, searchTo := gap.StartAtUtc.Add(-coverageTolerance), gap.EndAtUtc.Add(coverageTolerance)
+	uncertainResults := estimatedClock || reolink.ValidateCameraTimeRange(connection.Timezone, searchFrom, searchTo) != nil
+	items, err := service.searcher.SearchRecordings(ctx, connection, gap.Stream, searchFrom, searchTo)
 	if err != nil {
 		_ = service.store.UpdateRecoveryGap(ctx, gap.ID, "SearchFailed", missingDuration(missing).Seconds(), now)
 		return err
@@ -144,12 +165,18 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 		}
 	}
 	for _, item := range items {
+		start, end, timeErr := reolink.CameraRecordingTimes(connection.Timezone, item.RawMetadata)
+		if timeErr == nil {
+			item.StartAtUtc, item.EndAtUtc = start, end
+		}
 		if item.Stream != gap.Stream || !item.EndAtUtc.After(gap.StartAtUtc) || !item.StartAtUtc.Before(gap.EndAtUtc) || item.EndAtUtc.After(now.Add(-30*time.Second)) {
 			continue
 		}
 		if gap.Mode == domain.RecordingModeEvents && !hasSelectedType(item.EventTypes, selected) {
 			continue
 		}
+		recordingEstimated := estimatedClock || timeErr != nil
+		uncertainResults = uncertainResults || recordingEstimated
 		span := domain.TimeRange{StartAtUtc: item.StartAtUtc, EndAtUtc: item.EndAtUtc}
 		if span.StartAtUtc.Before(gap.StartAtUtc) {
 			span.StartAtUtc = gap.StartAtUtc
@@ -174,7 +201,7 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 		if len(raw) == 0 {
 			raw = []byte("{}")
 		}
-		if estimatedClock {
+		if recordingEstimated {
 			var metadata map[string]json.RawMessage
 			if err := json.Unmarshal(raw, &metadata); err != nil {
 				return err
@@ -236,8 +263,8 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 	} else if remaining > coverageTolerance && len(coverage) > 0 {
 		status = "Partial"
 	}
-	if estimatedClock {
-		status = "Provisional"
+	if uncertainResults {
+		return service.store.UpdateProvisionalRecoveryGap(ctx, gap, gap.EndAtUtc, remaining.Seconds(), now)
 	}
 	return service.store.UpdateRecoveryGap(ctx, gap.ID, status, remaining.Seconds(), now)
 }

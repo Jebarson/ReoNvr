@@ -51,12 +51,13 @@ type DiscoveredCamera struct {
 }
 
 type TimezoneConfiguration struct {
-	BaseOffsetSeconds int           `json:"baseOffsetSeconds"`
-	Estimated         bool          `json:"estimated,omitempty"`
-	DstEnabled        bool          `json:"dstEnabled"`
-	DstOffsetSeconds  int           `json:"dstOffsetSeconds"`
-	DstStart          DstTransition `json:"dstStart"`
-	DstEnd            DstTransition `json:"dstEnd"`
+	BaseOffsetSeconds          int           `json:"baseOffsetSeconds"`
+	Estimated                  bool          `json:"estimated,omitempty"`
+	EstimatedBaseOffsetSeconds *int          `json:"estimatedBaseOffsetSeconds,omitempty"`
+	DstEnabled                 bool          `json:"dstEnabled"`
+	DstOffsetSeconds           int           `json:"dstOffsetSeconds"`
+	DstStart                   DstTransition `json:"dstStart"`
+	DstEnd                     DstTransition `json:"dstEnd"`
 }
 
 type TimezoneMismatchError struct {
@@ -309,7 +310,7 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 	}
 	ruleDeadline, _ := ctx.Deadline()
 	ruleCtx, cancelRules := context.WithTimeout(ctx, min(2*time.Second, time.Until(ruleDeadline)/4))
-	configuration, timezone, clockErr := commandClient.readCameraClock(ruleCtx, connection)
+	configuration, timezone, baseOffsetKnown, clockErr := commandClient.readCameraClock(ruleCtx, connection)
 	cancelRules()
 	result.TimezoneConfiguration = configuration
 	result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
@@ -323,12 +324,17 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 	if clockErr != nil {
 		if configuration.BaseOffsetSeconds < -14*3600 || configuration.BaseOffsetSeconds > 14*3600 {
 			configuration = TimezoneConfiguration{}
+			baseOffsetKnown = false
+		}
+		baseOffset := configuration.BaseOffsetSeconds
+		if baseOffsetKnown {
+			configuration.EstimatedBaseOffsetSeconds = &baseOffset
 		}
 		configuration = approximateCameraClock(clockPayload, configuration, started, finished)
 		result.TimezoneConfiguration = configuration
 		result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
 		result.Timezone, _ = customCameraTimezone(configuration)
-		if connection.Timezone != "" {
+		if priorCameraClockCompatible(connection.Timezone, baseOffset, baseOffsetKnown, clockPayload, started, finished) {
 			if prior, err := cameraLocation(connection.Timezone); err == nil {
 				result.Timezone = connection.Timezone
 				result.TimezoneOffsetSeconds = zoneOffset(prior, time.Now().UTC())
@@ -363,23 +369,23 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 	return result, nil
 }
 
-func (client *Client) readCameraClock(ctx context.Context, connection Connection) (TimezoneConfiguration, string, error) {
+func (client *Client) readCameraClock(ctx context.Context, connection Connection) (TimezoneConfiguration, string, bool, error) {
 	timezoneBytes, err := client.run(ctx, connection, "config", "get", "time-zone")
 	if err != nil {
-		return TimezoneConfiguration{}, "", err
+		return TimezoneConfiguration{}, "", false, err
 	}
 	offset, err := parseTimezoneOffset(timezoneBytes)
 	if err != nil {
-		return TimezoneConfiguration{}, "", err
+		return TimezoneConfiguration{}, "", false, err
 	}
 	fallback := TimezoneConfiguration{BaseOffsetSeconds: -offset}
 	dstBytes, err := client.run(ctx, connection, "raw", "106")
 	if err != nil {
-		return fallback, "", err
+		return fallback, "", true, err
 	}
 	configuration, err := parseDstConfiguration(dstBytes)
 	if err != nil {
-		return fallback, "", err
+		return fallback, "", true, err
 	}
 	configuration.BaseOffsetSeconds = -offset
 	timezone, err := resolveCameraTimezone(configuration, connection.Timezone, time.Now().UTC())
@@ -387,7 +393,7 @@ func (client *Client) readCameraClock(ctx context.Context, connection Connection
 	if errors.As(err, &mismatch) {
 		timezone, err = customCameraTimezone(configuration)
 	}
-	return configuration, timezone, err
+	return configuration, timezone, true, err
 }
 
 func (client *Client) captureSnapshotJPEG(ctx context.Context, connection Connection) ([]byte, error) {

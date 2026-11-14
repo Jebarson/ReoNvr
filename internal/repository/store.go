@@ -142,7 +142,10 @@ func (store *Store) initialize(ctx context.Context) error {
 	if err := store.migrateStorageSettings(ctx); err != nil {
 		return err
 	}
-	return store.migrateRecovery(ctx)
+	if err := store.migrateRecovery(ctx); err != nil {
+		return err
+	}
+	return store.migrateRecoveryRetries(ctx)
 }
 
 func (store *Store) migrateActiveCameraUniqueness(ctx context.Context) error {
@@ -585,12 +588,12 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 	if timezone == "Camera/Unverified" {
 		return nil
 	}
-	location, err := reolink.CameraLocation(timezone)
+	_, err := reolink.CameraLocation(timezone)
 	if err != nil {
 		return errors.New("camera timezone is invalid")
 	}
 	estimatedClock := reolink.CameraClockEstimated(timezone)
-	rows, err := tx.QueryContext(ctx, `SELECT Id, RawMetadataJson, StartAtUtc, State FROM Recordings
+	rows, err := tx.QueryContext(ctx, `SELECT Id, RawMetadataJson, StartAtUtc, State, COALESCE(LocalPath, '') FROM Recordings
 		WHERE CameraId = ? AND Source = 'CameraStorage'
 		AND ((State = 'Discovered' AND ?) OR (COALESCE(json_extract(CASE WHEN json_valid(RawMetadataJson) THEN RawMetadataJson ELSE '{}' END,
 		'$._reonvrEstimatedClock'), 0) = 1
@@ -608,8 +611,8 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 	}
 	updates := make([]recordingTime, 0)
 	for rows.Next() {
-		var id, rawMetadata, previousStart, state string
-		if err := rows.Scan(&id, &rawMetadata, &previousStart, &state); err != nil {
+		var id, rawMetadata, previousStart, state, localPath string
+		if err := rows.Scan(&id, &rawMetadata, &previousStart, &state, &localPath); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan discovered recording timestamp: %w", err)
 		}
@@ -619,35 +622,19 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 			Estimated bool   `json:"_reonvrEstimatedClock"`
 		}
 		if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
-			rows.Close()
-			return fmt.Errorf("decode discovered recording timestamp: %w", err)
+			continue
 		}
 		if metadata.Estimated && estimatedClock && state != string(domain.RecordingDiscovered) {
 			continue
 		}
-		start, err := parseCameraLocalTime(metadata.StartTime, location)
+		start, end, err := reolink.CameraRecordingTimes(timezone, []byte(rawMetadata))
 		if err != nil {
-			if metadata.Estimated {
-				continue
-			}
-			rows.Close()
-			return fmt.Errorf("parse discovered recording start: %w", err)
-		}
-		end, err := parseCameraLocalTime(metadata.EndTime, location)
-		if err != nil {
-			if metadata.Estimated {
-				continue
-			}
-			rows.Close()
-			return fmt.Errorf("parse discovered recording end: %w", err)
+			continue
 		}
 		previous, err := time.Parse(time.RFC3339Nano, previousStart)
 		if err != nil {
 			rows.Close()
 			return err
-		}
-		if metadata.Estimated && !estimatedClock && reolink.ValidateCameraTimeRange(timezone, start, end) != nil {
-			continue
 		}
 		if metadata.Estimated || estimatedClock {
 			var values map[string]json.RawMessage
@@ -659,6 +646,9 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 				values["_reonvrEstimatedClock"] = json.RawMessage("true")
 			} else {
 				delete(values, "_reonvrEstimatedClock")
+				if state == string(domain.RecordingComplete) && localPath != "" {
+					values["_reonvrSidecarPending"] = json.RawMessage("true")
+				}
 			}
 			encoded, err := json.Marshal(values)
 			if err != nil {
@@ -731,17 +721,6 @@ func reinterpretEstimatedCoverage(ctx context.Context, tx *sql.Tx, recordingID s
 		return err
 	}
 	return saveRecordingCoverageTx(ctx, tx, recordingID, corrected)
-}
-
-func parseCameraLocalTime(value string, location *time.Location) (time.Time, error) {
-	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-		return parsed.UTC(), nil
-	}
-	parsed, err := time.ParseInLocation("2006-01-02T15:04:05", value, location)
-	if err != nil {
-		return time.Time{}, errors.New("unsupported camera timestamp")
-	}
-	return parsed.UTC(), nil
 }
 
 func (store *Store) ListCameras(ctx context.Context) ([]domain.Camera, error) {
@@ -1140,7 +1119,10 @@ func saveReconciliationTx(ctx context.Context, tx *sql.Tx, run domain.IngestionR
 				State = CASE
 					WHEN Recordings.State = 'Discovered' AND excluded.State = 'Queued' THEN 'Queued'
 					ELSE Recordings.State END,
-				RawMetadataJson = excluded.RawMetadataJson, UpdatedAtUtc = excluded.UpdatedAtUtc`,
+				RawMetadataJson = excluded.RawMetadataJson, UpdatedAtUtc = excluded.UpdatedAtUtc
+				WHERE Recordings.State NOT IN ('Downloading', 'Verifying')
+				AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
+				'$._reonvrSidecarPending'), 0) != 1`,
 			recording.ID, recording.CameraID, recording.NativeName, recording.Source, recording.Stream, nullableString(recording.Codec),
 			formatTime(&recording.StartAtUtc), formatTime(&recording.EndAtUtc), recording.SizeBytes,
 			recording.State, string(recording.RawMetadata), formatTime(&recording.DiscoveredAtUtc),
@@ -1447,6 +1429,7 @@ func (store *Store) ListRetentionCandidates(ctx context.Context, limit int) ([]d
 
 func (store *Store) MarkRecordingDeleted(ctx context.Context, id string, now time.Time) error {
 	result, err := store.db.ExecContext(ctx, `UPDATE Recordings SET State = 'Deleted',
+		RawMetadataJson = CASE WHEN json_valid(RawMetadataJson) THEN json_remove(RawMetadataJson, '$._reonvrSidecarPending') ELSE RawMetadataJson END,
 		LocalPath = NULL, DeletedAtUtc = ?, UpdatedAtUtc = ? WHERE Id = ? AND State = 'Complete'`,
 		formatTime(&now), formatTime(&now), id)
 	if err != nil {
@@ -1537,6 +1520,8 @@ func (store *Store) ListArchivedEvents(ctx context.Context, cameraID string, lim
 			AND Recordings.State = 'Complete' AND Recordings.LocalPath IS NOT NULL AND Recordings.LocalPath != ''
 			AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
 			'$._reonvrEstimatedClock'), 0) != 1
+			AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
+			'$._reonvrSidecarPending'), 0) != 1
 			AND EXISTS (SELECT 1 FROM RecordingCoverage Coverage WHERE Coverage.RecordingId = Recordings.Id
 				AND julianday(Coverage.StartAtUtc) <= julianday(COALESCE(Events.EndedAtUtc, Events.StartedAtUtc))
 				AND julianday(Coverage.EndAtUtc) > julianday(Events.StartedAtUtc))
