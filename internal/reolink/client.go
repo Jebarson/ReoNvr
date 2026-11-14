@@ -52,6 +52,7 @@ type DiscoveredCamera struct {
 
 type TimezoneConfiguration struct {
 	BaseOffsetSeconds int           `json:"baseOffsetSeconds"`
+	Estimated         bool          `json:"estimated,omitempty"`
 	DstEnabled        bool          `json:"dstEnabled"`
 	DstOffsetSeconds  int           `json:"dstOffsetSeconds"`
 	DstStart          DstTransition `json:"dstStart"`
@@ -306,7 +307,10 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 	if payload, err := commandClient.run(ctx, connection, "stream", "url", "--kind", "rtsp", "--stream", strings.ToLower(string(stream))); err == nil {
 		result.Capabilities.RtspAvailable = containsRtspURL(payload)
 	}
-	configuration, timezone, clockErr := commandClient.readCameraClock(ctx, connection)
+	ruleDeadline, _ := ctx.Deadline()
+	ruleCtx, cancelRules := context.WithTimeout(ctx, min(2*time.Second, time.Until(ruleDeadline)/4))
+	configuration, timezone, clockErr := commandClient.readCameraClock(ruleCtx, connection)
+	cancelRules()
 	result.TimezoneConfiguration = configuration
 	result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
 	result.Timezone = timezone
@@ -324,7 +328,20 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 		result.TimezoneConfiguration = configuration
 		result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
 		result.Timezone, _ = customCameraTimezone(configuration)
+		if connection.Timezone != "" {
+			if prior, err := cameraLocation(connection.Timezone); err == nil {
+				result.Timezone = connection.Timezone
+				result.TimezoneOffsetSeconds = zoneOffset(prior, time.Now().UTC())
+				result.TimezoneConfiguration = TimezoneConfiguration{BaseOffsetSeconds: result.TimezoneOffsetSeconds}
+				if priorConfiguration, err := decodeCameraClock(connection.Timezone); err == nil {
+					result.TimezoneConfiguration = priorConfiguration
+				}
+			}
+		}
 		result.Capabilities.ClockWarning = "Camera time rules could not be verified. ReoNvr will continue using a best-effort clock; recording times may be approximate."
+		if CameraClockEstimated(result.Timezone) {
+			result.Capabilities.ClockWarning += " Recovery remains provisional until clock rules can be verified."
+		}
 	} else if currentTimeErr == nil && cameraClockDiffers(clockPayload, result.Timezone, started, finished) {
 		result.Capabilities.ClockWarning = "Your camera's time doesn't match your machine. ReoNvr will use the camera's clock."
 	}

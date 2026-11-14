@@ -147,10 +147,15 @@ archived media, not camera-only search results. A discovered event is
 not proof that its video has been archived.
 
 Clock differences and unavailable daylight-saving rules produce a warning, not a
-registration or recovery block. ReoNvr uses the camera's readable current time and
-reported offset for a best-effort clock, falling back to UTC when neither is
-available. Historical timestamps can be approximate, especially across a DST
-change; re-test the camera after correcting its clock or changing DST settings.
+registration or recovery block. Failed probes retain a usable last-known clock.
+Without one, ReoNvr uses the camera's readable current time and reported offset
+for a best-effort clock, falling back to UTC when neither is available.
+Historical timestamps can be approximate, especially across a DST change;
+re-test the camera after correcting its clock or changing DST settings.
+Estimated-clock recovery remains provisional: downloads are still available,
+but their coverage cannot close missing intervals until reliable clock rules
+allow timestamp revalidation. Affected intervals are rescanned after the clock
+is verified; ambiguous timestamps remain provisional.
 
 ### Automatic Event Detection
 

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { after, before, test } from 'node:test'
 import { chromium, request } from 'playwright'
 import { armPauseGuard } from './pause-guard.mjs'
+import { captureMaskedScreenshot, liveCameraScreenshotSelector } from './screenshot.mjs'
 
 const baseURL = process.env.REONVR_E2E_URL ?? 'http://reonvr-fresh-app:8080'
 const target = new URL(baseURL)
@@ -80,8 +81,9 @@ async function layout(page, name) {
     return box.left < parent.left || box.right > parent.right + 1 || element.scrollWidth > element.clientWidth + 1
   })), false, 'Player status text fits inside the player')
   assert.equal(await page.evaluate(() => document.body.textContent.includes('Camera/')), false, 'Internal clock rules stay hidden')
-  await page.screenshot({ path: fileURLToPath(new URL(`../../runtime/e2e-${name}.png`, import.meta.url)), fullPage: true, animations: 'disabled', mask: [
-    page.locator('input[name=password], input[name=username], input[name=host], img, video'),
+  await captureMaskedScreenshot(page, { path: fileURLToPath(new URL(`../../runtime/e2e-${name}.png`, import.meta.url)), fullPage: true, animations: 'disabled', mask: [
+    page.locator(liveCameraScreenshotSelector),
+    page.getByRole('region', { name: 'Detected cameras', exact: true }),
     page.getByText(credentials.username, { exact: true }),
     ...configuration.cameras.flatMap((camera) => [page.getByText(camera.host, { exact: false }), page.getByText(`E2E ${camera.id}`, { exact: false })]),
   ] })

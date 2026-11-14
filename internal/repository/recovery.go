@@ -148,19 +148,23 @@ func (store *Store) SaveRecoveryScan(ctx context.Context, periodID string, until
 
 func (store *Store) SaveRecordingCoverage(ctx context.Context, recordingID string, ranges []domain.TimeRange) error {
 	return store.withTransaction(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM RecordingCoverage WHERE RecordingId = ?`, recordingID); err != nil {
+		return saveRecordingCoverageTx(ctx, tx, recordingID, ranges)
+	})
+}
+
+func saveRecordingCoverageTx(ctx context.Context, tx *sql.Tx, recordingID string, ranges []domain.TimeRange) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM RecordingCoverage WHERE RecordingId = ?`, recordingID); err != nil {
+		return err
+	}
+	for _, span := range ranges {
+		if !span.StartAtUtc.Before(span.EndAtUtc) {
+			return errors.New("invalid verified coverage")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO RecordingCoverage (RecordingId, StartAtUtc, EndAtUtc) VALUES (?, ?, ?)`, recordingID, formatTime(&span.StartAtUtc), formatTime(&span.EndAtUtc)); err != nil {
 			return err
 		}
-		for _, span := range ranges {
-			if !span.StartAtUtc.Before(span.EndAtUtc) {
-				return errors.New("invalid verified coverage")
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO RecordingCoverage (RecordingId, StartAtUtc, EndAtUtc) VALUES (?, ?, ?)`, recordingID, formatTime(&span.StartAtUtc), formatTime(&span.EndAtUtc)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (store *Store) SaveCaptureCoverage(ctx context.Context, cameraID string, stream domain.ArchiveStream, ranges []domain.TimeRange) error {
@@ -202,7 +206,9 @@ func (store *Store) SaveCaptureCoverage(ctx context.Context, cameraID string, st
 
 func (store *Store) ListVerifiedCoverage(ctx context.Context, cameraID string, stream domain.ArchiveStream, span domain.TimeRange, capture bool) ([]domain.TimeRange, error) {
 	query := `SELECT Coverage.StartAtUtc, Coverage.EndAtUtc FROM RecordingCoverage Coverage JOIN Recordings ON Recordings.Id = Coverage.RecordingId
-		WHERE Recordings.CameraId = ? AND Recordings.Stream = ? AND Recordings.State IN ('Complete', 'Deleted')`
+		WHERE Recordings.CameraId = ? AND Recordings.Stream = ? AND Recordings.State IN ('Complete', 'Deleted')
+		AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
+		'$._reonvrEstimatedClock'), 0) != 1`
 	if capture {
 		query = `SELECT Coverage.StartAtUtc, Coverage.EndAtUtc FROM CaptureCoverage Coverage WHERE Coverage.CameraId = ? AND Coverage.Stream = ?`
 	}

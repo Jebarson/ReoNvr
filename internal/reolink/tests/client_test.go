@@ -184,15 +184,18 @@ func TestConnectionTestKeepsStreamsAvailableWhenClockIsUnverified(test *testing.
 
 func TestConnectionTestSlowCurrentTimePreservesStorageAndSnapshot(test *testing.T) {
 	for _, fixture := range []struct {
-		name string
-		dst  string
+		name    string
+		dst     string
+		command string
 	}{
-		{name: "verified IANA clock", dst: `{"data":{"Dst":{"enable":0}}}`},
-		{name: "estimated clock", dst: `{"data":{}}`},
+		{name: "verified IANA clock", dst: `{"data":{"Dst":{"enable":0}}}`, command: "config get system-general"},
+		{name: "estimated clock", dst: `{"data":{}}`, command: "config get system-general"},
+		{name: "timezone query", dst: `{"data":{"Dst":{"enable":0}}}`, command: "config get time-zone"},
+		{name: "DST query", dst: `{"data":{"Dst":{"enable":0}}}`, command: "raw 106"},
 	} {
 		test.Run(fixture.name, func(test *testing.T) {
 			snapshot := []byte{0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9}
-			runner := &fixtureRunner{blockedCommand: "config get system-general", snapshot: snapshot, responses: map[string]string{
+			runner := &fixtureRunner{blockedCommand: fixture.command, snapshot: snapshot, responses: map[string]string{
 				"info":                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
 				"config get time-zone": `{"data":{"timeZone":28800}}`,
 				"raw 106":              fixture.dst,
@@ -209,6 +212,34 @@ func TestConnectionTestSlowCurrentTimePreservesStorageAndSnapshot(test *testing.
 				test.Fatal("estimated clock warning was lost after the optional query timed out")
 			}
 		})
+	}
+}
+
+func TestConnectionTestPreservesPriorClockOnProbeFailure(test *testing.T) {
+	priorCustom, err := customCameraTimezone(TimezoneConfiguration{
+		BaseOffsetSeconds: -8 * 3600, DstEnabled: true, DstOffsetSeconds: 3600,
+		DstStart: DstTransition{Month: 3, Week: 2, Weekday: 0, Hour: 1},
+		DstEnd:   DstTransition{Month: 11, Week: 1, Weekday: 0, Hour: 3},
+	})
+	if err != nil {
+		test.Fatal(err)
+	}
+	priorEstimate, err := customCameraTimezone(TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true})
+	if err != nil {
+		test.Fatal(err)
+	}
+	for _, prior := range []string{"America/Los_Angeles", priorCustom, priorEstimate} {
+		runner := &fixtureRunner{responses: map[string]string{
+			"info":                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+			"config get time-zone": `{"data":{"timeZone":28800}}`,
+			"raw 106":              `{"data":{}}`,
+			"storage status":       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+			"vod search":           `{"data":{"items":[]}}`,
+		}}
+		result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: prior, Username: testconfig.Username(), Password: testconfig.Password()})
+		if err != nil || result.Timezone != prior || result.TimezoneConfiguration.Estimated != CameraClockEstimated(prior) || !result.Capabilities.StoragePlaybackAvailable {
+			test.Fatalf("transient clock failure discarded usable prior clock: preserved=%t storage=%t err=%v", result.Timezone == prior, result.Capabilities.StoragePlaybackAvailable, err)
+		}
 	}
 }
 

@@ -4,6 +4,7 @@ import { mkdir, readFile } from 'node:fs/promises'
 import { extname, resolve, sep } from 'node:path'
 import test from 'node:test'
 import { chromium } from 'playwright'
+import { captureMaskedScreenshot, liveCameraScreenshotSelector } from './screenshot.mjs'
 
 const maskedSelector = '.cameraName small, .discoveryList small, input[name=host], input[name=username], input[name=password], .cameraSnapshot, img, video, canvas'
 const timestamp = '2026-01-15T11:30:00Z'
@@ -36,26 +37,24 @@ async function captureMasked(page, output, name, minimumMasks) {
     return { x: bounds.x + scrollX, y: bounds.y + scrollY, width: bounds.width, height: bounds.height }
   }).filter((bounds) => bounds.width > 0 && bounds.height > 0))
   assert.ok(regions.length >= minimumMasks, 'Expected sensitive areas must be present before capture')
-  const screenshot = await page.screenshot({
+  await captureMaskedScreenshot(page, {
     path: resolve(output, `${name}.png`), fullPage: true, animations: 'disabled',
     mask: [mask], maskColor: '#202020',
   })
-  const opaque = await page.evaluate(async ({ image, areas }) => {
-    const bitmap = new Image()
-    bitmap.src = `data:image/png;base64,${image}`
-    await bitmap.decode()
-    const canvas = document.createElement('canvas')
-    canvas.width = bitmap.width
-    canvas.height = bitmap.height
-    const context = canvas.getContext('2d')
-    context.drawImage(bitmap, 0, 0)
-    return areas.every((area) => {
-      const pixel = context.getImageData(Math.floor(area.x + area.width / 2), Math.floor(area.y + area.height / 2), 1, 1).data
-      return pixel[0] === 32 && pixel[1] === 32 && pixel[2] === 32 && pixel[3] === 255
-    })
-  }, { image: screenshot.toString('base64'), areas: regions })
-  assert.equal(opaque, true, 'Screenshot redactions must be solid opaque pixels')
 }
+
+test('live screenshot masks hide camera inputs, selectors and unconfigured discoveries', { timeout: 30000 }, async () => {
+  const browser = await chromium.launch({ channel: 'chromium', headless: true })
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
+    await page.setContent('<input name="name" value="private-camera"><input name="host" value="192.0.2.55"><input name="username" value="private-user"><input name="password" value="private-password"><label>Camera<select><option>private-camera</option></select></label><section aria-label="Detected cameras"><p>Unconfigured camera 192.0.2.99</p></section>')
+    const controls = page.locator(liveCameraScreenshotSelector)
+    assert.equal(await controls.count(), 5, 'Every private form and camera select control must be masked')
+    await captureMaskedScreenshot(page, { fullPage: true, mask: [controls, page.getByRole('region', { name: 'Detected cameras', exact: true })] })
+  } finally {
+    await browser.close()
+  }
+})
 
 test('manual screenshots use demo data and opaque address, credential and media masks', { timeout: 60000 }, async () => {
   const buildRoot = resolve('dist')

@@ -13,6 +13,7 @@ import (
 const cameraClockPrefix = "Camera/"
 
 func approximateCameraClock(payload []byte, configuration TimezoneConfiguration, started, finished time.Time) TimezoneConfiguration {
+	configuration.Estimated = true
 	configuration.DstEnabled = false
 	var decoded any
 	if json.Unmarshal(payload, &decoded) != nil {
@@ -107,6 +108,41 @@ func decodeCameraClock(name string) (TimezoneConfiguration, error) {
 
 func CameraLocation(name string) (*time.Location, error) {
 	return cameraLocation(name)
+}
+
+func CameraClockEstimated(name string) bool {
+	if !strings.HasPrefix(name, cameraClockPrefix) {
+		return false
+	}
+	configuration, err := decodeCameraClock(name)
+	return err != nil || configuration.Estimated
+}
+
+func ValidateCameraTimeRange(name string, from, to time.Time) error {
+	if !from.Before(to) {
+		return errors.New("invalid camera recording time range")
+	}
+	if err := validateCameraSearchClock(name, from, to); err != nil {
+		return err
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return err
+	}
+	for cursor, limit := from.Add(-24*time.Hour), to.Add(24*time.Hour); cursor.Before(limit); {
+		_, offset := cursor.In(location).Zone()
+		_, next := cursor.In(location).ZoneBounds()
+		if next.IsZero() || next.After(limit) {
+			break
+		}
+		_, nextOffset := next.In(location).Zone()
+		repeated := time.Duration(offset-nextOffset) * time.Second
+		if repeated > 0 && from.Before(next.Add(repeated)) && to.After(next.Add(-repeated)) {
+			return errors.New("camera recording timestamps are ambiguous during the daylight-saving clock change")
+		}
+		cursor = next
+	}
+	return nil
 }
 
 func cameraLocation(name string) (*time.Location, error) {

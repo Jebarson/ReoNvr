@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sort"
 	"time"
@@ -121,7 +122,8 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 		return err
 	}
 	missing := missingCoverage(gap.TimeRange, coverage)
-	if gap.Mode == domain.RecordingModeContinuous && missingDuration(missing) <= coverageTolerance {
+	estimatedClock := reolink.CameraClockEstimated(connection.Timezone)
+	if !estimatedClock && gap.Mode == domain.RecordingModeContinuous && missingDuration(missing) <= coverageTolerance {
 		return service.store.UpdateRecoveryGap(ctx, gap.ID, "Recovered", 0, now)
 	}
 	items, err := service.searcher.SearchRecordings(ctx, connection, gap.Stream, gap.StartAtUtc.Add(-coverageTolerance), gap.EndAtUtc.Add(coverageTolerance))
@@ -172,6 +174,20 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 		if len(raw) == 0 {
 			raw = []byte("{}")
 		}
+		if estimatedClock {
+			var metadata map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &metadata); err != nil {
+				return err
+			}
+			if metadata == nil {
+				metadata = make(map[string]json.RawMessage)
+			}
+			metadata["_reonvrEstimatedClock"] = json.RawMessage("true")
+			raw, err = json.Marshal(metadata)
+			if err != nil {
+				return err
+			}
+		}
 		queued = append(queued, domain.Recording{ID: recordingID(camera.ID, item.NativeName), CameraID: camera.ID, NativeName: item.NativeName,
 			Source: domain.RecordingSourceCameraStorage, Stream: item.Stream, StartAtUtc: item.StartAtUtc, EndAtUtc: item.EndAtUtc,
 			SizeBytes: item.SizeBytes, EventTypes: item.EventTypes, State: domain.RecordingQueued, RawMetadata: raw, DiscoveredAtUtc: now, UpdatedAtUtc: now})
@@ -219,6 +235,9 @@ func (service *RecoveryService) recoverGap(ctx context.Context, camera domain.Ca
 		status = "Downloading"
 	} else if remaining > coverageTolerance && len(coverage) > 0 {
 		status = "Partial"
+	}
+	if estimatedClock {
+		status = "Provisional"
 	}
 	return service.store.UpdateRecoveryGap(ctx, gap.ID, status, remaining.Seconds(), now)
 }

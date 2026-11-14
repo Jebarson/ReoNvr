@@ -959,6 +959,90 @@ func TestUpdateCameraProbeReinterpretsDiscoveredMetadataAfterTimezoneChange(t *t
 	}
 }
 
+func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T) {
+	for _, fixture := range []struct {
+		name     string
+		state    string
+		timezone string
+		raw      string
+		verified bool
+	}{
+		{name: "completed", state: "Complete", timezone: "UTC", verified: true},
+		{name: "deleted tombstone", state: "Deleted", timezone: "UTC", verified: true},
+		{name: "active download", state: "Downloading", timezone: "UTC", verified: true},
+		{name: "active verification", state: "Verifying", timezone: "UTC", verified: true},
+		{name: "invalid wall time", state: "Complete", timezone: "UTC", raw: `{"startTime":"missing","endTime":"missing","_reonvrEstimatedClock":true}`},
+		{name: "repeated DST hour", state: "Complete", timezone: "America/Los_Angeles", raw: `{"startTime":"2026-11-01T01:30:00","endTime":"2026-11-01T01:31:00","_reonvrEstimatedClock":true}`},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open(ctx, filepath.Join(t.TempDir(), "estimate.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+			end := start.Add(time.Minute)
+			configuration, err := json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: 3600, Estimated: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			camera := domain.Camera{ID: "estimate", Name: "Estimate", Host: testconfig.Host(2), Port: 9000,
+				Timezone: "Camera/" + base64.RawURLEncoding.EncodeToString(configuration), ArchiveStream: domain.StreamMain,
+				RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous,
+				HistoricalImport: domain.HistoricalImportNewOnly, CreatedAtUtc: start, UpdatedAtUtc: start}
+			if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+				t.Fatal(err)
+			}
+			raw := fixture.raw
+			if raw == "" {
+				raw = `{"startTime":"2026-11-11T11:00:00","endTime":"2026-11-11T11:01:00","_reonvrEstimatedClock":true}`
+			}
+			if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "estimate-run", CameraID: camera.ID, Kind: "Recovery", Status: "Complete", StartedAtUtc: start},
+				[]domain.Recording{{ID: "estimate-recording", CameraID: camera.ID, NativeName: "estimate.mp4", Source: domain.RecordingSourceCameraStorage,
+					Stream: domain.StreamMain, State: domain.RecordingDiscovered, StartAtUtc: start, EndAtUtc: end, RawMetadata: json.RawMessage(raw), DiscoveredAtUtc: start, UpdatedAtUtc: start}}, start); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE Recordings SET State = ? WHERE Id = 'estimate-recording'`, fixture.state); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveRecordingCoverage(ctx, "estimate-recording", []domain.TimeRange{{StartAtUtc: start, EndAtUtc: end}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", fixture.timezone, domain.CameraCapabilities{}, "Online", end); err != nil {
+				t.Fatal(err)
+			}
+			if fixture.state == "Downloading" || fixture.state == "Verifying" {
+				recording, err := store.GetRecording(ctx, "estimate-recording")
+				if err != nil || !recording.StartAtUtc.Equal(start) {
+					t.Fatalf("active download timestamps changed: %v", err)
+				}
+				if _, err := store.db.ExecContext(ctx, `UPDATE Recordings SET State = 'Complete' WHERE Id = 'estimate-recording'`); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", fixture.timezone, domain.CameraCapabilities{}, "Online", end.Add(time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recording, err := store.GetRecording(ctx, "estimate-recording")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata struct {
+				Estimated bool `json:"_reonvrEstimatedClock"`
+			}
+			if err := json.Unmarshal(recording.RawMetadata, &metadata); err != nil {
+				t.Fatal(err)
+			}
+			coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, domain.StreamMain,
+				domain.TimeRange{StartAtUtc: start.Add(-48 * time.Hour), EndAtUtc: end.Add(48 * time.Hour)}, false)
+			if err != nil || metadata.Estimated == fixture.verified || (len(coverage) == 1) != fixture.verified {
+				t.Fatalf("unsafe estimate promoted or stable estimate not revalidated: estimated=%t coverage=%d err=%v", metadata.Estimated, len(coverage), err)
+			}
+		})
+	}
+}
+
 func TestApplyEventTransitionPersistsAndClosesEventsIdempotently(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "events.db"))
