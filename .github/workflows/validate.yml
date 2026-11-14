@@ -102,6 +102,7 @@ jobs:
           docker build --platform "linux/$ARCH" -f docker/gateway.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/gateway:$VERSION-$ARCH" .
           docker build --platform "linux/$ARCH" -f docker/discovery-relay.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/discovery-relay:$VERSION-$ARCH" .
           docker build --platform "linux/$ARCH" -f docker/app.Dockerfile --target test-artifacts --output type=local,dest=runtime/ci-tools .
+          docker run --rm --network none -v "$PWD/runtime/ci-tools:/tools" alpine:3.22 chmod 0755 /tools /tools/archive.test
           docker run --rm -v "$PWD/runtime/ci-tools:/tools:ro" --entrypoint sh "reonvr/app:$VERSION-$ARCH" -ec 'command -v ffmpeg; command -v ffprobe; /tools/archive.test -test.run="^(TestClockAlignedSegmentsUseRelativeMediaTime|TestMediaInspectionWithRealFFmpeg)$" -test.v=test2json' > runtime/media-tests.log
           docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go tool test2json -p reonavr/internal/archive < runtime/media-tests.log' > runtime/media-tests.json
           docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go run ./tools/gotest verify TestClockAlignedSegmentsUseRelativeMediaTime TestMediaInspectionWithRealFFmpeg < runtime/media-tests.json'

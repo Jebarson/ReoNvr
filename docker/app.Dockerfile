@@ -50,7 +50,7 @@ RUN go build -o /tmp/gotest ./tools/gotest \
     && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH /tmp/gotest -c -o /out/archive.test ./internal/archive
 
 FROM scratch AS test-artifacts
-COPY --from=media-tests /out/archive.test /archive.test
+COPY --from=media-tests --chmod=0755 /out/archive.test /archive.test
 
 FROM debian:bookworm-slim
 ARG VERSION=dev
