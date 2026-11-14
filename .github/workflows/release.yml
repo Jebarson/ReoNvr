@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag on main, for example v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate version and require a main-branch commit
+        id: version
+        env:
+          VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine go run ./tools/release -check-version -version "$VERSION"
+          docker run --rm -e VERSION -v "$PWD:/src:ro" -w /src --entrypoint sh alpine/git -ec '
+            git config --global --add safe.directory /src
+            revision=$(git rev-parse --verify "refs/tags/$VERSION^{commit}")
+            test "$revision" = "$(git rev-parse HEAD)"
+            git merge-base --is-ancestor "$revision" origin/main
+            printf "version=%s\nrevision=%s\n" "$VERSION" "$revision"
+          ' >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: version
+    uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ needs.version.outputs.revision }}
+      version: ${{ needs.version.outputs.version }}
+
+  publish:
+    needs: [version, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.version.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: assets
+      - name: Verify publication checksums
+        run: docker run --rm -v "$PWD/assets:/assets:ro" -w /assets alpine:3.22 sh -c 'sha256sum -c *.sha256'
+      - name: Recheck tested tag and configured publication requirements
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_POLICY_TOKEN || github.token }}
+          REQUIRE_TAG_POLICY: ${{ vars.REQUIRE_TAG_POLICY || 'false' }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          REVISION: ${{ needs.version.outputs.revision }}
+        run: |
+          docker run --rm -e GITHUB_TOKEN -e REQUIRE_TAG_POLICY -e REPOSITORY -e VERSION -e REVISION -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go run ./tools/release -check-publication -require-tag-policy="$REQUIRE_TAG_POLICY" -repository "$REPOSITORY" -version "$VERSION" -revision "$REVISION"'
+      - name: Publish tested ZIPs with generated release notes
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          target_commitish: ${{ needs.version.outputs.revision }}
+          name: ReoNvr ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          make_latest: ${{ !contains(needs.version.outputs.version, '-') }}
+          files: |
+            assets/*.zip
+            assets/*.sha256

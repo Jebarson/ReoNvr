@@ -304,7 +304,7 @@ test('existing discovery and recovery regressions run against temporary cameras'
       originals.push(camera)
       assert.equal((await api.put(`/api/cameras/${id}`, { data: existingDraft(camera, { archiveEnabled: true }) })).status(), 200)
     }
-    const output = execFileSync(process.execPath, ['--test', '--test-concurrency=1', 'e2e/recovery.spec.mjs'], {
+    const output = execFileSync(process.execPath, ['--test', '--test-concurrency=1', 'tests/recovery.spec.mjs'], {
       env: { ...process.env, REONVR_E2E_URL: baseURL, REONVR_E2E_CHANNEL: 'chromium' },
       encoding: 'utf8', timeout: 100000,
     })

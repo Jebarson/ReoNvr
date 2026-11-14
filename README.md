@@ -1,429 +1,269 @@
 # ReoNvr
 
-ReoNvr is a self-hosted Reolink recording archive. It records native RTSP
-streams, optionally recovers missed recordings from camera storage, indexes
-camera detections, and provides local browser playback without transcoding.
+ReoNvr is a self-hosted recording archive for Reolink cameras. It records native
+RTSP streams, recovers missed footage from camera storage when available, and
+provides a browser interface for cameras, detections, and local playback.
+It does not transcode video or change camera recording schedules, streaming
+settings, detection rules, storage, or time settings. It never deletes camera
+SD-card media.
 
-ReoNvr reads camera configuration and media. It never changes camera recording
-schedules, formats camera storage, or deletes files from a camera.
+## Requirements
 
-## Recording modes
+- Docker Engine with Docker Compose v2 on Linux, or Docker Desktop running Linux
+  containers on Windows/macOS.
+- A Linux amd64 or arm64 Docker server. Intel/AMD PCs normally use amd64; Apple
+  Silicon and ARM64 Linux devices use arm64. Check with:
 
-| Mode | Live recording | Optional camera-storage recovery |
+  ```sh
+  docker info --format '{{.Architecture}}'
+  ```
+
+- A reachable Reolink camera with an account allowed to read device information,
+  events, recordings, and RTSP streams. Enable the required camera services in
+  the Reolink application yourself if they are unavailable.
+- Enough disk space for the archive and a browser capable of decoding the
+  selected native camera codec. HEVC/H.265 playback depends on the browser and
+  operating system; selecting an available H.264 sub-stream can improve
+  compatibility without transcoding.
+
+## Download and Install
+
+1. Open [Releases](https://github.com/Jebarson/ReoNvr/releases) and download the
+   ZIP for your Docker server architecture, for example
+   `ReoNvr-v1.0.0-linux-amd64.zip` or `ReoNvr-v1.0.0-linux-arm64.zip`.
+   Releases currently inherit this private repository's access restrictions.
+   An authorized maintainer can also share the ZIP directly; running it needs
+   no GitHub account, source checkout, compiler, or registry credentials.
+2. Verify the downloaded ZIP against its accompanying `.sha256` file and extract
+   it into a dedicated folder. The ZIP contains all three Docker images, Compose
+   configuration, startup scripts, checksums, version metadata, and required
+   third-party licenses. This README, guides, and screenshots remain in the
+   repository and are not included in the ZIP.
+3. Optionally edit the extracted `.env` before first startup. Keep
+   `REONVR_VERSION` and `REONVR_ARCH` unchanged. The defaults use Docker-managed
+   persistent volumes and expose the web interface only on this computer.
+4. Start Docker, then run the appropriate script from the extracted folder.
+
+   Windows PowerShell:
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+   ```
+
+   Run this only after verifying and extracting the ZIP. The execution-policy
+   override applies to this process, not your machine-wide settings. Organization
+   policies may still require administrator approval.
+
+   Linux/macOS shell:
+
+   ```sh
+   sh ./start.sh
+   ```
+
+   The scripts require complete checksum coverage of all seven immutable assets,
+   check the Docker architecture, and compare every Compose image (including
+   optional profiles) with the checked image manifest before importing or starting
+   anything. They then wait for application and gateway health checks.
+   The editable `.env` is intentionally excluded from the internal checksums.
+5. Open <http://localhost:8080>, or the HTTP port configured in `.env`.
+
+After the ZIP is downloaded, installation does not pull images or install
+dependencies from the internet. Camera access still requires connectivity from
+Docker to your camera network. The gateway is private to the Compose network.
+
+## First Camera
+
+Fresh installations have **Recording** enabled by default. Set it to **Paused**
+before adding cameras if you want to control when capture begins; saving an
+enabled camera with archiving selected can otherwise start recording immediately.
+Pausing ingestion does not pause automatic archive retention, described below.
+
+The screenshots below use illustrative demo data. Camera addresses, credentials,
+and camera images are covered with solid privacy masks.
+
+![Camera list with recording paused and camera addresses masked](docs/images/cameras.png)
+
+### Detect Automatically
+
+1. Open **Cameras** and choose **Detect Automatically**. ReoNvr scans for
+   reachable Reolink devices and lists them under **Detected cameras**.
+2. Choose **Add camera** beside the device you want. Its name, address, and native
+   port are filled in for you. Devices already registered show **Already added**.
+3. Enter the camera credentials, select the stream, and choose **Test connection**.
+   Review its capabilities and recording options, then save it as described below.
+
+![Automatic detection results with camera addresses masked](docs/images/automatic-detection.png)
+
+Detection does not add cameras, supply credentials, or enable recording by
+itself. It does not change camera settings. If a device is not found, add its
+address manually instead.
+
+For Docker hosts with suitable LAN networking, enable the optional discovery
+relay by adding this setting to the extracted release's `.env`:
+
+```dotenv
+COMPOSE_PROFILES=discovery
+```
+
+Run the normal startup script. Keep this setting
+when transferring your configuration to a new release so upgrades also recreate
+the relay with its new image.
+
+The relay uses host networking and UDP `2000`; native replies require host UDP
+`3000`. Leave `REONVR_DISCOVERY_PORT=3000` for automatic detection. Alternate host
+port mappings require manual camera registration. Camera discovery needs broadcast
+reachability and may not cross subnets, VPNs, or Docker Desktop's Linux VM.
+Use manual registration when it cannot reach the camera LAN. ReoNvr does not
+change Docker Desktop, firewall, or camera configuration automatically.
+
+### Add Manually and Configure Recording
+
+1. Open **Cameras**, choose **Add camera**, and enter its name, LAN address, and
+   camera credentials. Skip entering the address if you selected a detected
+   device. There are no default camera credentials.
+2. Select the stream quality and choose **Test connection**. ReoNvr reads the
+   model, clock information, streams, events, and storage/search capabilities.
+   Changing stream quality requires another connection test.
+3. Select **Events** to retain footage around selected detections, or
+   **Continuous** to keep every stream-copy segment. Optionally enable
+   **Recover missed recordings from camera storage** when the connection test
+   confirms usable camera storage and recording search.
+4. Save the camera. In **Settings**, select the archive subfolder and folder
+   layout. The archive subfolder is relative to `/archive`.
+5. If you paused recording during setup, enable the application-wide **Recording**
+   switch when capture should run. Disable it to pause ingestion across all cameras.
+
+![Camera connection and recording options with address, credentials, and preview image masked](docs/images/camera-setup.png)
+
+Recovery fills monitored missing intervals, not the camera's entire history. It
+can only recover footage the camera actually recorded and still retains. Keep
+camera and host clocks synchronized yourself. Playback shows locally verified
+archived media, not camera-only search results. A discovered event is
+not proof that its video has been archived.
+
+### Automatic Event Detection
+
+ReoNvr reads the camera's native detections, such as **Motion**, **Person**,
+**Vehicle**, and **Animal**, according to that model's capabilities. It does not
+run a separate AI detector or change the camera's detection rules. Select the
+event types you want while configuring the camera. With recording enabled,
+**Events** mode retains footage around those detections; **Continuous** mode
+retains all footage. Use **Playback** and its event-type filters to find local
+video for those detections. Enable the desired detection features in the Reolink
+application yourself if the camera is not reporting them.
+
+## Configuration
+
+Edit `.env`, then rerun the appropriate startup script above so checksum and
+image checks still run. Keep `REONVR_VERSION` and `REONVR_ARCH` from the new ZIP;
+inherited shell environment values override `.env` and stale values are rejected.
+
+| Setting | Default | Purpose |
 |---|---|---|
-| Events | Retain stream-copy segments around selected camera events | Recover matching native event clips from monitored intervals |
-| Continuous | Retain every stream-copy segment | Recover native clips overlapping missing local coverage |
-
-RTSP is always the primary source. **Recover missed recordings from camera
-storage** is available after a connection test confirms usable storage and
-recording search. It does not import the camera's entire history or change its
-recording schedule. Recovery requires the camera to have recorded and retained
-the missing footage. Keep the camera and ReoNvr host clocks synchronized.
-
-Public Playback and Events views use local archive media, not camera-only
-history. Recordings appear after their local media is complete. Event visibility
-requires verified video coverage, not just recording time bounds. Older files
-without inspected coverage remain playable but do not establish event backing.
-
-## Prerequisites
-
-- Docker Engine with Docker Compose v2, or Docker Desktop on Windows/macOS.
-- A Reolink camera reachable from the Docker host on its Baichuan and selected
-	media ports.
-- A camera account allowed to read device information, events, recordings, and
-	RTSP streams.
-- A writable host directory with enough space for the archive.
-- A modern browser. Native main-stream recordings are commonly H.265/HEVC;
-	Chrome works on the tested Windows host. Microsoft Edge requires the HEVC
-	Video Extensions package when Windows does not already provide an HEVC
-	decoder.
-
-## Installation
-
-1. Clone the repository and enter it:
-
-	 ```sh
-	 git clone https://github.com/Jebarson/ReoNvr.git
-	 cd ReoNvr
-	 git switch initial-setup
-	 ```
-
-2. Optionally choose a host recording directory:
-
-	 ```sh
-	 cp .env.example .env
-	 ```
-
-	 Edit `REONVR_RECORDINGS_PATH` in `.env`. The default is
-	 `./runtime/archive`. Create a custom directory before starting Docker.
-
-3. Build and start the application:
-
-	 ```sh
-	 docker compose up -d --build
-	 ```
-
-4. Confirm the app and gateway are healthy and the discovery relay is running:
-
-	 ```sh
-	 docker compose ps
-	 ```
-
-5. Open <http://localhost:8080>.
-
-Runtime data is stored in bind-mounted directories and survives container
-rebuilds. The gateway is private to the Compose network. The app publishes TCP
-`8080` for the UI and UDP `3000` for discovery replies. The bundled relay listens
-on UDP `2000` in the Docker host's network namespace; on Docker Desktop this is
-the Linux VM, not a Windows installation or a Docker Desktop settings change.
-
-## First use
-
-1. Open **Cameras** and select **Detect Automatically**, then **Add camera**
-	 beside a detected device. For manual entry, select the toolbar's **Add camera**.
-2. Review the camera name and LAN address, then enter the username and password.
-3. Choose the stream quality and select **Test connection**. ReoNvr discovers
-	 the camera model, timezone, streams, storage/search support, and event
-	 categories without changing the camera. Changing stream quality requires
-	 another test.
-4. Choose Events or Continuous and event categories. Optionally enable
-	 **Recover missed recordings from camera storage**, then save.
-5. Open **Settings** to choose the recording subfolder and organization:
-	 - Camera, then day
-	 - Day, then camera
-	 - Camera only
-	 - Day only
-6. Enable the application-wide **Recording** switch when ingestion should run.
-
-Clock warnings are advisory: you can keep the camera's current settings and save
-it for live RTSP recording. Custom rules alone do not trigger a warning; the
-camera's reported current time must differ by more than one minute after
-applying its clock rules. ReoNvr uses the camera's reported offset and
-daylight-saving rules for camera-storage timestamps, even without a matching
-named timezone. If those rules cannot be verified, only camera-storage recovery
-is unavailable; reviewing or changing the camera settings in the Reolink app is
-your choice. ReoNvr never changes them automatically.
-
-The Settings folder is relative to the mounted `/archive` root. To move the
-host archive, change `REONVR_RECORDINGS_PATH` and recreate the app container.
-Folder and layout changes apply only to new media; indexed older files retain
-their existing paths.
-
-## Daily operation
-
-- **Cameras** shows connectivity, RTSP mode, local media count, and recovery
-	status. Select the recovery status to inspect intervals and unresolved time.
-- **Detect Automatically** is available beside **Add camera** at any time.
-	It only scans for devices; selecting one prefills its name, address, and port.
-	Credentials and a successful connection test are still required before saving.
-- **Playback** lists only completed local recordings and supports date/event
-	filters, seeking, and original-file download.
-- **Settings** controls the recording subfolder and folder layout.
-- The global **Recording** switch pauses recovery, downloads, event ingestion,
-	and RTSP recording without changing camera policies. Deliberately paused
-	intervals are not scheduled for later catch-up.
-- Camera health, database maintenance, and local retention continue while
-	recording is paused. Pause is not a storage freeze; worker status can retain
-	`Stopped` history after ingestion ends.
-- Retention removes the oldest completed local recordings when free space
-	falls below the calculated 30-minute reserve. It never deletes camera media.
-
-Camera-storage downloads preserve their camera codec and container. RTSP capture
-copies the native streams into Matroska without transcoding; Continuous mode
-targets one-minute segments, with cuts at available keyframes. **Original**
-downloads the exact archived file. Extensionless native Reolink MP4 files are
-served and downloaded with an `.mp4` filename.
-
-Recovery compares saved recording intent with verified media coverage using a
-two-second tolerance. A downloaded file alone does not establish full recovery.
-Partial coverage remains unresolved; an unobserved event interval with no
-matching camera history stays **Unknown**, not recovered. Recent footage is
-left provisional for two minutes in Continuous mode or ten minutes in Events
-mode. Recovery keeps whole native clips, which can overlap live recordings;
-Playback remains a recording list, not a seamlessly stitched timeline.
-
-Captured event time is not proof of archived footage: known selected events
-still require verified media for their saved pre/post-roll windows.
-Previously linked selected SD clips remain required even if a later search no
-longer returns them. Permanently invalid native media becomes **Failed** only
-after its rejected partial file, or final file and sidecar, are removed and the
-directory is flushed. This allows older downloads to proceed without pretending
-the missing footage was recovered. Cleanup failures and temporary probe failures
-remain retryable. Adjacent quiet checks are coalesced within their recording-policy
-period. Recovery history shows unresolved intervals first; terminal history
-expires after 30 days while unresolved intervals and archived media are preserved.
-
-Upgrading preserves completed local media. Existing camera-storage policies
-become RTSP-primary with recovery enabled from the migration boundary, without
-automatically importing older camera history. Legacy queued or in-progress
-camera-storage transfers become metadata-only and are not resumed by that old
-queue. Review camera recovery policies after upgrading; old pending files are
-not guaranteed to be recovered, and no camera SD media is removed.
-
-## Reliability and limits
-
-Camera policy saves apply their lifecycle hooks in commit order, and camera
-worker changes serialize with global recording-control updates. Intent-bookkeeping
-failures are retried separately and do not block applying camera worker changes.
-Events mode periodically publishes
-long events and flushes valid buffered footage on pause or stream interruption.
-RTSP publication journals reconcile unfinished media/index/coverage commits at
-startup or the next camera-worker retry. Replays verify the native file hash
-and do not resurrect intentionally retained tombstones. Retention leaves other
-queued clips in the same recovery interval eligible for download.
-Event flush retries replay existing publications rather than remuxing their media.
-Publication errors resolve only after all outstanding journals for that camera
-have recovered or been cleared; failures for other cameras remain open.
-
-A forced process/host shutdown can still lose the unjournaled active tail.
-Missing or corrupt journaled media is reported rather than marked recovered.
-Failed journals and their buffered fragments remain available for retry without
-blocking startup, other publications, or subsequent camera capture.
-Unindexed files from versions before publication journaling are not discovered
-automatically. Physical outages, power loss, full disks, and destructive
-retention drills remain separate from the deterministic regression tests.
-
-See [docs/APPLICATION-SPEC.md](docs/APPLICATION-SPEC.md#12-review-fixes-and-validation-limits)
-for the addressed review cases and remaining validation limits. Stop the app
-container for consistent filesystem backups; recording pause alone leaves
-retention and database maintenance running.
-
-## Updating and stopping
-
-Update and rebuild:
-
-```sh
-git pull
-docker compose up -d --build
-```
-
-Stop containers without deleting data:
-
-```sh
-docker compose down
-```
-
-Do not add `-v`; ReoNvr uses bind mounts, but destructive volume commands are
-not part of the supported update workflow.
-
-## Fresh setup replica
-
-An independent fresh-install replica runs at <http://localhost:8081> using
-`compose.fresh.yaml`. Its app and gateway use local snapshot image tags, a
-separate Docker network, and separate named volumes for the database, encryption
-key, archive, and gateway state. It does not copy cameras, credentials, settings,
-or media from the installation on port `8080`. Port `8081` is bound only to the
-local machine.
-
-Start the prepared replica:
-
-```sh
-docker compose -f compose.fresh.yaml up -d --wait
-```
-
-The fresh stack includes the discovery relay and owns host UDP `3000`. Only one
-installation or discovery client can own that fixed reply port at a time. The
-original running instance can remain online, but do not recreate it with the
-updated main Compose file while the fresh instance owns the port.
-
-Recording has been left paused for setup review. Add cameras through the normal
-UI when ready. Changes and camera registrations in this replica persist in its
-own volumes across restarts.
-
-Stop only the replica, preserving its data:
-
-```sh
-docker compose -f compose.fresh.yaml down
-```
-
-## Acceptance testing
-
-The Docker-only Windows runner is `web/e2e/run.ps1`. It runs the Go suite,
-frontend lint/build, runtime FFmpeg checks, read-only live SD checks, and
-Playwright UX tests. No host Go, npm, Node, or browser installation is needed.
-
-Live acceptance is an opt-in **local camera lab profile**, not a generic CI smoke test:
-
-- Start the fresh stack with current snapshot images. Its visible camera list
-	must be empty and global recording paused. Never point it at the original app.
-- Use `internal/testconfig/config.example.json` as the template for the ignored
-	`runtime/test-config.json`. The example has blank camera addresses, usernames,
-	and passwords. Fill in the local file yourself; never commit or publish it.
-- Configure at least two reachable cameras with unique IDs. `probeCamera` selects
-	the clock/snapshot probe and `storageCamera` selects the SD/RTSP test camera.
-	Set each camera's host, Baichuan port, and channel for the current network.
-	Browser registration currently requires channel zero; the Go live check also
-	accepts configured NVR channels. All live cameras share the configured username
-	and password. No particular camera model, subnet, or fixed camera count is required.
-- The helper validates the local file and pipes it directly to test containers
-	over stdin. It no longer reads the original database or encryption key. Never
-	run the helper standalone, capture its stdout, or put passwords in arguments,
-	environment variables, traces, or HAR recordings. The plaintext local file is
-	read-only mounted, excluded from Git/Docker builds, and must be kept private.
-- The fresh image must include the code under test. The runner does not rebuild
-	or redeploy either installation automatically.
-
-From the repository root in PowerShell:
-
-```powershell
-docker build -f docker/app.Dockerfile -t reonvr-fresh-app:snapshot .
-docker compose -f compose.fresh.yaml up -d --wait
-.\web\e2e\run.ps1
-```
-
-Use `-Config <path>` to select another private local JSON file. Run
-`.\web\e2e\run.ps1 -SkipLive` for Go, frontend, and FFmpeg checks without a
-configuration file, camera credentials, camera access, or recording mutations.
-Blank live credentials fail before contacting the fresh app or any camera.
-Unit tests load synthetic addresses from the example's `fixtures` section and
-generate blank fixture usernames/passwords in memory rather than embedding them
-in source. `REONVR_TEST_CONFIG` can select an alternative fixture configuration
-for individual containerized Go or recovery-browser runs.
-
-The runner installs pinned frontend dependencies into a named Docker volume.
-It registers temporary cameras through the UI, checks all storage layouts,
-records the configured storage camera's native substream to verify a full continuous
-segment, then checks playback, seeking, original-download byte identity, and
-HTTP range handling. Screenshots cover desktop, tablet, and 390/320-pixel mobile
-layouts and are written under ignored `runtime/e2e-*.png`, with password inputs
-masked. Screenshots can contain private camera images; do not publish them.
-
-The browser suite restores local settings, removes its temporary cameras, and
-pauses recording. Just before capture, the suite arms and verifies an independent
-container's five-minute pause deadline. That guard keeps retrying pause after
-expiry or an explicit cleanup request, including while the application is
-temporarily unavailable. The runner removes it only after confirming recording
-is paused; failed confirmation leaves the guard running. Native test recordings
-are intentionally retained in the isolated fresh archive after camera removal;
-this also exercises archive ownership preservation. The original installation
-is not mutated. Camera settings and camera SD media are never changed or deleted.
-
-Only application assets under `web/public` or `web/src/assets` and intentional
-manual illustrations under `docs/images` belong in Git. Test screenshots,
-camera snapshots, recordings, reports, and private configuration remain ignored.
-
-Live coverage includes discovery/authentication/snapshots for configured cameras,
-camera CRUD/policies, actual clock parsing, native SD search/download/codec
-inspection, bounded RTSP recording, and browser playback. Backend tests cover
-recovery/retention algorithms, leases, worker lifecycle, validation, and credential
-safety. Mocked browser responses exercise unavailable/pending/failed media,
-unsupported-codec fallback, filters, connection failures, and optional clock
-warnings without causing real camera faults.
-
-This does not certify physical outage recovery, actual AI-event triggering,
-SD removal, full-disk behavior, destructive retention, long-running load, or
-every browser/host platform. Those need separate controlled drills; the suite
-does not simulate a real outage by changing camera settings or disrupting the LAN.
-
-## Backup
-
-Pausing recording does not stop retention or database maintenance. For a
-consistent filesystem backup, first pause recording in the UI, then stop the
-app container before copying data:
-
-```sh
-docker compose stop app
-```
-
-Back up these items together while the app remains stopped:
-
-- The complete `runtime/data` directory, including SQLite WAL files when present
-- `runtime/secrets/master.key`
-- The directory configured by `REONVR_RECORDINGS_PATH`
-
-The database and master key are a pair. Losing the key makes saved camera
-passwords unrecoverable. Keep backup keys private. Restart with
-`docker compose start app`; the persisted recording pause remains in effect.
-
-To restore, stop the app and preserve the current data before replacing
-anything. Restore the database directory, matching key, and archive from the
-same backup generation to their configured mounts, preserving write permissions
-for container user `10001`. Do not mix restored database files with unrelated
-WAL files. Start the app, confirm readiness, check camera registrations and
-playback, and leave recording paused until the restored state has been reviewed.
-For the fresh replica, use its separate named volumes and
-`docker compose -f compose.fresh.yaml` commands; do not restore over the original
-installation or assume its bind-mount paths apply to the replica.
-
-## Security
-
-- Camera passwords are encrypted locally with AES-256-GCM.
-- Passwords are supplied to Reolink tools through standard input, not argv.
-- Passwords, ciphertext, and authenticated media URLs are not returned by the
-	API or written to logs.
-- Keep port `8080` on a trusted LAN or place ReoNvr behind an authenticated
-	reverse proxy. Built-in multi-user authentication is not implemented.
-- Never commit `.env`, `runtime/`, database files, archive media, or master
-	keys.
-
-## Troubleshooting
-
-Check service health and recent logs:
+| `REONVR_HTTP_PORT` | `8080` | Host web port |
+| `REONVR_BIND_ADDRESS` | `127.0.0.1` | Host interface exposing the web UI |
+| `REONVR_DISCOVERY_PORT` | `3000` | Keep `3000` for automatic detection; alternate ports are manual-registration only |
+| `REONVR_RECORDINGS_PATH` | Docker volume | Optional absolute host archive directory |
+| `COMPOSE_PROJECT_NAME` | `reonvr-release` | Persistent release installation identity, separate from the source checkout |
+| `COMPOSE_PROFILES` | Not set | Set `discovery` to persist the optional relay across startups and upgrades |
+
+To store recordings in a host folder, set `REONVR_RECORDINGS_PATH` to an existing
+absolute path such as `/srv/reonvr/recordings` or `D:/ReoNvr/recordings`. On Linux,
+the container user (UID/GID `10001`) needs write access. ReoNvr does not change host
+folder ownership automatically. Changing this mount does not move existing
+recordings; preserve the old archive and plan a deliberate migration.
+
+### Automatic Retention
+
+There is no configurable retention-period setting. When free archive capacity
+drops below a calculated reserve for 30 minutes of enabled cameras' selected
+streams, ReoNvr automatically deletes the oldest completed local recordings and
+their metadata until the reserve is restored. Active and partial recordings are
+protected. **Retention continues while the Recording switch is paused.** Stop
+the stack before making a consistent backup or freezing archive changes.
+Retention never deletes camera SD-card media.
+
+**Do not expose ReoNvr directly to the internet.** The application does not supply
+an internet-facing authentication/TLS boundary. Keep loopback binding, or use a
+trusted network and an authenticated HTTPS reverse proxy. Camera credentials
+are encrypted at rest, but that does not make an exposed web interface safe.
+
+## Operation and Backups
+
+Run these commands from the extracted release folder:
 
 ```sh
 docker compose ps
-docker compose logs --tail 200 app gateway
+docker compose logs --tail=100 app gateway
+docker compose stop
+docker compose start
 ```
 
-If a native H.265 recording plays audio but shows no video, use a browser with
-HEVC support or install the operating system's HEVC decoder. ReoNvr deliberately
-does not transcode archived media.
+Docker-managed volumes persist the database, encryption key, gateway state, and
+archive across container recreation. Keep the same `COMPOSE_PROJECT_NAME` across
+upgrades. **Never run `docker compose down -v` on an installation you want to
+keep**: it deletes named volumes, including the encryption key and recordings.
 
-Automatic detection includes a credential-free relay for common home networks.
-It uses private IPv4 interface broadcasts and these common `/24` broadcast
-addresses by default: `10.0.0.255`, `10.0.1.255`, and `192.168.{0,1,4,8,31,50,68,86,100,178,254}.255`.
-The relay forwards only the native four-byte discovery probe, at most once per
-second; it does not scan address ranges, authenticate, or change camera settings.
+Before a backup, pause recording in the UI and stop the stack. Back up `.env`
+and the data, secrets, gateway, and archive volumes together, or the configured
+host archive folder instead of the archive volume. `docker compose config
+--volumes` lists the named volumes. Store backups securely: database and key
+backups together can decrypt saved camera credentials. Losing the master key
+makes saved credentials unusable. Start the stack again when the backup finishes.
 
-For other networks, set `REONVR_DISCOVERY_BROADCASTS` in `.env` to a
-comma-separated list such as `192.168.20.255,10.20.255.255`, then recreate the
-relay with `docker compose up -d discovery-relay`. This replaces the defaults;
-up to 32 private or link-local IPv4 destinations are accepted. Use the fresh
-Compose file instead when testing the replica.
+## Upgrading
 
-UDP `3000` must be available to the app and permitted by the host firewall. If
-Docker reports that the port is allocated, stop the other discovery receiver
-before starting this stack. VLAN isolation, unusual subnets, firewalls, and
-sleeping cameras can still prevent replies. Manual entry remains available.
+1. Read the new release notes, pause recording, stop the old stack, and take a
+   consistent backup of its configuration, data, key, and archive.
+2. Extract the new matching-architecture ZIP into a new folder. Transfer your
+   customized settings from the previous `.env`, but retain the **new**
+   `REONVR_VERSION` and `REONVR_ARCH`. Keep the old project name and archive path.
+3. Run the new startup script, check `docker compose ps`, and verify cameras,
+   recordings, playback, and recording controls before resuming ingestion.
 
-## Development
+Database migrations run automatically. Do not start an older image against a
+newer database unless its release notes explicitly allow it. Rollback may require
+restoring the matching database, key, configuration, and archive backup.
+Source-checkout deployments use a different bind-mount layout: do not replace
+their Compose file with the release file without migrating their data first.
+Older release ZIPs used `reonvr`; preserve that explicit project name when
+upgrading them, even though new installations now default to `reonvr-release`.
+Changing it creates different named volumes rather than moving your data.
 
-Build and test in containers; no host Go, Node.js, browser, or camera CLI
-installation is needed. The container build uses Go 1.27 and Node.js 26 LTS.
-Run the following commands from the repository root in PowerShell.
+### Migrating a Source Deployment
 
-Backend tests:
+Stop the source stack and take a consistent backup before the first release
+startup. Migrate `runtime/data`, `runtime/secrets`, and `runtime/gateway` together
+into the release's corresponding named volumes, preserving the database and its
+matching master key. Migrate `runtime/archive` into the archive volume, or retain
+the existing archive with an absolute `REONVR_RECORDINGS_PATH`. Preserve file
+permissions required by UID/GID `10001` and verify every mounted path before
+starting. The startup scripts do not migrate or discover source-checkout data.
+Keep the source backup intact until cameras and archived playback are verified.
+For an independent fresh install, leave the new project name unchanged and choose
+unused HTTP and discovery ports before starting alongside another deployment.
 
-```powershell
-docker run --rm -v "${PWD}:/src" -v reonvr-go-mod:/go/pkg/mod -v reonvr-go-build:/root/.cache/go-build -w /src golang:1.27-alpine go test ./... -count=1
-```
+## Troubleshooting
 
-Install frontend test dependencies into a Docker volume, then lint and build:
+- **A port is already in use:** choose an unused HTTP port in `.env`. Automatic
+   detection requires host UDP `3000`; choosing another discovery port means
+   using manual registration instead.
+- **Camera connection fails:** verify Docker-to-camera routing, credentials,
+  permissions, and required native/RTSP services without exposing them online.
+- **HEVC does not play:** verify operating-system/browser HEVC support or choose
+  an available H.264 stream. ReoNvr preserves native codecs.
+- **Archive is not writable:** check free space and UID/GID `10001` access to a
+  custom host mount. Do not change ownership recursively on unrelated data.
+- **Recovery remains incomplete:** inspect camera recovery intervals and camera
+  storage availability. Missing or corrupt footage is not marked recovered.
+- **Startup fails:** use `docker compose ps` and the bounded logs command above.
+  Redact credentials, authenticated URLs, addresses, and recordings before
+  sharing diagnostic output.
+- **Checksums or image selection fail:** do not bypass the startup script or
+   regenerate the manifest. Extract a fresh matching-architecture ZIP, retain its
+   version and architecture settings, and clear stale overrides in your shell.
 
-```powershell
-docker run --rm -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm ci
-docker run --rm -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run lint
-docker compose build app
-```
+## Contributing
 
-Browser acceptance tests use the deployed app, an already registered
-storage-capable camera, and the test container's bundled Chromium:
-
-```powershell
-docker compose up -d --wait app
-docker run --rm --network reonvr-private -e REONVR_E2E_URL=http://host.docker.internal:8080 -e REONVR_E2E_CHANNEL=chromium -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run test:e2e
-```
-
-Recording must already be paused. The tests temporarily change and restore the
-camera's local recovery policy, leave recording paused, and check desktop and
-mobile discovery and recovery states. The real discovery check does not save
-devices; simulated replies exercise prefill, already-added, empty, and retry
-states. `host.docker.internal` reaches the published app port on Docker Desktop;
-`REONVR_E2E_URL` can target another paused deployment. Screenshots are written
-beneath the ignored `runtime/` directory.
-
-The container build embeds the frontend into the Go server. See
-[docs/APPLICATION-SPEC.md](docs/APPLICATION-SPEC.md) for the implemented
-functional contract and
-[docs/REOLINK-CAMERA-API-LEARNINGS.md](docs/REOLINK-CAMERA-API-LEARNINGS.md)
-for camera integration details.
+See the [development and contribution guide](docs/CONTRIBUTING.md) for the Docker
+development setup, colocated test layout, CI, versioned releases, and review policy.

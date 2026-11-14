@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
+  gate:
+    name: CI
+    runs-on: ubuntu-24.04
+    if: always()
+    needs: validate
+    steps:
+      - name: Require every validation job
+        env:
+          RESULT: ${{ needs.validate.result }}
+        run: test "$RESULT" = success
