@@ -50,6 +50,20 @@ assembly/checksums, and browser smoke tests of the exact extracted ZIP. CI
 never requires physical cameras or private live credentials. Live camera tests
 remain opt-in and must never be reported as executed when skipped.
 
+The startup regression script exercises both shell and PowerShell entry points
+against 19 fixtures for each architecture, including incomplete/duplicate
+checksum coverage, tampered archives, stale image versions, architecture
+mismatches, unexpected images, and failed Compose resolution. Rejections must
+happen before image import or startup. Run it without a Docker socket:
+
+```powershell
+docker run --rm --network none -v "${PWD}:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$ErrorActionPreference = "Stop"; & /src/packaging/tests/start.Tests.ps1 -Architecture amd64; & /src/packaging/tests/start.Tests.ps1 -Architecture arm64'
+```
+
+Shell scripts and the protection helper are checked out as LF through
+`.gitattributes`; packaging also normalizes the shell entry point to LF. CI
+checks shell syntax and rejects CRLF in these executable inputs.
+
 ## Releasing
 
 Choose a SemVer tag such as `v1.0.0`, `v1.0.1`, `v1.1.0`, or `v1.1.0-rc.1` on a
@@ -66,6 +80,39 @@ by labels using the release-note configuration in `.github/release.yml`.
 No registry credentials are required: release ZIPs include all Docker images,
 startup scripts, Compose configuration, checksums, and version metadata, but no
 README, guides, or screenshots.
+
+The exact ZIP allowlist is `.env`, `checksums.sha256`, `compose.yaml`, `start.sh`,
+`start.ps1`, `images.tar`, `images.txt`, `release.json`, and
+`THIRD-PARTY-LICENSES.tar`. The checksum manifest must cover each of the seven
+immutable files exactly once; `.env` and the manifest itself are excluded.
+`images.txt` and JSON image metadata are generated from the same typed image list.
+Bootstrap resolves all Compose profiles using explicit Compose and environment
+files and compares those images with this checked list before loading anything.
+Release deployments default to `reonvr-release`, while source deployments use
+`reonvr`; existing release upgrades must preserve their previous identity.
+
+Immediately before publication, the workflow rechecks the remote tag against
+the tested revision and pins `target_commitish` to that revision. Lightweight and
+annotated tags are supported. Publication additionally requires an active tag
+ruleset covering `refs/tags/v*`, with no exclusions or bypass actors, blocking
+both updates and deletion. The exact policy is
+[release-tag-protection.json](../.github/release-tag-protection.json); an
+administrator can import it under **Settings > Rules > Rulesets** after checking
+for an existing equivalent ruleset. Do not add bypass permissions for publishers;
+the policy permits new tags but freezes existing version tags.
+
+**Tag enforcement is currently plan-blocked:** the ruleset API returns HTTP 403
+for this private repository. The workflow fails closed instead of publishing
+without that protection. Do not change visibility or billing to bypass the gate.
+On a supported plan, the checker must also be able to see the complete bypass
+list. If `GITHUB_TOKEN` cannot read it, configure repository secret
+`RELEASE_POLICY_TOKEN` with a credential allowed to inspect ruleset administration
+for this repository; publication itself still uses the standard contents-write
+token. Missing or hidden policy fields, denied API access, and changed/deleted
+tags all block publication. Administrative removal of the ruleset remains outside
+the guarantee, so restrict administration and keep the policy enabled throughout
+the run. Never paste credentials into source, commands, or review comments.
+
 Before publication, CI collects offline licenses using pinned
 `go-licenses/v2@v2.0.1` and `license-checker-rseidelsohn@5.0.1`. The ZIP includes
 `THIRD-PARTY-LICENSES.tar`, dependency inventories, manifests, and the complete

@@ -60,8 +60,10 @@ SD-card media.
    sh ./start.sh
    ```
 
-   The scripts verify bundled file checksums, check the Docker architecture,
-   import the images, and wait for application and gateway health checks.
+   The scripts require complete checksum coverage of all seven immutable assets,
+   check the Docker architecture, and compare every Compose image (including
+   optional profiles) with the checked image manifest before importing or starting
+   anything. They then wait for application and gateway health checks.
    The editable `.env` is intentionally excluded from the internal checksums.
 5. Open <http://localhost:8080>, or the HTTP port configured in `.env`.
 
@@ -103,7 +105,7 @@ relay by adding this setting to the extracted release's `.env`:
 COMPOSE_PROFILES=discovery
 ```
 
-Run the normal startup script, or `docker compose up -d --wait`. Keep this setting
+Run the normal startup script. Keep this setting
 when transferring your configuration to a new release so upgrades also recreate
 the relay with its new image.
 
@@ -152,7 +154,9 @@ application yourself if the camera is not reporting them.
 
 ## Configuration
 
-Edit `.env`, then apply changes with `docker compose up -d --wait`.
+Edit `.env`, then rerun the appropriate startup script above so checksum and
+image checks still run. Keep `REONVR_VERSION` and `REONVR_ARCH` from the new ZIP;
+inherited shell environment values override `.env` and stale values are rejected.
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -160,7 +164,7 @@ Edit `.env`, then apply changes with `docker compose up -d --wait`.
 | `REONVR_BIND_ADDRESS` | `127.0.0.1` | Host interface exposing the web UI |
 | `REONVR_DISCOVERY_PORT` | `3000` | Keep `3000` for automatic detection; alternate ports are manual-registration only |
 | `REONVR_RECORDINGS_PATH` | Docker volume | Optional absolute host archive directory |
-| `COMPOSE_PROJECT_NAME` | `reonvr` | Persistent installation identity |
+| `COMPOSE_PROJECT_NAME` | `reonvr-release` | Persistent release installation identity, separate from the source checkout |
 | `COMPOSE_PROFILES` | Not set | Set `discovery` to persist the optional relay across startups and upgrades |
 
 To store recordings in a host folder, set `REONVR_RECORDINGS_PATH` to an existing
@@ -222,6 +226,22 @@ newer database unless its release notes explicitly allow it. Rollback may requir
 restoring the matching database, key, configuration, and archive backup.
 Source-checkout deployments use a different bind-mount layout: do not replace
 their Compose file with the release file without migrating their data first.
+Older release ZIPs used `reonvr`; preserve that explicit project name when
+upgrading them, even though new installations now default to `reonvr-release`.
+Changing it creates different named volumes rather than moving your data.
+
+### Migrating a Source Deployment
+
+Stop the source stack and take a consistent backup before the first release
+startup. Migrate `runtime/data`, `runtime/secrets`, and `runtime/gateway` together
+into the release's corresponding named volumes, preserving the database and its
+matching master key. Migrate `runtime/archive` into the archive volume, or retain
+the existing archive with an absolute `REONVR_RECORDINGS_PATH`. Preserve file
+permissions required by UID/GID `10001` and verify every mounted path before
+starting. The startup scripts do not migrate or discover source-checkout data.
+Keep the source backup intact until cameras and archived playback are verified.
+For an independent fresh install, leave the new project name unchanged and choose
+unused HTTP and discovery ports before starting alongside another deployment.
 
 ## Troubleshooting
 
@@ -239,6 +259,9 @@ their Compose file with the release file without migrating their data first.
 - **Startup fails:** use `docker compose ps` and the bounded logs command above.
   Redact credentials, authenticated URLs, addresses, and recordings before
   sharing diagnostic output.
+- **Checksums or image selection fail:** do not bypass the startup script or
+   regenerate the manifest. Extract a fresh matching-architecture ZIP, retain its
+   version and architecture settings, and clear stale overrides in your shell.
 
 ## Contributing
 

@@ -28,8 +28,11 @@ jobs:
       - name: Validate PowerShell startup and orchestration syntax
         run: |
           docker run --rm -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$tokens = $null; $parseErrors = $null; foreach ($file in @("/src/packaging/start.ps1", "/src/tools/protect-main.ps1", "/src/web/tests/run.ps1")) { [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$parseErrors) | Out-Null; if ($parseErrors.Count) { $parseErrors | Write-Error; exit 1 } }'
-      - name: Test Windows startup checksum validation
-        run: docker run --rm --network none -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -File /src/packaging/tests/start.Tests.ps1
+      - name: Test both startup scripts and architectures
+        run: docker run --rm --network none -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$ErrorActionPreference = "Stop"; & /src/packaging/tests/start.Tests.ps1 -Architecture amd64; & /src/packaging/tests/start.Tests.ps1 -Architecture arm64'
+      - name: Validate shell syntax and LF checkout
+        run: |
+          docker run --rm --network none -v "$PWD:/src:ro" -w /src alpine:3.22 sh -ec 'test -f tools/protect-main.ps1; ! grep "$(printf "\r")" packaging/start.sh tools/protect-main.ps1 >/dev/null; sh -n packaging/start.sh'
       - name: Check Go formatting
         run: |
           files=$(docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine gofmt -l cmd internal tools web/tests/credentials)
