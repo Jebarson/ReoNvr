@@ -100,10 +100,58 @@ func TestPublicationRechecksRemoteTagAndPolicy(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			err := checkPublication(server.Client(), server.URL, "test-token", "owner/repo", "v1.2.3", revision)
+			err := checkPublication(server.Client(), server.URL, "test-token", "owner/repo", "v1.2.3", revision, true)
 			valid := scenario == "lightweight" || scenario == "annotated" || scenario == "paginated"
 			if (err == nil) != valid {
 				t.Fatalf("incorrect publication result: %v", err)
+			}
+		})
+	}
+}
+
+func TestDisabledPublicationPolicyPreservesTagChecks(t *testing.T) {
+	revision := strings.Repeat("a", 40)
+	for _, scenario := range []string{"lightweight", "annotated", "moved", "deleted", "forbidden", "malformed", "missing-object"} {
+		t.Run(scenario, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/repos/owner/repo/git/ref/tags/v1.2.3":
+					if scenario == "forbidden" {
+						response.WriteHeader(http.StatusForbidden)
+						return
+					}
+					if scenario == "malformed" {
+						io.WriteString(response, "{")
+						return
+					}
+					if scenario == "missing-object" {
+						io.WriteString(response, "{}")
+						return
+					}
+					if scenario == "deleted" {
+						response.WriteHeader(http.StatusNotFound)
+						return
+					}
+					kind, target := "commit", revision
+					if scenario == "moved" {
+						target = strings.Repeat("c", 40)
+					}
+					if scenario == "annotated" {
+						kind, target = "tag", strings.Repeat("b", 40)
+					}
+					json.NewEncoder(response).Encode(map[string]any{"object": map[string]string{"type": kind, "sha": target}})
+				case "/repos/owner/repo/git/tags/" + strings.Repeat("b", 40):
+					json.NewEncoder(response).Encode(map[string]any{"object": map[string]string{"type": "commit", "sha": revision}})
+				default:
+					t.Errorf("unexpected API request with policy disabled: %s", request.URL.Path)
+					response.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			err := checkPublication(server.Client(), server.URL, "test-token", "owner/repo", "v1.2.3", revision, false)
+			valid := scenario == "lightweight" || scenario == "annotated"
+			if (err == nil) != valid {
+				t.Fatalf("incorrect disabled policy result: %v", err)
 			}
 		})
 	}

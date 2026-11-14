@@ -214,7 +214,7 @@ func (policy releaseTagPolicy) immutable() bool {
 	return updatesBlocked && deletionsBlocked
 }
 
-func checkPublication(client *http.Client, api, token, repository, version, revision string) error {
+func checkPublication(client *http.Client, api, token, repository, version, revision string, requireTagPolicy bool) error {
 	if err := validateVersion(version); err != nil {
 		return err
 	}
@@ -244,31 +244,33 @@ func checkPublication(client *http.Client, api, token, repository, version, revi
 		}
 		return json.Unmarshal(payload, target)
 	}
-	protected := false
-	for page := 1; page <= 100; page++ {
-		var policies []releaseTagPolicy
-		if err := read(fmt.Sprintf("/rulesets?targets=tag&includes_parents=true&per_page=100&page=%d", page), &policies); err != nil {
-			return err
-		}
-		for _, summary := range policies {
-			if summary.Target != "tag" || summary.Enforcement != "active" {
-				continue
-			}
-			var policy releaseTagPolicy
-			if err := read(fmt.Sprintf("/rulesets/%d", summary.ID), &policy); err != nil {
+	if requireTagPolicy {
+		protected := false
+		for page := 1; page <= 100; page++ {
+			var policies []releaseTagPolicy
+			if err := read(fmt.Sprintf("/rulesets?targets=tag&includes_parents=true&per_page=100&page=%d", page), &policies); err != nil {
 				return err
 			}
-			if policy.immutable() {
-				protected = true
+			for _, summary := range policies {
+				if summary.Target != "tag" || summary.Enforcement != "active" {
+					continue
+				}
+				var policy releaseTagPolicy
+				if err := read(fmt.Sprintf("/rulesets/%d", summary.ID), &policy); err != nil {
+					return err
+				}
+				if policy.immutable() {
+					protected = true
+					break
+				}
+			}
+			if protected || len(policies) < 100 {
 				break
 			}
 		}
-		if protected || len(policies) < 100 {
-			break
+		if !protected {
+			return errors.New("publication requires a verified active tag update/deletion ruleset with no bypass actors; policy permissions must be visible")
 		}
-	}
-	if !protected {
-		return errors.New("publication requires a verified active tag update/deletion ruleset with no bypass actors; policy permissions must be visible")
 	}
 	var reference struct {
 		Object struct {
@@ -301,15 +303,16 @@ func main() {
 	output := flag.String("output", "runtime/dist", "output directory")
 	root := flag.String("root", ".", "repository root")
 	checkVersion := flag.Bool("check-version", false, "validate version without creating a bundle")
-	publication := flag.Bool("check-publication", false, "verify immutable remote tag before publication")
+	publication := flag.Bool("check-publication", false, "verify remote tag and required policy before publication")
+	requireTagPolicy := flag.Bool("require-tag-policy", true, "require an immutable release-tag ruleset before publication")
 	repository := flag.String("repository", "", "GitHub owner/repository for publication")
 	flag.Parse()
 	if *publication {
-		if err := checkPublication(&http.Client{Timeout: 20 * time.Second}, "https://api.github.com", os.Getenv("GITHUB_TOKEN"), *repository, *version, *revision); err != nil {
+		if err := checkPublication(&http.Client{Timeout: 20 * time.Second}, "https://api.github.com", os.Getenv("GITHUB_TOKEN"), *repository, *version, *revision, *requireTagPolicy); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		fmt.Println("Remote tag and immutable release policy verified")
+		fmt.Println("Remote tag and publication requirements verified")
 		return
 	}
 	if *checkVersion {

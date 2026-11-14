@@ -93,7 +93,7 @@ Release deployments default to `reonvr-release`, while source deployments use
 
 Immediately before publication, the workflow rechecks the remote tag against
 the tested revision and pins `target_commitish` to that revision. Lightweight and
-annotated tags are supported. Publication additionally requires an active tag
+annotated tags are supported. When enabled, the policy check requires an active tag
 ruleset covering `refs/tags/v*`, with no exclusions or bypass actors, blocking
 both updates and deletion. The exact policy is
 [release-tag-protection.json](../.github/release-tag-protection.json); an
@@ -102,14 +102,16 @@ for an existing equivalent ruleset. Do not add bypass permissions for publishers
 the policy permits new tags but freezes existing version tags.
 
 **Tag enforcement is currently plan-blocked:** the ruleset API returns HTTP 403
-for this private repository. The workflow fails closed instead of publishing
-without that protection. Do not change visibility or billing to bypass the gate.
+for this private repository. When enabled, the policy check fails closed instead
+of publishing without that protection. Do not change visibility or billing to
+bypass the gate.
 On a supported plan, the checker must also be able to see the complete bypass
 list. If `GITHUB_TOKEN` cannot read it, configure repository secret
 `RELEASE_POLICY_TOKEN` with a credential allowed to inspect ruleset administration
 for this repository; publication itself still uses the standard contents-write
-token. Missing or hidden policy fields, denied API access, and changed/deleted
-tags all block publication. Administrative removal of the ruleset remains outside
+token. When policy checking is enabled, missing or hidden policy fields and denied
+policy API access block publication. Changed or deleted tags always block
+publication. Administrative removal of the ruleset remains outside
 the guarantee, so restrict administration and keep the policy enabled throughout
 the run. Never paste credentials into source, commands, or review comments.
 
