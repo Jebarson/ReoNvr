@@ -32,7 +32,24 @@ jobs:
         run: docker run --rm --network none -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$ErrorActionPreference = "Stop"; & /src/packaging/tests/start.Tests.ps1 -Architecture amd64; & /src/packaging/tests/start.Tests.ps1 -Architecture arm64'
       - name: Validate shell syntax and LF checkout
         run: |
-          docker run --rm --network none -v "$PWD:/src:ro" -w /src alpine:3.22 sh -ec 'test -f tools/protect-main.ps1; ! grep "$(printf "\r")" packaging/start.sh tools/protect-main.ps1 >/dev/null; sh -n packaging/start.sh'
+          docker run --rm --network none -v "$PWD:/src:ro" -w /src alpine:3.22 sh -ec '
+            check_inputs() {
+              test -r "$1" && test -r "$2" || return 1
+              if grep "$(printf "\r")" "$1" "$2" >/dev/null; then
+                return 1
+              else
+                test "$?" -eq 1 || return 1
+              fi
+              sh -n "$1"
+            }
+            check_inputs packaging/start.sh tools/protect-main.ps1
+            fixture=$(mktemp -d)
+            printf "set -eu\r\n" > "$fixture/helper.ps1"
+            printf "#!/bin/sh\r\nset -eu\r\n" > "$fixture/start.sh"
+            if check_inputs packaging/start.sh "$fixture/helper.ps1"; then exit 1; fi
+            if check_inputs "$fixture/start.sh" tools/protect-main.ps1; then exit 1; fi
+            if check_inputs packaging/start.sh "$fixture/missing.ps1"; then exit 1; fi
+          '
       - name: Check Go formatting
         run: |
           files=$(docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine gofmt -l cmd internal tools web/tests/credentials)
