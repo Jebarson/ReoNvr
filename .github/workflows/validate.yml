@@ -28,6 +28,8 @@ jobs:
       - name: Validate PowerShell startup and orchestration syntax
         run: |
           docker run --rm -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$tokens = $null; $parseErrors = $null; foreach ($file in @("/src/packaging/start.ps1", "/src/tools/protect-main.ps1", "/src/web/tests/run.ps1")) { [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$parseErrors) | Out-Null; if ($parseErrors.Count) { $parseErrors | Write-Error; exit 1 } }'
+      - name: Test Windows startup checksum validation
+        run: docker run --rm --network none -v "$PWD:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -File /src/packaging/tests/start.Tests.ps1
       - name: Check Go formatting
         run: |
           files=$(docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine gofmt -l cmd internal tools web/tests/credentials)
@@ -100,7 +102,31 @@ jobs:
           docker build --platform "linux/$ARCH" -f docker/gateway.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/gateway:$VERSION-$ARCH" .
           docker build --platform "linux/$ARCH" -f docker/discovery-relay.Dockerfile --build-arg "VERSION=$VERSION" --build-arg "REVISION=$revision" -t "reonvr/discovery-relay:$VERSION-$ARCH" .
           docker build --platform "linux/$ARCH" -f docker/app.Dockerfile --target test-artifacts --output type=local,dest=runtime/ci-tools .
-          docker run --rm -v "$PWD/runtime/ci-tools:/tools:ro" --entrypoint /tools/archive.test "reonvr/app:$VERSION-$ARCH" '-test.run=TestClockAlignedSegmentsUseRelativeMediaTime|TestMediaInspectionWithRealFFmpeg' -test.v
+          docker run --rm -v "$PWD/runtime/ci-tools:/tools:ro" --entrypoint sh "reonvr/app:$VERSION-$ARCH" -ec 'command -v ffmpeg; command -v ffprobe; /tools/archive.test -test.run="^(TestClockAlignedSegmentsUseRelativeMediaTime|TestMediaInspectionWithRealFFmpeg)$" -test.v=test2json' > runtime/media-tests.log
+          docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go tool test2json -p reonavr/internal/archive < runtime/media-tests.log' > runtime/media-tests.json
+          docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go run ./tools/gotest verify TestClockAlignedSegmentsUseRelativeMediaTime TestMediaInspectionWithRealFFmpeg < runtime/media-tests.json'
+      - name: Generate and verify the manual images shipped in the ZIP
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/web node:26-alpine sh -ec 'npm ci; npm run build'
+          docker run --rm --network none -v "$PWD:/src" -w /src/web -e REONVR_DOCS_OUTPUT=/src/docs/images mcr.microsoft.com/playwright:v1.65.0-noble npm run test:docs
+      - name: Collect offline licenses and dependency inventory
+        run: |
+          docker build --platform "linux/$ARCH" -f docker/app.Dockerfile --target licensing-artifacts --output type=local,dest=runtime/release-notices .
+          docker run --rm -v "$PWD:/src" -w /src golang:1.27-alpine sh -ec '
+            go mod download
+            go install github.com/google/go-licenses/v2@v2.0.1
+            go-licenses save ./cmd/reonavr ./cmd/discovery-relay --ignore reonavr --save_path=runtime/release-notices/go
+            go-licenses report ./cmd/reonavr ./cmd/discovery-relay --ignore reonavr > runtime/release-notices/go-dependencies.csv
+            go list -m all > runtime/release-notices/go-modules.txt
+            mkdir -p runtime/release-notices/manifests
+            cp go.mod go.sum runtime/release-notices/manifests/
+            cp /usr/local/go/LICENSE runtime/release-notices/go/LICENSE-Go
+          '
+          docker run --rm -v "$PWD:/src" -w /src/web node:26-alpine sh -ec '
+            npx --yes license-checker-rseidelsohn@5.0.1 --json --relativeLicensePath --relativeModulePath --excludePrivatePackages --unknown --failOn UNKNOWN --files /src/runtime/release-notices/frontend --out /src/runtime/release-notices/frontend-dependencies.json
+            cp package.json package-lock.json /src/runtime/release-notices/manifests/
+          '
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 tar -cf runtime/third-party-notices.tar -C runtime/release-notices .
       - name: Assemble offline ZIP
         run: |
           docker image save -o runtime/images.tar "reonvr/app:$VERSION-$ARCH" "reonvr/gateway:$VERSION-$ARCH" "reonvr/discovery-relay:$VERSION-$ARCH"

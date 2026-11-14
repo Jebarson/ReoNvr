@@ -39,6 +39,8 @@ docker run --rm --network none -v "${PWD}:/src" -w /src/web -e REONVR_DOCS_OUTPU
 
 CI runs the same screenshot privacy check, writing temporary captures under
 `runtime/reports/documentation` instead of overwriting the checked-in images.
+Each package job separately regenerates and validates `docs/images` immediately
+before ZIP assembly; unchecked repository images are never used for publication.
 
 CI runs on pull requests, every push to `main` (including merged pull requests),
 merge-queue events, and manual dispatch. The required aggregate check is **CI**.
@@ -62,6 +64,13 @@ that exact commit, and publishes both architecture ZIPs and SHA-256 files with
 generated notes. Prerelease tags produce prereleases. Changes are categorized
 by labels using the release-note configuration in `.github/release.yml`.
 No registry credentials are required: release ZIPs include all Docker images.
+Before publication, CI collects offline licenses using pinned
+`go-licenses/v2@v2.0.1` and `license-checker-rseidelsohn@5.0.1`. The ZIP includes
+`THIRD-PARTY-LICENSES.tar`, dependency inventories, manifests, and the complete
+unmodified upstream Reolink archive with its EULA and notices. Review that EULA
+for the intended distribution: it permits no-charge unmodified-archive sharing
+with notices, while commercial bundling requires Reolink's written consent.
+Do not describe the proprietary executables as Apache-licensed source code.
 The repository is currently private, so GitHub release downloads require access.
 Do not change its visibility without an explicit decision to expose source and
 history. Do not create an actual release as part of testing this workflow.

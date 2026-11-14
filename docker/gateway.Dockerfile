@@ -15,7 +15,9 @@ RUN case "$TARGETARCH" in \
     && tar -xzf /tmp/reolink.tar.gz -C /opt/reolink --strip-components=1 \
     && test -x /opt/reolink/bin/reolink-cli \
     && test -x /opt/reolink/bin/reolink-gateway \
-    && rm /tmp/reolink.tar.gz
+    && test -s /opt/reolink/EULA.txt \
+    && test -s /opt/reolink/THIRD-PARTY-LICENSES.txt \
+    && mv /tmp/reolink.tar.gz /opt/reolink/release.tar.gz
 
 FROM debian:bookworm-slim
 ARG VERSION=dev
@@ -29,6 +31,7 @@ RUN groupadd --gid 10001 reonavr \
     && chown -R reonavr:reonavr /var/lib/reolink
 COPY --from=reolink-cli /opt/reolink/bin/reolink-cli /usr/local/bin/reolink-cli
 COPY --from=reolink-cli /opt/reolink/bin/reolink-gateway /usr/local/bin/reolink-gateway
+COPY --from=reolink-cli /opt/reolink/release.tar.gz /opt/reolink/EULA.txt /opt/reolink/THIRD-PARTY-LICENSES.txt /usr/share/reolink-cli/
 USER reonavr
 ENV HOME=/var/lib/reolink \
     XDG_CACHE_HOME=/var/lib/reolink/cache \

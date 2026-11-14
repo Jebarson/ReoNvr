@@ -45,8 +45,12 @@ SD-card media.
    Windows PowerShell:
 
    ```powershell
-   .\start.ps1
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
    ```
+
+   Run this only after verifying and extracting the ZIP. The execution-policy
+   override applies to this process, not your machine-wide settings. Organization
+   policies may still require administrator approval.
 
    Linux/macOS shell:
 
@@ -64,6 +68,11 @@ dependencies from the internet. Camera access still requires connectivity from
 Docker to your camera network. The gateway is private to the Compose network.
 
 ## First Camera
+
+Fresh installations have **Recording** enabled by default. Set it to **Paused**
+before adding cameras if you want to control when capture begins; saving an
+enabled camera with archiving selected can otherwise start recording immediately.
+Pausing ingestion does not pause automatic archive retention, described below.
 
 The screenshots below use illustrative demo data. Camera addresses, credentials,
 and camera images are covered with solid privacy masks.
@@ -86,14 +95,19 @@ itself. It does not change camera settings. If a device is not found, add its
 address manually instead.
 
 For Docker hosts with suitable LAN networking, enable the optional discovery
-relay from the extracted release folder:
+relay by adding this setting to the extracted release's `.env`:
 
-```sh
-docker compose --profile discovery up -d --wait
+```dotenv
+COMPOSE_PROFILES=discovery
 ```
 
-The relay uses host networking and UDP `2000`; the app receives replies on UDP
-`3000` (or `REONVR_DISCOVERY_PORT` on the host). Camera discovery needs broadcast
+Run the normal startup script, or `docker compose up -d --wait`. Keep this setting
+when transferring your configuration to a new release so upgrades also recreate
+the relay with its new image.
+
+The relay uses host networking and UDP `2000`; native replies require host UDP
+`3000`. Leave `REONVR_DISCOVERY_PORT=3000` for automatic detection. Alternate host
+port mappings require manual camera registration. Camera discovery needs broadcast
 reachability and may not cross subnets, VPNs, or Docker Desktop's Linux VM.
 Use manual registration when it cannot reach the camera LAN. ReoNvr does not
 change Docker Desktop, firewall, or camera configuration automatically.
@@ -110,10 +124,10 @@ change Docker Desktop, firewall, or camera configuration automatically.
    **Continuous** to keep every stream-copy segment. Optionally enable
    **Recover missed recordings from camera storage** when the connection test
    confirms usable camera storage and recording search.
-4. Save the camera. In **Settings**, select the archive subfolder, folder layout,
-   and retention policy. The archive subfolder is relative to `/archive`.
-5. Enable the application-wide **Recording** switch when recording should run.
-   Disable it to pause ingestion across all cameras.
+4. Save the camera. In **Settings**, select the archive subfolder and folder
+   layout. The archive subfolder is relative to `/archive`.
+5. If you paused recording during setup, enable the application-wide **Recording**
+   switch when capture should run. Disable it to pause ingestion across all cameras.
 
 ![Camera connection and recording options with address, credentials, and preview image masked](docs/images/camera-setup.png)
 
@@ -142,15 +156,26 @@ Edit `.env`, then apply changes with `docker compose up -d --wait`.
 |---|---|---|
 | `REONVR_HTTP_PORT` | `8080` | Host web port |
 | `REONVR_BIND_ADDRESS` | `127.0.0.1` | Host interface exposing the web UI |
-| `REONVR_DISCOVERY_PORT` | `3000` | Host UDP port for discovery replies |
+| `REONVR_DISCOVERY_PORT` | `3000` | Keep `3000` for automatic detection; alternate ports are manual-registration only |
 | `REONVR_RECORDINGS_PATH` | Docker volume | Optional absolute host archive directory |
 | `COMPOSE_PROJECT_NAME` | `reonvr` | Persistent installation identity |
+| `COMPOSE_PROFILES` | Not set | Set `discovery` to persist the optional relay across startups and upgrades |
 
 To store recordings in a host folder, set `REONVR_RECORDINGS_PATH` to an existing
 absolute path such as `/srv/reonvr/recordings` or `D:/ReoNvr/recordings`. On Linux,
 the container user (UID/GID `10001`) needs write access. ReoNvr does not change host
 folder ownership automatically. Changing this mount does not move existing
 recordings; preserve the old archive and plan a deliberate migration.
+
+### Automatic Retention
+
+There is no configurable retention-period setting. When free archive capacity
+drops below a calculated reserve for 30 minutes of enabled cameras' selected
+streams, ReoNvr automatically deletes the oldest completed local recordings and
+their metadata until the reserve is restored. Active and partial recordings are
+protected. **Retention continues while the Recording switch is paused.** Stop
+the stack before making a consistent backup or freezing archive changes.
+Retention never deletes camera SD-card media.
 
 **Do not expose ReoNvr directly to the internet.** The application does not supply
 an internet-facing authentication/TLS boundary. Keep loopback binding, or use a
@@ -198,7 +223,9 @@ their Compose file with the release file without migrating their data first.
 
 ## Troubleshooting
 
-- **A port is already in use:** choose unused HTTP/discovery ports in `.env`.
+- **A port is already in use:** choose an unused HTTP port in `.env`. Automatic
+   detection requires host UDP `3000`; choosing another discovery port means
+   using manual registration instead.
 - **Camera connection fails:** verify Docker-to-camera routing, credentials,
   permissions, and required native/RTSP services without exposing them online.
 - **HEVC does not play:** verify operating-system/browser HEVC support or choose

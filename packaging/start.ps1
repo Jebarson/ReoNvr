@@ -3,7 +3,9 @@ Push-Location $PSScriptRoot
 try {
   docker compose version
   if ($LASTEXITCODE -ne 0) { throw 'Docker Compose v2 is required' }
-  foreach ($line in Get-Content checksums.sha256) {
+    $manifest = @(Get-Content -LiteralPath checksums.sha256)
+    if ($manifest.Count -eq 0) { throw 'Release checksum manifest is empty. Download and extract the ZIP again.' }
+    foreach ($line in $manifest) {
     $digest, $name = $line -split '  ', 2
     if (-not $name -or (Get-FileHash -LiteralPath $name -Algorithm SHA256).Hash.ToLowerInvariant() -ne $digest) {
       throw 'Release checksum verification failed. Download and extract the ZIP again.'

@@ -109,6 +109,7 @@ func buildBundle(root, output, images, version, architecture, revision string) (
 		{"docs/APPLICATION-SPEC.md", "docs/APPLICATION-SPEC.md"},
 		{"docs/REOLINK-CAMERA-API-LEARNINGS.md", "docs/REOLINK-CAMERA-API-LEARNINGS.md"},
 		{"THIRD-PARTY-NOTICES.md", "packaging/THIRD-PARTY-NOTICES.md"},
+		{"THIRD-PARTY-LICENSES.tar", "runtime/third-party-notices.tar"},
 	} {
 		payload, err := os.ReadFile(filepath.Join(root, asset.source))
 		if err != nil {
@@ -122,7 +123,7 @@ func buildBundle(root, output, images, version, architecture, revision string) (
 			return "", err
 		}
 	}
-	configuration := fmt.Sprintf("REONVR_VERSION=%s\nREONVR_ARCH=%s\nCOMPOSE_PROJECT_NAME=reonvr\nREONVR_BIND_ADDRESS=127.0.0.1\nREONVR_HTTP_PORT=8080\nREONVR_DISCOVERY_PORT=3000\n# REONVR_RECORDINGS_PATH=/absolute/path/to/recordings\n", version, architecture)
+	configuration := fmt.Sprintf("REONVR_VERSION=%s\nREONVR_ARCH=%s\nCOMPOSE_PROJECT_NAME=reonvr\nREONVR_BIND_ADDRESS=127.0.0.1\nREONVR_HTTP_PORT=8080\nREONVR_DISCOVERY_PORT=3000\n# COMPOSE_PROFILES=discovery\n# REONVR_RECORDINGS_PATH=/absolute/path/to/recordings\n", version, architecture)
 	if err := writeEntry(".env", 0o644, strings.NewReader(configuration), false); err != nil {
 		return "", err
 	}

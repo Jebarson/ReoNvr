@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -40,7 +41,55 @@ func testOverlay(root string) (map[string]string, error) {
 	return replacements, err
 }
 
+func verifyTestEvents(reader io.Reader, required []string) error {
+	if len(required) == 0 {
+		return errors.New("at least one required test name is needed")
+	}
+	passed := make(map[string]bool, len(required))
+	for _, name := range required {
+		passed[name] = false
+	}
+	packagePassed := false
+	decoder := json.NewDecoder(reader)
+	for {
+		var event struct {
+			Action string
+			Test   string
+		}
+		if err := decoder.Decode(&event); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode test events: %w", err)
+		}
+		if event.Action == "fail" {
+			return errors.New("runtime media validation failed")
+		}
+		if _, required := passed[event.Test]; required {
+			if event.Action == "skip" {
+				return fmt.Errorf("required test was skipped: %s", event.Test)
+			}
+			if event.Action == "pass" {
+				passed[event.Test] = true
+			}
+		} else if event.Test == "" && event.Action == "pass" {
+			packagePassed = true
+		}
+	}
+	if !packagePassed {
+		return errors.New("runtime test package did not report a pass")
+	}
+	for name, complete := range passed {
+		if !complete {
+			return fmt.Errorf("required test did not report a pass: %s", name)
+		}
+	}
+	return nil
+}
+
 func run(arguments []string) error {
+	if len(arguments) > 0 && arguments[0] == "verify" {
+		return verifyTestEvents(os.Stdin, arguments[1:])
+	}
 	module, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
 		return err
