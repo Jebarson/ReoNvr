@@ -71,7 +71,7 @@ func TestClockAlignedSegmentsUseRelativeMediaTime(t *testing.T) {
 	}
 	segmentIndex := slices.Index(arguments, "segment") - 1
 	fixtureArguments := []string{"-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5",
-		"-frames:v", "15", "-vf", "setpts=PTS+1700000000/TB", "-c:v", "libx264", "-g", "5", "-an", "-copyts"}
+		"-frames:v", "15", "-vf", "setpts=PTS+1700000000/TB", "-r", "5", "-c:v", "libx264", "-g", "5", "-an", "-copyts"}
 	command := exec.CommandContext(ctx, "ffmpeg", append(fixtureArguments, arguments[segmentIndex:]...)...)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("generate clock-aligned fixture: %v %s", err, output)

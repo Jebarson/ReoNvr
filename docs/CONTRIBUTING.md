@@ -18,7 +18,7 @@ discovery; do not run `go mod tidy` inside them or use plain `go test ./...`,
 which cannot discover this layout correctly. Always use the runner:
 
 ```sh
-docker run --rm -v "${PWD}:/src" -w /src golang:1.27-bookworm go run ./tools/gotest -race -count=1 ./...
+docker run --rm -v "${PWD}:/src" -w /src golang:1.27-trixie go run ./tools/gotest -race -count=1 ./...
 ```
 
 Frontend tests and Docker orchestration live in `web/tests/`. From PowerShell,
@@ -34,7 +34,7 @@ container has no external network, and opaque IP, credential, and media masks
 are checked in the saved PNGs. Never substitute a live deployment or real data.
 
 ```powershell
-docker run --rm --network none -v "${PWD}:/src" -w /src/web -e REONVR_DOCS_OUTPUT=/src/docs/images mcr.microsoft.com/playwright:v1.65.0-noble npm run test:docs
+docker run --rm --network none -v "${PWD}:/src" -w /src/web -e REONVR_DOCS_OUTPUT=/src/docs/images mcr.microsoft.com/playwright:v1.65.1-noble npm run test:docs
 ```
 
 CI runs the same screenshot privacy check, writing temporary captures under
@@ -57,7 +57,7 @@ mismatches, unexpected images, and failed Compose resolution. Rejections must
 happen before image import or startup. Run it without a Docker socket:
 
 ```powershell
-docker run --rm --network none -v "${PWD}:/src:ro" mcr.microsoft.com/powershell:7.4-debian-12 pwsh -NoLogo -NoProfile -Command '$ErrorActionPreference = "Stop"; & /src/packaging/tests/start.Tests.ps1 -Architecture amd64; & /src/packaging/tests/start.Tests.ps1 -Architecture arm64'
+docker run --rm --network none -v "${PWD}:/src:ro" mcr.microsoft.com/powershell:7.5-debian-12 pwsh -NoLogo -NoProfile -Command '$ErrorActionPreference = "Stop"; & /src/packaging/tests/start.Tests.ps1 -Architecture amd64; & /src/packaging/tests/start.Tests.ps1 -Architecture arm64'
 ```
 
 Shell scripts and the protection helper are checked out as LF through
@@ -553,8 +553,8 @@ docker run --rm -v "${PWD}:/src" -v reonvr-go-mod:/go/pkg/mod -v reonvr-go-build
 Install frontend test dependencies into a Docker volume, then lint and build:
 
 ```powershell
-docker run --rm -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm ci
-docker run --rm -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run lint
+docker run --rm -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm ci
+docker run --rm -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm run lint
 docker compose build app
 ```
 
@@ -563,7 +563,7 @@ storage-capable camera, and the test container's bundled Chromium:
 
 ```powershell
 docker compose up -d --wait app
-docker run --rm --network reonvr-private -e REONVR_E2E_URL=http://host.docker.internal:8080 -e REONVR_E2E_CHANNEL=chromium -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run test:e2e
+docker run --rm --network reonvr-private -e REONVR_E2E_URL=http://host.docker.internal:8080 -e REONVR_E2E_CHANNEL=chromium -v "${PWD}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm run test:e2e
 ```
 
 Recording must already be paused. The tests temporarily change and restore the
