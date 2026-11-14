@@ -30,11 +30,11 @@ try {
   }
   docker run --rm -v "${root}:/src" -v reonvr-go-mod:/go/pkg/mod -v reonvr-go-build:/root/.cache/go-build -w /src golang:1.27-alpine go run ./tools/gotest -count=1 ./...
   if ($LASTEXITCODE -ne 0) { throw 'Backend regression tests failed' }
-  docker run --rm -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm ci
+  docker run --rm -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm ci
   if ($LASTEXITCODE -ne 0) { throw 'Containerized frontend dependency installation failed' }
-  docker run --rm -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run lint
+  docker run --rm -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm run lint
   if ($LASTEXITCODE -ne 0) { throw 'Frontend lint failed' }
-  docker run --rm -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run build
+  docker run --rm -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm run build
   if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
   docker run --rm -v "${root}:/src:ro" -w /src/web node:26-alpine node --test tests/pause-guard.test.mjs
   if ($LASTEXITCODE -ne 0) { throw 'Independent pause guard tests failed' }
@@ -52,7 +52,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Independent recording pause guard could not start' }
   $guardStarted = $true
   docker run --rm -e REONVR_E2E_CREDENTIALS=1 -e REONVR_TEST_CONFIG=/run/test-config.json -v reonvr-e2e-tools:/tools:ro -v "${configPath}:/run/test-config.json:ro" --entrypoint /tools/credentials reonvr-fresh-app:snapshot |
-    docker run --rm -i --network reonvr-fresh_default -e REONVR_E2E_ALLOW_MUTATIONS=1 -e REONVR_E2E_GUARD_URL=http://reonvr-e2e-pause-guard:8099 -e REONVR_E2E_URL=http://reonvr-fresh-app:8080 -e REONVR_TEST_CONFIG=/run/test-config.json -v "${configPath}:/run/test-config.json:ro" -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.0-noble npm run test:e2e:full
+    docker run --rm -i --network reonvr-fresh_default -e REONVR_E2E_ALLOW_MUTATIONS=1 -e REONVR_E2E_GUARD_URL=http://reonvr-e2e-pause-guard:8099 -e REONVR_E2E_URL=http://reonvr-fresh-app:8080 -e REONVR_TEST_CONFIG=/run/test-config.json -v "${configPath}:/run/test-config.json:ro" -v "${root}:/src" -v reonvr-playwright-modules:/src/web/node_modules -w /src/web mcr.microsoft.com/playwright:v1.65.1-noble npm run test:e2e:full
   if ($LASTEXITCODE -ne 0) { throw 'Full acceptance tests failed; recording pause and cleanup are being verified' }
 } finally {
   try {

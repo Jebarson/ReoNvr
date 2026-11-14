@@ -203,6 +203,13 @@ func TestReleaseBundleIncludesOnlyDistributionFilesAndChecksums(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		outputInfo, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outputInfo.Mode().Perm()&0o005 != 0o005 {
+			t.Fatalf("bundle output is unreadable by the host artifact uploader: %s", outputInfo.Mode())
+		}
 		archive, err := zip.OpenReader(path)
 		if err != nil {
 			t.Fatal(err)

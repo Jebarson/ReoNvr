@@ -1,9 +1,9 @@
-FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS reolink-cli
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS reolink-cli
 ARG TARGETARCH
-ARG REOLINK_VERSION=0.19.0
+ARG REOLINK_VERSION=0.21.0
 RUN case "$TARGETARCH" in \
-            amd64) arch=x86_64; checksum=a0424c0ce00ed95467162ec267824769e3e6d7d83d81f84df00dba34310b4dc2 ;; \
-            arm64) arch=arm64; checksum=b24c503690c1e30da047d0268d0380457526d4fb5e43ce23ad6f33b69ad91d42 ;; \
+            amd64) arch=x86_64; checksum=5ffab9501ead8bdaaee229c60676faa76727817224aa7d275bacdbc860640908 ;; \
+            arm64) arch=arm64; checksum=7e542777f88c8fc47c69d1de8738241dae3c179acea253c07bfcde1b25506402 ;; \
             *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
         esac \
         && apt-get update \
@@ -19,7 +19,7 @@ RUN case "$TARGETARCH" in \
     && test -s /opt/reolink/THIRD-PARTY-LICENSES.txt \
     && mv /tmp/reolink.tar.gz /opt/reolink/release.tar.gz
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="ReoNvr Gateway" \

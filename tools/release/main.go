@@ -65,7 +65,7 @@ func buildBundle(root, output, images, version, architecture, revision string) (
 	if !imageInfo.Mode().IsRegular() || imageInfo.Size() == 0 {
 		return "", errors.New("images archive must be a nonempty regular file")
 	}
-	if err := os.MkdirAll(output, 0o750); err != nil {
+	if err := os.MkdirAll(output, 0o755); err != nil {
 		return "", err
 	}
 	archivePath := filepath.Join(output, "ReoNvr-"+version+"-linux-"+architecture+".zip")
