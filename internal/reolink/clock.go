@@ -12,6 +12,24 @@ import (
 
 const cameraClockPrefix = "Camera/"
 
+func approximateCameraClock(payload []byte, configuration TimezoneConfiguration, started, finished time.Time) TimezoneConfiguration {
+	configuration.DstEnabled = false
+	var decoded any
+	if json.Unmarshal(payload, &decoded) != nil {
+		return configuration
+	}
+	cameraTime, ok := cameraCurrentTime(decoded)
+	if !ok {
+		return configuration
+	}
+	midpoint := started.Add(finished.Sub(started) / 2).UTC()
+	offset := cameraTime.Sub(midpoint).Round(15 * time.Minute)
+	if offset >= -14*time.Hour && offset <= 14*time.Hour {
+		configuration.BaseOffsetSeconds = int(offset / time.Second)
+	}
+	return configuration
+}
+
 func cameraClockDiffers(payload []byte, timezone string, started, finished time.Time) bool {
 	location, err := cameraLocation(timezone)
 	if err != nil {

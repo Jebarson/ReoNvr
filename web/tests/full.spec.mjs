@@ -80,7 +80,11 @@ async function layout(page, name) {
     return box.left < parent.left || box.right > parent.right + 1 || element.scrollWidth > element.clientWidth + 1
   })), false, 'Player status text fits inside the player')
   assert.equal(await page.evaluate(() => document.body.textContent.includes('Camera/')), false, 'Internal clock rules stay hidden')
-  await page.screenshot({ path: fileURLToPath(new URL(`../../runtime/e2e-${name}.png`, import.meta.url)), fullPage: true, animations: 'disabled', mask: [page.locator('input[name=password]')] })
+  await page.screenshot({ path: fileURLToPath(new URL(`../../runtime/e2e-${name}.png`, import.meta.url)), fullPage: true, animations: 'disabled', mask: [
+    page.locator('input[name=password], input[name=username], input[name=host], img, video'),
+    page.getByText(credentials.username, { exact: true }),
+    ...configuration.cameras.flatMap((camera) => [page.getByText(camera.host, { exact: false }), page.getByText(`E2E ${camera.id}`, { exact: false })]),
+  ] })
 }
 
 function existingDraft(camera, changes = {}) {
@@ -159,7 +163,7 @@ test('configured camera authentication, native streams, clock rules and snapshot
   assert.equal(JSON.stringify(result).includes(credentials.password), false, 'API must not expose the password')
 })
 
-test('real discovery and configured cameras register through the browser', { timeout: 180000 }, async () => {
+test('real discovery finds configured cameras through the browser', { timeout: 60000 }, async () => {
   await withPage(1440, async (page) => {
     await page.getByText('No cameras registered', { exact: true }).waitFor()
     const scan = page.waitForResponse((response) => response.url().endsWith('/api/cameras/discover'))
@@ -168,6 +172,13 @@ test('real discovery and configured cameras register through the browser', { tim
     assert.equal(discovery.status(), 200)
     const devices = await discovery.json()
     assert.deepEqual(configuration.cameras.filter((camera) => !devices.some((device) => device.host === camera.host)).map((camera) => camera.id), [], 'All configured cameras are discoverable')
+  })
+})
+
+test('configured cameras register through the browser', { timeout: 180000 }, async () => {
+  await withPage(1440, async (page) => {
+    await page.getByRole('button', { name: 'Detect Automatically', exact: true }).click()
+    await page.getByRole('heading', { name: 'Detected cameras', exact: true }).waitFor()
     await page.getByRole('button', { name: 'Dismiss detection results', exact: true }).click()
     for (const configured of configuration.cameras) {
       await page.getByRole('button', { name: 'Add camera', exact: true }).first().click()
@@ -203,7 +214,15 @@ test('real discovery and configured cameras register through the browser', { tim
   })
 })
 
-test('edit policy, retest stream changes, recovery, enable and disable persist', { timeout: 90000 }, async () => {
+test('configured storage camera supports native recovery', { timeout: 45000 }, async () => {
+  const response = await api.post('/api/cameras/test', { data: cameraDraft(storageCamera) })
+  assert.equal(response.status(), 200)
+  const capabilities = await response.json()
+  assert.equal(capabilities.storageAvailable, true, 'Configured storage camera has camera storage')
+  assert.equal(capabilities.storagePlaybackAvailable, true, 'Configured storage camera supports recording search')
+})
+
+test('edit policy, stream retest, capability-aware recovery, enable and disable persist', { timeout: 90000 }, async () => {
   const camera = [...created.values()].find((item) => item.host === storageCamera.host)
   assert.ok(camera)
   await withPage(1440, async (page) => {
@@ -220,23 +239,28 @@ test('edit policy, retest stream changes, recovery, enable and disable persist',
     await page.getByText('Test the connection to read camera capabilities.', { exact: true }).waitFor()
     const tested = page.waitForResponse((response) => response.url().endsWith(`/api/cameras/${camera.id}/test`))
     await page.getByRole('button', { name: 'Test connection', exact: true }).click()
-    assert.equal((await tested).status(), 200)
+    const response = await tested
+    assert.equal(response.status(), 200)
+    const capabilities = await response.json()
+    const recoveryAvailable = Boolean(capabilities.storageAvailable && capabilities.storagePlaybackAvailable)
     await page.getByRole('radio', { name: /^Continuous/ }).check()
     const recovery = page.getByRole('checkbox', { name: /^Recover missed recordings/ })
-    assert.equal(await recovery.isEnabled(), true)
-    await recovery.check()
+    assert.equal(await recovery.isEnabled(), recoveryAvailable)
+    if (recoveryAvailable) await recovery.check()
     const saved = page.waitForResponse((response) => response.url().endsWith(`/api/cameras/${camera.id}`) && response.request().method() === 'PUT')
     await page.getByRole('button', { name: 'Save camera', exact: true }).click()
     assert.equal((await saved).status(), 200)
     const current = await json(`/api/cameras/${camera.id}`)
     assert.equal(current.archiveStream, 'Sub')
     assert.equal(current.recordingMode, 'Continuous')
-    assert.equal(current.recoveryEnabled, true)
+    assert.equal(current.recoveryEnabled, recoveryAvailable)
     await page.reload()
-    await row().getByRole('button', { name: 'Recovery paused', exact: true }).click()
-    await page.getByRole('heading', { name: 'Recovery', exact: true }).waitFor()
-    await page.getByText('No recovery intervals', { exact: true }).waitFor()
-    await layout(page, 'recovery-empty-desktop')
+    if (recoveryAvailable) {
+      await row().getByRole('button', { name: 'Recovery paused', exact: true }).click()
+      await page.getByRole('heading', { name: 'Recovery', exact: true }).waitFor()
+      await page.getByText('No recovery intervals', { exact: true }).waitFor()
+      await layout(page, 'recovery-empty-desktop')
+    }
     assert.equal((await api.put(`/api/cameras/${camera.id}`, { data: existingDraft(current, { archiveEnabled: false, recoveryEnabled: false }) })).status(), 200)
   })
 })

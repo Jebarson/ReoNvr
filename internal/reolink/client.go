@@ -310,17 +310,25 @@ func (client *Client) Test(ctx context.Context, connection Connection) (TestResu
 	result.TimezoneConfiguration = configuration
 	result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
 	result.Timezone = timezone
+	started := time.Now().UTC()
+	deadline, _ := ctx.Deadline()
+	clockCtx, cancelClock := context.WithTimeout(ctx, min(2*time.Second, time.Until(deadline)/4))
+	clockPayload, currentTimeErr := commandClient.run(clockCtx, connection, "config", "get", "system-general")
+	cancelClock()
+	finished := time.Now().UTC()
 	if clockErr != nil {
-		result.Timezone = "Camera/Unverified"
-	} else if strings.HasPrefix(timezone, cameraClockPrefix) {
-		started := time.Now().UTC()
-		payload, err := commandClient.run(ctx, connection, "config", "get", "system-general")
-		finished := time.Now().UTC()
-		if err == nil && cameraClockDiffers(payload, timezone, started, finished) {
-			result.Capabilities.ClockWarning = "Your camera's time doesn't match your machine. ReoNvr will use the camera's clock."
+		if configuration.BaseOffsetSeconds < -14*3600 || configuration.BaseOffsetSeconds > 14*3600 {
+			configuration = TimezoneConfiguration{}
 		}
+		configuration = approximateCameraClock(clockPayload, configuration, started, finished)
+		result.TimezoneConfiguration = configuration
+		result.TimezoneOffsetSeconds = configuration.BaseOffsetSeconds
+		result.Timezone, _ = customCameraTimezone(configuration)
+		result.Capabilities.ClockWarning = "Camera time rules could not be verified. ReoNvr will continue using a best-effort clock; recording times may be approximate."
+	} else if currentTimeErr == nil && cameraClockDiffers(clockPayload, result.Timezone, started, finished) {
+		result.Capabilities.ClockWarning = "Your camera's time doesn't match your machine. ReoNvr will use the camera's clock."
 	}
-	if result.Capabilities.StorageAvailable && clockErr == nil {
+	if result.Capabilities.StorageAvailable {
 		searchConnection := connection
 		searchConnection.Timezone = result.Timezone
 		now := time.Now().UTC()
@@ -347,13 +355,14 @@ func (client *Client) readCameraClock(ctx context.Context, connection Connection
 	if err != nil {
 		return TimezoneConfiguration{}, "", err
 	}
+	fallback := TimezoneConfiguration{BaseOffsetSeconds: -offset}
 	dstBytes, err := client.run(ctx, connection, "raw", "106")
 	if err != nil {
-		return TimezoneConfiguration{}, "", err
+		return fallback, "", err
 	}
 	configuration, err := parseDstConfiguration(dstBytes)
 	if err != nil {
-		return TimezoneConfiguration{}, "", err
+		return fallback, "", err
 	}
 	configuration.BaseOffsetSeconds = -offset
 	timezone, err := resolveCameraTimezone(configuration, connection.Timezone, time.Now().UTC())

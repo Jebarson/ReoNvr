@@ -16,10 +16,11 @@ import (
 )
 
 type fixtureRunner struct {
-	responses map[string]string
-	snapshot  []byte
-	calls     [][]string
-	passwords []string
+	responses      map[string]string
+	snapshot       []byte
+	calls          [][]string
+	passwords      []string
+	blockedCommand string
 }
 
 type streamingFixtureRunner struct {
@@ -38,9 +39,15 @@ func (runner *streamingFixtureRunner) Stream(_ context.Context, password string,
 	return nil
 }
 
-func (runner *fixtureRunner) Run(_ context.Context, password string, arguments ...string) ([]byte, error) {
+func (runner *fixtureRunner) Run(ctx context.Context, password string, arguments ...string) ([]byte, error) {
 	runner.calls = append(runner.calls, slices.Clone(arguments))
 	runner.passwords = append(runner.passwords, password)
+	if runner.blockedCommand != "" && strings.HasSuffix(strings.Join(arguments, " "), runner.blockedCommand) {
+		<-ctx.Done()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if slices.Contains(arguments, "snapshot") && len(runner.snapshot) > 0 {
 		fileIndex := slices.Index(arguments, "--file")
 		if fileIndex < 0 || fileIndex+1 >= len(arguments) {
@@ -150,19 +157,96 @@ func TestConnectionTestKeepsStreamsAvailableWhenClockIsUnverified(test *testing.
 		"config get time-zone":                 `{"data":{"timeZone":28800}}`,
 		"raw 106":                              `{"data":{}}`,
 		"storage status":                       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+		"vod search":                           `{"data":{"items":[]}}`,
 		"stream url --kind rtsp --stream main": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{host1}}/Preview_01_main\"]}}"),
 	}}
 	result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
-	if err != nil || !result.Capabilities.RtspAvailable || result.Capabilities.ClockWarning != "" || result.Timezone != "Camera/Unverified" {
-		test.Fatalf("unverified clock blocked a valid connection or claimed a time mismatch: %#v %v", result, err)
+	if err != nil || !result.Capabilities.RtspAvailable || result.Capabilities.ClockWarning == "" {
+		test.Fatalf("unverified clock blocked a valid connection or omitted its warning: %#v %v", result, err)
 	}
-	if result.Capabilities.StoragePlaybackAvailable {
-		test.Fatal("unverified timestamps must not enable storage recovery")
+	location, err := cameraLocation(result.Timezone)
+	if err != nil || zoneOffset(location, time.Now()) != -28800 {
+		test.Fatalf("camera base offset was not retained for best-effort searches: %v", err)
 	}
+	if !result.Capabilities.StoragePlaybackAvailable {
+		test.Fatal("missing daylight-saving rules blocked usable camera storage")
+	}
+	searched := false
 	for _, call := range runner.calls {
 		if slices.Contains(call, "vod") {
-			test.Fatal("unverified timestamps triggered a historical search")
+			searched = true
 		}
+	}
+	if !searched {
+		test.Fatal("camera storage was not probed with the best-effort clock")
+	}
+}
+
+func TestConnectionTestSlowCurrentTimePreservesStorageAndSnapshot(test *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		dst  string
+	}{
+		{name: "verified IANA clock", dst: `{"data":{"Dst":{"enable":0}}}`},
+		{name: "estimated clock", dst: `{"data":{}}`},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			snapshot := []byte{0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9}
+			runner := &fixtureRunner{blockedCommand: "config get system-general", snapshot: snapshot, responses: map[string]string{
+				"info":                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+				"config get time-zone": `{"data":{"timeZone":28800}}`,
+				"raw 106":              fixture.dst,
+				"storage status":       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+				"vod search":           `{"data":{"items":[]}}`,
+			}}
+			client := NewClient(runner, time.Second)
+			client.captureSnapshot = true
+			result, err := client.Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: "Etc/GMT+8", Username: testconfig.Username(), Password: testconfig.Password()})
+			if err != nil || !result.Capabilities.StoragePlaybackAvailable || !slices.Equal(result.SnapshotJPEG, snapshot) {
+				test.Fatalf("optional clock query consumed the storage/snapshot budget: storage=%t snapshot=%t err=%v", result.Capabilities.StoragePlaybackAvailable, slices.Equal(result.SnapshotJPEG, snapshot), err)
+			}
+			if fixture.name == "estimated clock" && result.Capabilities.ClockWarning == "" {
+				test.Fatal("estimated clock warning was lost after the optional query timed out")
+			}
+		})
+	}
+}
+
+func TestConnectionTestContinuesWhenAllClockQueriesAreUnavailable(test *testing.T) {
+	runner := &fixtureRunner{responses: map[string]string{
+		"info":           `{"data":{"model":"Doorbell","firmware":"test"}}`,
+		"storage status": `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+		"vod search":     `{"data":{"items":[]}}`,
+	}}
+	result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
+	if err != nil || result.Capabilities.ClockWarning == "" || !result.Capabilities.StoragePlaybackAvailable {
+		test.Fatalf("unavailable clock queries blocked best-effort storage: %#v %v", result, err)
+	}
+	if _, err := cameraLocation(result.Timezone); err != nil {
+		test.Fatalf("clock fallback is unusable: %v", err)
+	}
+}
+
+func TestApproximateCameraClockUsesObservedOffsetAndKeepsFallback(test *testing.T) {
+	started := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	for _, fixture := range []struct {
+		name    string
+		payload string
+		offset  int
+	}{
+		{name: "active daylight saving", payload: `{"data":{"Time":{"year":2026,"month":7,"day":15,"hour":5,"minute":0,"second":0}}}`, offset: -7 * 3600},
+		{name: "quarter hour zone", payload: `{"data":{"Time":{"year":2026,"month":7,"day":15,"hour":17,"minute":45,"second":20}}}`, offset: 20700},
+		{name: "malformed time", payload: `not-json`, offset: -8 * 3600},
+		{name: "missing time", payload: `{"data":{}}`, offset: -8 * 3600},
+		{name: "invalid calendar", payload: `{"year":2026,"month":2,"day":30,"hour":5,"minute":0,"second":0}`, offset: -8 * 3600},
+		{name: "large clock skew", payload: `{"year":2025,"month":7,"day":15,"hour":5,"minute":0,"second":0}`, offset: -8 * 3600},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			configuration := approximateCameraClock([]byte(fixture.payload), TimezoneConfiguration{BaseOffsetSeconds: -8 * 3600}, started, started.Add(time.Second))
+			if configuration.BaseOffsetSeconds != fixture.offset || configuration.DstEnabled {
+				test.Fatalf("unexpected estimated clock: %#v", configuration)
+			}
+		})
 	}
 }
 
