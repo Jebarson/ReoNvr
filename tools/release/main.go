@@ -101,14 +101,6 @@ func buildBundle(root, output, images, version, architecture, revision string) (
 		{"compose.yaml", "packaging/compose.yaml"},
 		{"start.sh", "packaging/start.sh"},
 		{"start.ps1", "packaging/start.ps1"},
-		{"README.md", "README.md"},
-		{"docs/images/cameras.png", "docs/images/cameras.png"},
-		{"docs/images/automatic-detection.png", "docs/images/automatic-detection.png"},
-		{"docs/images/camera-setup.png", "docs/images/camera-setup.png"},
-		{"docs/CONTRIBUTING.md", "docs/CONTRIBUTING.md"},
-		{"docs/APPLICATION-SPEC.md", "docs/APPLICATION-SPEC.md"},
-		{"docs/REOLINK-CAMERA-API-LEARNINGS.md", "docs/REOLINK-CAMERA-API-LEARNINGS.md"},
-		{"THIRD-PARTY-NOTICES.md", "packaging/THIRD-PARTY-NOTICES.md"},
 		{"THIRD-PARTY-LICENSES.tar", "runtime/third-party-notices.tar"},
 	} {
 		payload, err := os.ReadFile(filepath.Join(root, asset.source))

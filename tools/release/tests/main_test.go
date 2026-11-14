@@ -66,13 +66,17 @@ func TestReleaseBundleIncludesOnlyDistributionFilesAndChecksums(t *testing.T) {
 			}
 		}
 		archive.Close()
-		if len(entries) != 16 || entries["runtime/test-config.json"] != nil || !strings.Contains(string(entries[".env"]), "REONVR_ARCH="+architecture) {
+		expected := []string{".env", "checksums.sha256", "compose.yaml", "images.tar", "release.json", "start.ps1", "start.sh", "THIRD-PARTY-LICENSES.tar"}
+		if len(entries) != len(expected) || entries["runtime/test-config.json"] != nil || !strings.Contains(string(entries[".env"]), "REONVR_ARCH="+architecture) {
 			t.Fatal("bundle includes unexpected data or wrong architecture")
 		}
-		for _, name := range []string{"docs/images/cameras.png", "docs/images/automatic-detection.png", "docs/images/camera-setup.png", "THIRD-PARTY-LICENSES.tar"} {
-			if string(entries[name]) != "fixture" {
-				t.Fatalf("distribution asset missing or changed: %s", name)
+		for _, name := range expected {
+			if _, found := entries[name]; !found {
+				t.Fatalf("distribution asset missing: %s", name)
 			}
+		}
+		if string(entries["THIRD-PARTY-LICENSES.tar"]) != "fixture" {
+			t.Fatal("required third-party licenses missing or changed")
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(entries["checksums.sha256"])), "\n") {
 			digest, name, found := strings.Cut(line, "  ")

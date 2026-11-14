@@ -36,7 +36,9 @@ SD-card media.
    no GitHub account, source checkout, compiler, or registry credentials.
 2. Verify the downloaded ZIP against its accompanying `.sha256` file and extract
    it into a dedicated folder. The ZIP contains all three Docker images, Compose
-   configuration, startup scripts, checksums, and version metadata.
+   configuration, startup scripts, checksums, version metadata, and required
+   third-party licenses. This README, guides, and screenshots remain in the
+   repository and are not included in the ZIP.
 3. Optionally edit the extracted `.env` before first startup. Keep
    `REONVR_VERSION` and `REONVR_ARCH` unchanged. The defaults use Docker-managed
    persistent volumes and expose the web interface only on this computer.

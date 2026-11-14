@@ -106,10 +106,6 @@ jobs:
           docker run --rm -v "$PWD/runtime/ci-tools:/tools:ro" --entrypoint sh "reonvr/app:$VERSION-$ARCH" -ec 'command -v ffmpeg; command -v ffprobe; /tools/archive.test -test.run="^(TestClockAlignedSegmentsUseRelativeMediaTime|TestMediaInspectionWithRealFFmpeg)$" -test.v=test2json' > runtime/media-tests.log
           docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go tool test2json -p reonavr/internal/archive < runtime/media-tests.log' > runtime/media-tests.json
           docker run --rm -v "$PWD:/src:ro" -w /src golang:1.27-alpine sh -ec 'go run ./tools/gotest verify TestClockAlignedSegmentsUseRelativeMediaTime TestMediaInspectionWithRealFFmpeg < runtime/media-tests.json'
-      - name: Generate and verify the manual images shipped in the ZIP
-        run: |
-          docker run --rm -v "$PWD:/src" -w /src/web node:26-alpine sh -ec 'npm ci; npm run build'
-          docker run --rm --network none -v "$PWD:/src" -w /src/web -e REONVR_DOCS_OUTPUT=/src/docs/images mcr.microsoft.com/playwright:v1.65.0-noble npm run test:docs
       - name: Collect offline licenses and dependency inventory
         run: |
           docker build --platform "linux/$ARCH" -f docker/app.Dockerfile --target licensing-artifacts --output type=local,dest=runtime/release-notices .
@@ -124,6 +120,7 @@ jobs:
             cp /usr/local/go/LICENSE runtime/release-notices/go/LICENSE-Go
           '
           docker run --rm -v "$PWD:/src" -w /src/web node:26-alpine sh -ec '
+            npm ci
             npx --yes license-checker-rseidelsohn@5.0.1 --json --relativeLicensePath --relativeModulePath --excludePrivatePackages --unknown --failOn UNKNOWN --files /src/runtime/release-notices/frontend --out /src/runtime/release-notices/frontend-dependencies.json
             cp package.json package-lock.json /src/runtime/release-notices/manifests/
           '

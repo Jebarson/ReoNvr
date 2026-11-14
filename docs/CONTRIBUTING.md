@@ -1,6 +1,6 @@
 # Development and Contribution Guide
 
-Use the [package README](../README.md) for installation and operation. Develop on
+Use the [repository README](../README.md) for installation and operation. Develop on
 a branch created from `main`; submit a pull request rather than pushing changes
 directly to the default branch. Keep changes focused, include regressions for
 behavior changes, and never commit runtime data, credentials, keys, or camera
@@ -39,8 +39,8 @@ docker run --rm --network none -v "${PWD}:/src" -w /src/web -e REONVR_DOCS_OUTPU
 
 CI runs the same screenshot privacy check, writing temporary captures under
 `runtime/reports/documentation` instead of overwriting the checked-in images.
-Each package job separately regenerates and validates `docs/images` immediately
-before ZIP assembly; unchecked repository images are never used for publication.
+The README, guides, and screenshots remain in the repository; release ZIPs do
+not include them, and package jobs do not generate documentation images.
 
 CI runs on pull requests, every push to `main` (including merged pull requests),
 merge-queue events, and manual dispatch. The required aggregate check is **CI**.
@@ -63,7 +63,9 @@ The workflow rejects commits outside `main`, repeats the reusable CI gate for
 that exact commit, and publishes both architecture ZIPs and SHA-256 files with
 generated notes. Prerelease tags produce prereleases. Changes are categorized
 by labels using the release-note configuration in `.github/release.yml`.
-No registry credentials are required: release ZIPs include all Docker images.
+No registry credentials are required: release ZIPs include all Docker images,
+startup scripts, Compose configuration, checksums, and version metadata, but no
+README, guides, or screenshots.
 Before publication, CI collects offline licenses using pinned
 `go-licenses/v2@v2.0.1` and `license-checker-rseidelsohn@5.0.1`. The ZIP includes
 `THIRD-PARTY-LICENSES.tar`, dependency inventories, manifests, and the complete
