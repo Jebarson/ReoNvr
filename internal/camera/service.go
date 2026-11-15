@@ -70,8 +70,8 @@ type Store interface {
 	GetCamera(context.Context, string) (domain.Camera, error)
 	GetCredential(context.Context, string) (domain.EncryptedCredential, error)
 	RetireCamera(context.Context, string, time.Time) error
-	UpdateCameraProbe(context.Context, string, string, string, string, domain.CameraCapabilities, string, time.Time) error
-	UpdateCameraStatus(context.Context, string, string, time.Time) error
+	UpdateCameraProbe(context.Context, string, string, string, string, domain.CameraCapabilities, string, time.Time, ...domain.Camera) error
+	UpdateCameraStatus(context.Context, string, string, time.Time, ...domain.Camera) error
 }
 
 type CameraTester interface {
@@ -164,7 +164,18 @@ func (service *Service) Test(ctx context.Context, cameraID string, draft Draft) 
 	}
 	draft.Password = password
 	connectionFingerprint := fingerprint(draft, password)
-	result, err := service.tester.Test(ctx, draft.connection())
+	connection := draft.connection()
+	connection.Timezone = ""
+	if cameraID != "" {
+		stored, err := service.Get(ctx, cameraID)
+		if err != nil {
+			return TestResponse{}, err
+		}
+		if strings.EqualFold(strings.Trim(stored.Host, "[]"), strings.Trim(connection.Host, "[]")) && stored.Port == connection.Port && stored.Channel == connection.Channel {
+			connection.Timezone = stored.Timezone
+		}
+	}
+	result, err := service.tester.Test(ctx, connection)
 	draft.Password = ""
 	password = ""
 	if err != nil {
@@ -341,10 +352,9 @@ func (service *Service) Probe(ctx context.Context, id string) error {
 	})
 	password = ""
 	if probeErr != nil {
-		_ = service.store.UpdateCameraStatus(ctx, id, "Degraded", service.now().UTC())
-		return probeErr
+		return errors.Join(probeErr, service.store.UpdateCameraStatus(ctx, id, "Degraded", service.now().UTC(), camera))
 	}
-	return service.store.UpdateCameraProbe(ctx, id, result.Model, result.Firmware, result.Timezone, result.Capabilities, "Online", service.now().UTC())
+	return service.store.UpdateCameraProbe(ctx, id, result.Model, result.Firmware, result.Timezone, result.Capabilities, "Online", service.now().UTC(), camera)
 }
 
 func (service *Service) resolvePassword(ctx context.Context, cameraID, submitted string) (string, error) {

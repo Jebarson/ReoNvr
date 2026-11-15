@@ -98,6 +98,7 @@ func run(logger *slog.Logger) error {
 	supervisor.Add(workers.Spec{Name: "RetentionWorker", Interval: time.Minute, Run: func(workerContext context.Context) error {
 		return retentionService.EnsureCapacity(workerContext, 0)
 	}})
+	supervisor.Add(workers.Spec{Name: "ArchiveMetadataWorker", Interval: time.Minute, Run: downloadService.RepairSidecars})
 	supervisor.Add(workers.Spec{Name: "HealthAggregationWorker", Interval: 30 * time.Second, Run: func(context.Context) error { return nil }})
 	cameraWorkers := &cameraWorkerManager{
 		registry: supervisor, enabled: recordingEnabled.Load, logger: logger,

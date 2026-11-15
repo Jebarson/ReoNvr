@@ -18,8 +18,10 @@ import (
 
 type fakeTester struct {
 	passwords        []string
+	timezones        []string
 	result           reolink.TestResult
 	rejectedPassword string
+	onTest           func()
 }
 
 type discoveryTester struct {
@@ -74,10 +76,86 @@ func TestDiscoveryMarksRegisteredDevicesWithoutSavingNewOnes(t *testing.T) {
 
 func (tester *fakeTester) Test(_ context.Context, connection reolink.Connection) (reolink.TestResult, error) {
 	tester.passwords = append(tester.passwords, connection.Password)
+	tester.timezones = append(tester.timezones, connection.Timezone)
+	if tester.onTest != nil {
+		tester.onTest()
+	}
 	if tester.rejectedPassword != "" && connection.Password == tester.rejectedPassword {
 		return reolink.TestResult{}, errors.New("authentication failed")
 	}
 	return tester.result, nil
+}
+
+func TestProbeDoesNotApplyResultsToChangedCamera(t *testing.T) {
+	for _, change := range []string{"unchanged", "host", "port", "channel", "failed-host"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "probe-race.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{3}, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tester := &fakeTester{result: testCameraResult()}
+			service := NewService(store, tester, cipher)
+			draft := validDraft()
+			receipt, err := service.Test(ctx, "", draft)
+			if err != nil {
+				t.Fatal(err)
+			}
+			draft.TestID = receipt.TestID
+			camera, err := service.Create(ctx, draft)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := camera
+			tester.result.Model = "Probe model"
+			if change == "failed-host" {
+				tester.rejectedPassword = draft.Password
+			}
+			tester.onTest = func() {
+				if change == "unchanged" {
+					return
+				}
+				switch change {
+				case "host", "failed-host":
+					camera.Host = testconfig.Host(3)
+				case "port":
+					camera.Port++
+				case "channel":
+					camera.Channel++
+				}
+				camera.Model, camera.Timezone, camera.ConnectionStatus = "Replacement", "Camera/Unverified", "Testing"
+				if err := store.UpdateCamera(ctx, camera, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probeErr := service.Probe(ctx, camera.ID)
+			if change == "unchanged" && probeErr != nil {
+				t.Fatal(probeErr)
+			}
+			if change != "unchanged" && !errors.Is(probeErr, repository.ErrConflict) {
+				t.Fatalf("skipped stale probe did not report a conflict: %v", probeErr)
+			}
+			if change != "unchanged" && !errors.Is(store.UpdateCameraStatus(ctx, camera.ID, "Degraded", service.now().UTC(), expected), repository.ErrConflict) {
+				t.Fatal("skipped stale status did not report a conflict")
+			}
+			current, err := store.GetCamera(ctx, camera.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "unchanged" {
+				if current.Model != "Probe model" || current.ConnectionStatus != "Online" {
+					t.Fatal("unchanged camera did not accept its probe")
+				}
+			} else if current.Model != "Replacement" || current.Timezone != "Camera/Unverified" || current.ConnectionStatus != "Testing" {
+				t.Fatal("stale lifecycle probe changed replacement camera metadata")
+			}
+		})
+	}
 }
 
 func TestRegistrationRequiresReceiptAndRetainsCredentialForPolicyEdit(t *testing.T) {
@@ -299,6 +377,63 @@ func TestConnectionEditCanTestWithStoredPassword(t *testing.T) {
 	}
 	if updated.Host != testconfig.Host(3) {
 		t.Fatalf("host was not updated: %#v", updated)
+	}
+}
+
+func TestRetestUsesPriorClockOnlyForStoredEndpoint(t *testing.T) {
+	ctx := context.Background()
+	store, err := repository.Open(ctx, filepath.Join(t.TempDir(), "clock-endpoint.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cipher, err := security.NewCredentialCipher(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tester := &fakeTester{result: testCameraResult()}
+	service := NewService(store, tester, cipher)
+	draft := validDraft()
+	result, err := service.Test(ctx, "", draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("new camera has no trusted prior", func(t *testing.T) {
+		if tester.timezones[0] != "" {
+			t.Fatal("new camera inherited an unverified draft timezone")
+		}
+	})
+	draft.TestID = result.TestID
+	created, err := service.Create(ctx, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		name  string
+		edit  func(*Draft)
+		prior bool
+	}{
+		{name: "same endpoint", edit: func(draft *Draft) {}, prior: true},
+		{name: "normalized endpoint", edit: func(draft *Draft) { draft.Host = " " + draft.Host + " " }, prior: true},
+		{name: "host changed", edit: func(draft *Draft) { draft.Host = testconfig.Host(3) }},
+		{name: "port changed", edit: func(draft *Draft) { draft.Port++ }},
+		{name: "channel changed", edit: func(draft *Draft) { draft.Channel++ }},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			changed := draft
+			changed.Timezone = "America/Los_Angeles"
+			fixture.edit(&changed)
+			if _, err := service.Test(ctx, created.ID, changed); err != nil {
+				t.Fatal(err)
+			}
+			wanted := ""
+			if fixture.prior {
+				wanted = created.Timezone
+			}
+			if tester.timezones[len(tester.timezones)-1] != wanted {
+				t.Fatal("retest trusted clock data from a different endpoint or the draft")
+			}
+		})
 	}
 }
 

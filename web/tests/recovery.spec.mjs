@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { chromium, request } from 'playwright'
+import { captureMaskedScreenshot, liveCameraScreenshotSelector } from './screenshot.mjs'
 
 const baseURL = process.env.REONVR_E2E_URL ?? 'http://localhost:8080'
 const defaults = JSON.parse(readFileSync(new URL('../../internal/testconfig/config.example.json', import.meta.url), 'utf8'))
@@ -46,8 +47,15 @@ async function checkLayout(page) {
   assert.equal(clippedNavigation, false, 'Navigation labels must fit within the viewport')
 }
 
-function screenshot(name) {
-  return fileURLToPath(new URL(`../../runtime/${name}.png`, import.meta.url))
+async function screenshot(page, name) {
+  await captureMaskedScreenshot(page, {
+    path: fileURLToPath(new URL(`../../runtime/${name}.png`, import.meta.url)), fullPage: true, animations: 'disabled',
+    mask: [
+      page.locator(liveCameraScreenshotSelector),
+      page.getByRole('region', { name: 'Detected cameras', exact: true }),
+      ...cameras.flatMap((camera) => [camera.host, camera.name, camera.username].filter(Boolean).map((value) => page.getByText(value, { exact: false }))),
+    ],
+  })
 }
 
 test('real automatic detection is read-only and available beside Add camera', { timeout: 30000 }, async () => {
@@ -73,7 +81,7 @@ test('real automatic detection is read-only and available beside Add camera', { 
     assert.equal(current.length, cameras.length)
     assert.equal(current.reduce((total, camera) => total + camera.recordingCount, 0), cameras.reduce((total, camera) => total + camera.recordingCount, 0))
     await checkLayout(page)
-    await page.screenshot({ path: screenshot('detection-live-desktop'), fullPage: true })
+    await screenshot(page, 'detection-live-desktop')
   } finally {
     await context.close()
   }
@@ -85,7 +93,8 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
     const page = await context.newPage()
     const errors = []
     const writes = []
-    const firstScan = Promise.withResolvers()
+    let releaseFirstScan
+    const firstScan = new Promise((resolve) => { releaseFirstScan = resolve })
     let attempts = 0
     page.on('pageerror', (error) => errors.push(error.message))
     page.on('request', (request) => {
@@ -95,7 +104,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
     await page.route((url) => url.pathname === '/api/cameras/discover', async (route) => {
       attempts += 1
       if (attempts === 1) {
-        await firstScan.promise
+        await firstScan
         await route.fulfill({ json: [
           { host: cameras[0].host, port: cameras[0].port, name: 'Existing camera', registered: true },
           { host: discoveryHost, port: 9001, name: 'Garden camera', registered: false },
@@ -112,13 +121,13 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       await detect.click()
       await page.getByRole('status').filter({ hasText: 'Scanning local network...' }).waitFor()
       assert.equal(await detect.isDisabled(), true)
-      firstScan.resolve()
+      releaseFirstScan()
       const results = page.getByRole('region', { name: 'Detected cameras', exact: true })
       await results.getByText('Garden camera', { exact: true }).waitFor()
       assert.equal(await results.getByText('Already added', { exact: true }).count(), 1)
       assert.equal(await results.getByRole('button', { name: 'Add Existing camera', exact: true }).count(), 0)
       await checkLayout(page)
-      await page.screenshot({ path: screenshot(`detection-results-${viewport.width}`), fullPage: true })
+      await screenshot(page, `detection-results-${viewport.width}`)
       await results.getByRole('button', { name: 'Add Garden camera', exact: true }).click()
       assert.equal(await page.getByLabel('Name', { exact: true }).inputValue(), 'Garden camera')
       assert.equal(await page.getByLabel('IP address or hostname', { exact: true }).inputValue(), discoveryHost)
@@ -129,7 +138,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       await detect.click()
       await page.getByText('No cameras replied', { exact: true }).waitFor()
       await checkLayout(page)
-      await page.screenshot({ path: screenshot(`detection-empty-${viewport.width}`), fullPage: true })
+      await screenshot(page, `detection-empty-${viewport.width}`)
       await detect.click()
       await page.getByRole('alert').filter({ hasText: 'Camera detection failed.' }).waitFor()
       await results.getByRole('button', { name: 'Retry', exact: true }).click()
@@ -141,7 +150,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       assert.deepEqual(writes, [])
       assert.deepEqual(errors, [])
     } finally {
-      firstScan.resolve()
+      releaseFirstScan()
       await context.close()
     }
   })
@@ -185,7 +194,7 @@ test('real camera policy persists without losing recordings or enabling recordin
     await page.getByRole('row').filter({ has: page.getByText(original.name, { exact: true }) }).getByTitle('Edit camera', { exact: true }).click()
     assert.equal(await page.getByRole('checkbox', { name: /^Recover missed recordings/ }).isChecked(), !original.recoveryEnabled)
     await checkLayout(page)
-    await page.screenshot({ path: screenshot('recovery-settings-desktop'), fullPage: true })
+    await screenshot(page, 'recovery-settings-desktop')
     assert.deepEqual(errors, [])
   } finally {
     if (changed) {
@@ -221,7 +230,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       assert.equal(await page.getByRole('cell', { name: /^(Status )?Unknown$/ }).count(), 1)
       assert.equal(await page.getByRole('cell', { name: /^(Status )?Event clips recovered$/ }).count(), 1)
       await checkLayout(page)
-      await page.screenshot({ path: screenshot(`recovery-history-${viewport.width}`), fullPage: true })
+      await screenshot(page, `recovery-history-${viewport.width}`)
       await page.getByRole('main').getByRole('button', { name: 'Cameras', exact: true }).click()
       await page.getByTitle('Edit camera', { exact: true }).click()
       const recovery = page.getByRole('checkbox', { name: /^Recover missed recordings/ })
@@ -229,7 +238,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       assert.equal(await recovery.isDisabled(), true)
       assert.equal(await page.getByRole('radio', { name: /^Continuous/ }).isEnabled(), true)
       await checkLayout(page)
-      await page.screenshot({ path: screenshot(`recovery-unavailable-${viewport.width}`), fullPage: true })
+      await screenshot(page, `recovery-unavailable-${viewport.width}`)
       assert.deepEqual(errors, [])
     } finally {
       await context.close()

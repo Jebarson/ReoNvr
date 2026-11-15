@@ -116,6 +116,11 @@ reachability and may not cross subnets, VPNs, or Docker Desktop's Linux VM.
 Use manual registration when it cannot reach the camera LAN. ReoNvr does not
 change Docker Desktop, firewall, or camera configuration automatically.
 
+Only one installation can own host UDP `2000` and `3000` at a time. Before moving
+discovery to another installation, stop the old installation's app and discovery
+relay; do not delete its volumes. Using different HTTP ports does not resolve
+these UDP conflicts.
+
 ### Add Manually and Configure Recording
 
 1. Open **Cameras**, choose **Add camera**, and enter its name, LAN address, and
@@ -140,6 +145,17 @@ can only recover footage the camera actually recorded and still retains. Keep
 camera and host clocks synchronized yourself. Playback shows locally verified
 archived media, not camera-only search results. A discovered event is
 not proof that its video has been archived.
+
+Clock differences and unavailable daylight-saving rules produce a warning, not a
+registration or recovery block. Failed probes retain a usable last-known clock.
+Without one, ReoNvr uses the camera's readable current time and reported offset
+for a best-effort clock, falling back to UTC when neither is available.
+Historical timestamps can be approximate, especially across a DST change;
+re-test the camera after correcting its clock or changing DST settings.
+Estimated-clock recovery remains provisional: downloads are still available,
+but their coverage cannot close missing intervals until reliable clock rules
+allow timestamp revalidation. Affected intervals are rescanned after the clock
+is verified; ambiguous timestamps remain provisional.
 
 ### Automatic Event Detection
 

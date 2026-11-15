@@ -34,6 +34,11 @@ type RecoveryGap struct {
 	Status           string     `json:"status"`
 	MissingSeconds   float64    `json:"missingSeconds"`
 	LastCheckedAtUtc *time.Time `json:"lastCheckedAtUtc,omitempty"`
+	SearchTimezone   string     `json:"-"`
+	SearchEndpoint   string     `json:"-"`
+	ClockAmbiguous   bool       `json:"-"`
+	SearchCursorUtc  *time.Time `json:"-"`
+	NextSearchAtUtc  *time.Time `json:"-"`
 }
 
 type RecordingState string
@@ -89,6 +94,8 @@ type Event struct {
 }
 
 type IngestionRun struct {
+	SearchClock     string     `json:"-"`
+	SearchEndpoint  string     `json:"-"`
 	ID              string     `json:"id"`
 	CameraID        string     `json:"cameraId"`
 	Kind            string     `json:"kind"`

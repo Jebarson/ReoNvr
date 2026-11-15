@@ -2,6 +2,7 @@ package archive
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -206,6 +207,15 @@ func TestEventServiceFinalizesEventWithoutUnavailableNativeMedia(t *testing.T) {
 	}
 }
 
+func TestErrorsIsMatchesWrappedCancellation(t *testing.T) {
+	if !errorsIs(errors.Join(context.Canceled), context.Canceled) {
+		t.Fatal("wrapped cancellation did not match its cause")
+	}
+	if errorsIs(errors.New("unrelated failure"), context.Canceled) {
+		t.Fatal("unrelated error matched cancellation")
+	}
+}
+
 func errorsIs(err, target error) bool {
-	return err == target
+	return errors.Is(err, target)
 }

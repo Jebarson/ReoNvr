@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { extname, resolve, sep } from 'node:path'
 import test from 'node:test'
 import { chromium } from 'playwright'
+import { parseSync, Visitor } from 'rolldown/utils'
+import { captureMaskedScreenshot, liveCameraScreenshotSelector } from './screenshot.mjs'
 
 const maskedSelector = '.cameraName small, .discoveryList small, input[name=host], input[name=username], input[name=password], .cameraSnapshot, img, video, canvas'
 const timestamp = '2026-01-15T11:30:00Z'
@@ -36,26 +39,84 @@ async function captureMasked(page, output, name, minimumMasks) {
     return { x: bounds.x + scrollX, y: bounds.y + scrollY, width: bounds.width, height: bounds.height }
   }).filter((bounds) => bounds.width > 0 && bounds.height > 0))
   assert.ok(regions.length >= minimumMasks, 'Expected sensitive areas must be present before capture')
-  const screenshot = await page.screenshot({
+  await captureMaskedScreenshot(page, {
     path: resolve(output, `${name}.png`), fullPage: true, animations: 'disabled',
     mask: [mask], maskColor: '#202020',
   })
-  const opaque = await page.evaluate(async ({ image, areas }) => {
-    const bitmap = new Image()
-    bitmap.src = `data:image/png;base64,${image}`
-    await bitmap.decode()
-    const canvas = document.createElement('canvas')
-    canvas.width = bitmap.width
-    canvas.height = bitmap.height
-    const context = canvas.getContext('2d')
-    context.drawImage(bitmap, 0, 0)
-    return areas.every((area) => {
-      const pixel = context.getImageData(Math.floor(area.x + area.width / 2), Math.floor(area.y + area.height / 2), 1, 1).data
-      return pixel[0] === 32 && pixel[1] === 32 && pixel[2] === 32 && pixel[3] === 255
-    })
-  }, { image: screenshot.toString('base64'), areas: regions })
-  assert.equal(opaque, true, 'Screenshot redactions must be solid opaque pixels')
 }
+
+test('discovery scan cleanup matches its Promise shape', async () => {
+  const source = await readFile(new URL('./recovery.spec.mjs', import.meta.url), 'utf8')
+  const syntax = parseSync('recovery.spec.mjs', source)
+  const promises = new Set()
+  new Visitor({
+    VariableDeclarator(node) {
+      if (node.init?.type === 'NewExpression' && node.init.callee.name === 'Promise') promises.add(node.id.name)
+    },
+    MemberExpression(node) {
+      if (promises.has(node.object.name)) {
+        assert.ok(!['resolve', 'promise'].includes(node.property.name), 'Promise cleanup must use its captured resolver')
+      }
+    },
+  }).visit(syntax.program)
+})
+
+test('recovery screenshots cannot bypass verified masking', async () => {
+  for (const path of ['./recovery.spec.mjs', '../e2e/recovery.spec.mjs']) {
+    let source
+    try {
+      source = await readFile(new URL(path, import.meta.url), 'utf8')
+    } catch (error) {
+      if (path.startsWith('../e2e/') && error.code === 'ENOENT') continue
+      throw error
+    }
+    const syntax = parseSync(path, source)
+    assert.deepEqual(syntax.errors, [])
+    let verifiedCaptures = 0
+    let screenshotCalls = 0
+    new Visitor({
+      CallExpression(node) {
+        const callee = node.callee
+        assert.ok(!(callee.type === 'MemberExpression' && (callee.property.name === 'screenshot' || callee.property.value === 'screenshot')), `${path} contains an unverified screenshot call`)
+        if (callee.type === 'Identifier' && callee.name === 'captureMaskedScreenshot') verifiedCaptures += 1
+        if (callee.type === 'Identifier' && callee.name === 'screenshot') {
+          assert.equal(node.arguments[0]?.name, 'page')
+          screenshotCalls += 1
+        }
+      },
+    }).visit(syntax.program)
+    assert.equal(verifiedCaptures, 1, `${path} must use the verified capture helper`)
+    assert.equal(screenshotCalls, 6, `${path} must mask every recovery capture`)
+  }
+})
+
+test('live screenshot masks hide camera inputs, selectors and unconfigured discoveries', { timeout: 30000 }, async () => {
+  const browser = await chromium.launch({ channel: 'chromium', headless: true })
+  try {
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } })
+    await page.setContent('<label>Name<input value="private-camera" required></label><input name="host" value="192.0.2.55"><input name="username" value="private-user"><input name="password" value="private-password"><label>Camera<select><option>private-camera</option></select></label><section aria-label="Detected cameras"><p>Unconfigured camera 192.0.2.99</p></section>')
+    assert.equal(await page.getByLabel('Name', { exact: true }).getAttribute('name'), null, 'Mirror the actual unnamed camera Name input')
+    const controls = page.locator(liveCameraScreenshotSelector)
+    assert.equal(await controls.count(), 5, 'Every private form and camera select control must be masked')
+    await captureMaskedScreenshot(page, { fullPage: true, mask: [controls, page.getByRole('region', { name: 'Detected cameras', exact: true })] })
+    const temporary = await mkdtemp(resolve(tmpdir(), 'reonvr-privacy-'))
+    try {
+      const accepted = resolve(temporary, 'fresh', 'nested', 'capture.png')
+      const image = await captureMaskedScreenshot(page, { path: accepted, fullPage: true, mask: [controls] })
+      assert.deepEqual(await readFile(accepted), image)
+      const output = resolve(temporary, 'rejected', 'capture.png')
+      const screenshot = page.screenshot.bind(page)
+      page.screenshot = (options) => screenshot({ ...options, mask: [] })
+      await assert.rejects(captureMaskedScreenshot(page, { path: output, fullPage: true, mask: [controls] }), /solid opaque pixels/)
+      await assert.rejects(readFile(output), { code: 'ENOENT' })
+      await assert.rejects(stat(resolve(temporary, 'rejected')), { code: 'ENOENT' })
+    } finally {
+      await rm(temporary, { recursive: true, force: true })
+    }
+  } finally {
+    await browser.close()
+  }
+})
 
 test('manual screenshots use demo data and opaque address, credential and media masks', { timeout: 60000 }, async () => {
   const buildRoot = resolve('dist')

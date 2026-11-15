@@ -16,10 +16,11 @@ import (
 )
 
 type fixtureRunner struct {
-	responses map[string]string
-	snapshot  []byte
-	calls     [][]string
-	passwords []string
+	responses      map[string]string
+	snapshot       []byte
+	calls          [][]string
+	passwords      []string
+	blockedCommand string
 }
 
 type streamingFixtureRunner struct {
@@ -38,9 +39,15 @@ func (runner *streamingFixtureRunner) Stream(_ context.Context, password string,
 	return nil
 }
 
-func (runner *fixtureRunner) Run(_ context.Context, password string, arguments ...string) ([]byte, error) {
+func (runner *fixtureRunner) Run(ctx context.Context, password string, arguments ...string) ([]byte, error) {
 	runner.calls = append(runner.calls, slices.Clone(arguments))
 	runner.passwords = append(runner.passwords, password)
+	if runner.blockedCommand != "" && strings.HasSuffix(strings.Join(arguments, " "), runner.blockedCommand) {
+		<-ctx.Done()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if slices.Contains(arguments, "snapshot") && len(runner.snapshot) > 0 {
 		fileIndex := slices.Index(arguments, "--file")
 		if fileIndex < 0 || fileIndex+1 >= len(arguments) {
@@ -150,19 +157,237 @@ func TestConnectionTestKeepsStreamsAvailableWhenClockIsUnverified(test *testing.
 		"config get time-zone":                 `{"data":{"timeZone":28800}}`,
 		"raw 106":                              `{"data":{}}`,
 		"storage status":                       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+		"vod search":                           `{"data":{"items":[]}}`,
 		"stream url --kind rtsp --stream main": testconfig.Expand("{\"data\":{\"urls\":[\"rtsp://{{host1}}/Preview_01_main\"]}}"),
 	}}
 	result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
-	if err != nil || !result.Capabilities.RtspAvailable || result.Capabilities.ClockWarning != "" || result.Timezone != "Camera/Unverified" {
-		test.Fatalf("unverified clock blocked a valid connection or claimed a time mismatch: %#v %v", result, err)
+	if err != nil || !result.Capabilities.RtspAvailable || result.Capabilities.ClockWarning == "" {
+		test.Fatalf("unverified clock blocked a valid connection or omitted its warning: %#v %v", result, err)
 	}
-	if result.Capabilities.StoragePlaybackAvailable {
-		test.Fatal("unverified timestamps must not enable storage recovery")
+	location, err := cameraLocation(result.Timezone)
+	if err != nil || zoneOffset(location, time.Now()) != -28800 {
+		test.Fatalf("camera base offset was not retained for best-effort searches: %v", err)
 	}
+	if !result.Capabilities.StoragePlaybackAvailable {
+		test.Fatal("missing daylight-saving rules blocked usable camera storage")
+	}
+	searched := false
 	for _, call := range runner.calls {
 		if slices.Contains(call, "vod") {
-			test.Fatal("unverified timestamps triggered a historical search")
+			searched = true
 		}
+	}
+	if !searched {
+		test.Fatal("camera storage was not probed with the best-effort clock")
+	}
+}
+
+func TestConnectionTestSlowCurrentTimePreservesStorageAndSnapshot(test *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		dst     string
+		command string
+	}{
+		{name: "verified IANA clock", dst: `{"data":{"Dst":{"enable":0}}}`, command: "config get system-general"},
+		{name: "estimated clock", dst: `{"data":{}}`, command: "config get system-general"},
+		{name: "timezone query", dst: `{"data":{"Dst":{"enable":0}}}`, command: "config get time-zone"},
+		{name: "DST query", dst: `{"data":{"Dst":{"enable":0}}}`, command: "raw 106"},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			snapshot := []byte{0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9}
+			runner := &fixtureRunner{blockedCommand: fixture.command, snapshot: snapshot, responses: map[string]string{
+				"info":                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+				"config get time-zone": `{"data":{"timeZone":28800}}`,
+				"raw 106":              fixture.dst,
+				"storage status":       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+				"vod search":           `{"data":{"items":[]}}`,
+			}}
+			client := NewClient(runner, time.Second)
+			client.captureSnapshot = true
+			result, err := client.Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: "Etc/GMT+8", Username: testconfig.Username(), Password: testconfig.Password()})
+			if err != nil || !result.Capabilities.StoragePlaybackAvailable || !slices.Equal(result.SnapshotJPEG, snapshot) {
+				test.Fatalf("optional clock query consumed the storage/snapshot budget: storage=%t snapshot=%t err=%v", result.Capabilities.StoragePlaybackAvailable, slices.Equal(result.SnapshotJPEG, snapshot), err)
+			}
+			if fixture.name == "estimated clock" && result.Capabilities.ClockWarning == "" {
+				test.Fatal("estimated clock warning was lost after the optional query timed out")
+			}
+		})
+	}
+}
+
+func TestConnectionTestPreservesPriorClockOnProbeFailure(test *testing.T) {
+	priorCustom, err := customCameraTimezone(TimezoneConfiguration{
+		BaseOffsetSeconds: -8 * 3600, DstEnabled: true, DstOffsetSeconds: 3600,
+		DstStart: DstTransition{Month: 3, Week: 2, Weekday: 0, Hour: 1},
+		DstEnd:   DstTransition{Month: 11, Week: 1, Weekday: 0, Hour: 3},
+	})
+	if err != nil {
+		test.Fatal(err)
+	}
+	priorEstimate, err := customCameraTimezone(TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true})
+	if err != nil {
+		test.Fatal(err)
+	}
+	for _, prior := range []string{"America/Los_Angeles", priorCustom, priorEstimate} {
+		runner := &fixtureRunner{responses: map[string]string{
+			"info":                 `{"data":{"model":"Doorbell","firmware":"test"}}`,
+			"config get time-zone": `{"data":{"timeZone":28800}}`,
+			"raw 106":              `{"data":{}}`,
+			"storage status":       `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+			"vod search":           `{"data":{"items":[]}}`,
+		}}
+		result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: prior, Username: testconfig.Username(), Password: testconfig.Password()})
+		if err != nil || result.Timezone != prior || result.TimezoneConfiguration.Estimated != CameraClockEstimated(prior) || !result.Capabilities.StoragePlaybackAvailable {
+			test.Fatalf("transient clock failure discarded usable prior clock: preserved=%t storage=%t err=%v", result.Timezone == prior, result.Capabilities.StoragePlaybackAvailable, err)
+		}
+	}
+}
+
+func TestConnectionTestRefreshesConflictingPriorClock(test *testing.T) {
+	priorEstimate, err := customCameraTimezone(TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true})
+	if err != nil {
+		test.Fatal(err)
+	}
+	baseOffset := -8 * 3600
+	trackedEstimate, err := customCameraTimezone(TimezoneConfiguration{BaseOffsetSeconds: -7 * 3600, Estimated: true, EstimatedBaseOffsetSeconds: &baseOffset})
+	if err != nil {
+		test.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		name        string
+		prior       string
+		base        int
+		observed    int
+		readTime    bool
+		preserve    bool
+		implausible bool
+	}{
+		{name: "fresh estimate", prior: priorEstimate, base: -8 * 3600, observed: -8 * 3600, readTime: true},
+		{name: "conflicting current time", prior: "UTC", base: 0, observed: 3600, readTime: true},
+		{name: "camera one day fast", prior: "UTC", observed: 24 * 3600, readTime: true, implausible: true},
+		{name: "camera one day slow", prior: "UTC", observed: -24 * 3600, readTime: true, implausible: true},
+		{name: "conflicting base offset", prior: "UTC", base: 3600, observed: 3600},
+		{name: "changed estimated base without current time", prior: trackedEstimate, base: 3600, observed: 3600},
+		{name: "no readable observation", prior: priorEstimate, base: -8 * 3600, observed: -7 * 3600, preserve: true},
+		{name: "compatible verified clock", prior: "UTC", base: 0, readTime: true, preserve: true},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			timezone, err := json.Marshal(map[string]int{"timeZone": -fixture.base})
+			if err != nil {
+				test.Fatal(err)
+			}
+			responses := map[string]string{"info": `{"data":{"model":"Fixture"}}`, "config get time-zone": string(timezone), "raw 106": `{"data":{}}`}
+			if fixture.readTime {
+				wall := time.Now().UTC().Add(time.Duration(fixture.observed) * time.Second)
+				payload, err := json.Marshal(map[string]int{"year": wall.Year(), "month": int(wall.Month()), "day": wall.Day(), "hour": wall.Hour(), "minute": wall.Minute(), "second": wall.Second()})
+				if err != nil {
+					test.Fatal(err)
+				}
+				responses["config get system-general"] = string(payload)
+			}
+			result, err := NewClient(&fixtureRunner{responses: responses}, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: fixture.prior, Username: testconfig.Username(), Password: testconfig.Password()})
+			expectedOffset := fixture.observed
+			if fixture.implausible {
+				expectedOffset = fixture.base
+			}
+			if err != nil || result.TimezoneOffsetSeconds != expectedOffset || (result.Timezone == fixture.prior) != fixture.preserve {
+				test.Fatalf("readable clock observations were ignored: offset=%d preserved=%t err=%v", result.TimezoneOffsetSeconds, result.Timezone == fixture.prior, err)
+			}
+			if !fixture.preserve && !CameraClockEstimated(result.Timezone) {
+				test.Fatal("conflicting prior clock remained conclusive")
+			}
+		})
+	}
+}
+
+func TestRecordingTimestampQualificationAcrossDST(test *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		start   string
+		end     string
+		invalid bool
+	}{
+		{"qualified repeated start", "2026-11-01T01:45:00-07:00", "2026-11-01T02:15:00", false},
+		{"qualified repeated end", "2026-11-01T00:45:00", "2026-11-01T01:15:00-08:00", false},
+		{"unique endpoints spanning repeat", "2026-11-01T00:45:00", "2026-11-01T02:15:00", false},
+		{"unqualified repeated start", "2026-11-01T01:45:00", "2026-11-01T02:15:00-08:00", true},
+		{"unqualified repeated end", "2026-11-01T00:45:00-07:00", "2026-11-01T01:15:00", true},
+		{"nonexistent unqualified end", "2026-03-08T01:45:00-08:00", "2026-03-08T02:15:00", true},
+	} {
+		test.Run(scenario.name, func(test *testing.T) {
+			payload, err := json.Marshal(map[string]string{"startTime": scenario.start, "endTime": scenario.end})
+			if err != nil {
+				test.Fatal(err)
+			}
+			_, _, err = CameraRecordingTimes("America/Los_Angeles", payload)
+			if (err != nil) != scenario.invalid {
+				test.Fatalf("incorrect timestamp qualification: %v", err)
+			}
+		})
+	}
+}
+
+func TestPriorClockCompatibilityAcrossSeasons(test *testing.T) {
+	for _, fixture := range []struct {
+		name       string
+		instant    time.Time
+		base       int
+		wallOffset int
+		compatible bool
+	}{
+		{name: "summer", instant: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC), base: -8 * 3600, wallOffset: -7 * 3600, compatible: true},
+		{name: "winter", instant: time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC), base: -8 * 3600, wallOffset: -8 * 3600, compatible: true},
+		{name: "changed DST setting", instant: time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC), base: -8 * 3600, wallOffset: -8 * 3600},
+		{name: "changed base", instant: time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC), base: 3600, wallOffset: 3600},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			wall := fixture.instant.Add(time.Duration(fixture.wallOffset) * time.Second)
+			payload, err := json.Marshal(map[string]int{"year": wall.Year(), "month": int(wall.Month()), "day": wall.Day(), "hour": wall.Hour(), "minute": wall.Minute(), "second": wall.Second()})
+			if err != nil {
+				test.Fatal(err)
+			}
+			if got := priorCameraClockCompatible("America/Los_Angeles", fixture.base, true, payload, fixture.instant, fixture.instant.Add(time.Second)); got != fixture.compatible {
+				test.Fatalf("prior rule compatibility=%t, want %t", got, fixture.compatible)
+			}
+		})
+	}
+}
+
+func TestConnectionTestContinuesWhenAllClockQueriesAreUnavailable(test *testing.T) {
+	runner := &fixtureRunner{responses: map[string]string{
+		"info":           `{"data":{"model":"Doorbell","firmware":"test"}}`,
+		"storage status": `{"data":{"items":[{"mounted":true,"formatted":true,"remainGB":1,"totalGB":32}]}}`,
+		"vod search":     `{"data":{"items":[]}}`,
+	}}
+	result, err := NewClient(runner, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Username: testconfig.Username(), Password: testconfig.Password()})
+	if err != nil || result.Capabilities.ClockWarning == "" || !result.Capabilities.StoragePlaybackAvailable {
+		test.Fatalf("unavailable clock queries blocked best-effort storage: %#v %v", result, err)
+	}
+	if _, err := cameraLocation(result.Timezone); err != nil {
+		test.Fatalf("clock fallback is unusable: %v", err)
+	}
+}
+
+func TestApproximateCameraClockUsesObservedOffsetAndKeepsFallback(test *testing.T) {
+	started := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	for _, fixture := range []struct {
+		name    string
+		payload string
+		offset  int
+	}{
+		{name: "active daylight saving", payload: `{"data":{"Time":{"year":2026,"month":7,"day":15,"hour":5,"minute":0,"second":0}}}`, offset: -7 * 3600},
+		{name: "quarter hour zone", payload: `{"data":{"Time":{"year":2026,"month":7,"day":15,"hour":17,"minute":45,"second":20}}}`, offset: 20700},
+		{name: "malformed time", payload: `not-json`, offset: -8 * 3600},
+		{name: "missing time", payload: `{"data":{}}`, offset: -8 * 3600},
+		{name: "invalid calendar", payload: `{"year":2026,"month":2,"day":30,"hour":5,"minute":0,"second":0}`, offset: -8 * 3600},
+		{name: "large clock skew", payload: `{"year":2025,"month":7,"day":15,"hour":5,"minute":0,"second":0}`, offset: -8 * 3600},
+	} {
+		test.Run(fixture.name, func(test *testing.T) {
+			configuration := approximateCameraClock([]byte(fixture.payload), TimezoneConfiguration{BaseOffsetSeconds: -8 * 3600}, started, started.Add(time.Second))
+			if configuration.BaseOffsetSeconds != fixture.offset || configuration.DstEnabled {
+				test.Fatalf("unexpected estimated clock: %#v", configuration)
+			}
+		})
 	}
 }
 

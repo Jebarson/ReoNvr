@@ -1,6 +1,7 @@
 package reolink
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -11,6 +12,68 @@ import (
 )
 
 const cameraClockPrefix = "Camera/"
+
+func approximateCameraClock(payload []byte, configuration TimezoneConfiguration, started, finished time.Time) TimezoneConfiguration {
+	configuration.Estimated = true
+	configuration.DstEnabled = false
+	if offset, ok := observedCameraOffset(payload, started, finished); ok {
+		configuration.BaseOffsetSeconds = offset
+	}
+	return configuration
+}
+
+func observedCameraOffset(payload []byte, started, finished time.Time) (int, bool) {
+	var decoded any
+	if json.Unmarshal(payload, &decoded) != nil {
+		return 0, false
+	}
+	cameraTime, ok := cameraCurrentTime(decoded)
+	if !ok {
+		return 0, false
+	}
+	midpoint := started.Add(finished.Sub(started) / 2).UTC()
+	offset := cameraTime.Sub(midpoint).Round(15 * time.Minute)
+	if offset >= -14*time.Hour && offset <= 14*time.Hour {
+		return int(offset / time.Second), true
+	}
+	return 0, false
+}
+
+func priorCameraClockCompatible(name string, baseOffset int, baseKnown bool, payload []byte, started, finished time.Time) bool {
+	if name == "" {
+		return false
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return false
+	}
+	configuration, customErr := decodeCameraClock(name)
+	_, currentKnown := observedCameraOffset(payload, started, finished)
+	if CameraClockEstimated(name) {
+		if currentKnown {
+			return false
+		}
+		return !baseKnown || configuration.EstimatedBaseOffsetSeconds == nil || *configuration.EstimatedBaseOffsetSeconds == baseOffset
+	}
+	if baseKnown {
+		priorBase := configuration.BaseOffsetSeconds
+		if customErr != nil {
+			instant := finished.In(location)
+			for transitions := 0; instant.IsDST(); transitions++ {
+				_, next := instant.ZoneBounds()
+				if next.IsZero() || transitions >= 8 {
+					return false
+				}
+				instant = next.In(location)
+			}
+			_, priorBase = instant.Zone()
+		}
+		if priorBase != baseOffset {
+			return false
+		}
+	}
+	return !cameraClockDiffers(payload, name, started, finished)
+}
 
 func cameraClockDiffers(payload []byte, timezone string, started, finished time.Time) bool {
 	location, err := cameraLocation(timezone)
@@ -87,8 +150,139 @@ func decodeCameraClock(name string) (TimezoneConfiguration, error) {
 	return configuration, nil
 }
 
+func CameraEndpointIdentity(host string, port, channel int) string {
+	payload, _ := json.Marshal(struct {
+		Host    string
+		Port    int
+		Channel int
+	}{strings.ToLower(strings.TrimSpace(host)), port, channel})
+	digest := sha256.Sum256(payload)
+	return base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
 func CameraLocation(name string) (*time.Location, error) {
 	return cameraLocation(name)
+}
+
+func CameraClockEstimated(name string) bool {
+	if !strings.HasPrefix(name, cameraClockPrefix) {
+		return false
+	}
+	configuration, err := decodeCameraClock(name)
+	return err != nil || configuration.Estimated
+}
+
+func CameraRecordingTimes(name string, payload []byte) (time.Time, time.Time, error) {
+	var metadata struct {
+		Start string `json:"startTime"`
+		End   string `json:"endTime"`
+	}
+	if err := json.Unmarshal(payload, &metadata); err != nil {
+		return time.Time{}, time.Time{}, errors.New("invalid camera recording metadata")
+	}
+	start, startQualified, err := parseRecordedCameraTime(name, metadata.Start)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, endQualified, err := parseRecordedCameraTime(name, metadata.End)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if !start.Before(end) {
+		return time.Time{}, time.Time{}, errors.New("invalid camera recording time range")
+	}
+	if !startQualified {
+		if err := ValidateCameraTimeRange(name, start, start.Add(time.Nanosecond)); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	if !endQualified {
+		if err := ValidateCameraTimeRange(name, end, end.Add(time.Nanosecond)); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
+	return start, end, nil
+}
+
+func parseRecordedCameraTime(name, value string) (time.Time, bool, error) {
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), true, nil
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
+		wall, err := time.Parse(layout, value)
+		if err != nil {
+			continue
+		}
+		parsed, err := time.ParseInLocation(layout, value, location)
+		if err != nil {
+			continue
+		}
+		local := parsed.In(location)
+		roundTrip := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), time.UTC)
+		if !roundTrip.Equal(wall) {
+			return time.Time{}, false, errors.New("camera recording wall time does not exist")
+		}
+		return parsed.UTC(), false, nil
+	}
+	return time.Time{}, false, errors.New("unsupported camera recording timestamp")
+}
+
+func ValidateCameraTimeRange(name string, from, to time.Time) error {
+	ranges, err := CameraSearchRanges(name, from, to)
+	if err != nil {
+		return err
+	}
+	if len(ranges) != 1 || !ranges[0][0].Equal(from) || !ranges[0][1].Equal(to) {
+		return errors.New("camera recording timestamps are ambiguous during the daylight-saving clock change")
+	}
+	return nil
+}
+
+// CameraSearchRanges returns ordered, non-overlapping native search bounds within
+// from and to, omitting repeated wall-time intervals at backward clock changes.
+// Each pair contains inclusive lower and upper instants; an upper bound preceding
+// an omitted interval is shortened by one nanosecond. A wholly omitted window
+// can return no bounds. Invalid clocks and unsupported ranges return an error.
+func CameraSearchRanges(name string, from, to time.Time) ([][2]time.Time, error) {
+	if !from.Before(to) {
+		return nil, errors.New("invalid camera recording time range")
+	}
+	if err := validateCameraSearchClock(name, from, to); err != nil {
+		return nil, err
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return nil, err
+	}
+	var ranges [][2]time.Time
+	safeFrom := from
+	for cursor, limit := from.Add(-24*time.Hour), to.Add(24*time.Hour); cursor.Before(limit); {
+		_, offset := cursor.In(location).Zone()
+		_, next := cursor.In(location).ZoneBounds()
+		if next.IsZero() || next.After(limit) {
+			break
+		}
+		_, nextOffset := next.In(location).Zone()
+		repeated := time.Duration(offset-nextOffset) * time.Second
+		if repeated > 0 && from.Before(next.Add(repeated)) && to.After(next.Add(-repeated)) {
+			boundary := next.Add(-repeated).Add(-time.Nanosecond)
+			if safeFrom.Before(boundary) {
+				ranges = append(ranges, [2]time.Time{safeFrom, boundary})
+			}
+			if next.Add(repeated).After(safeFrom) {
+				safeFrom = next.Add(repeated)
+			}
+		}
+		cursor = next
+	}
+	if safeFrom.Before(to) {
+		ranges = append(ranges, [2]time.Time{safeFrom, to})
+	}
+	return ranges, nil
 }
 
 func cameraLocation(name string) (*time.Location, error) {
