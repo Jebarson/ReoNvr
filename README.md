@@ -26,14 +26,25 @@ SD-card media.
   operating system; selecting an available H.264 sub-stream can improve
   compatibility without transcoding.
 
+## License
+
+ReoNvr is free for an individual's personal, noncommercial use under the custom
+[license](LICENSE). Copies, forks, redistributions, and projects using copied
+code must credit **Jebarson Jebamony (@Jebarson)** and preserve the license.
+Commercial use and use by or on behalf of companies or other organizations are
+prohibited, even if distributed or provided free of charge. Attribution does not
+permit commercial or company use. This is source-available, not open-source.
+Third-party dependencies and bundled Reolink tools retain their own licenses
+and EULA obligations.
+
 ## Download and Install
 
 1. Open [Releases](https://github.com/Jebarson/ReoNvr/releases) and download the
    ZIP for your Docker server architecture, for example
-   `ReoNvr-v1.0.0-linux-amd64.zip` or `ReoNvr-v1.0.0-linux-arm64.zip`.
-   Releases currently inherit this private repository's access restrictions.
-   An authorized maintainer can also share the ZIP directly; running it needs
-   no GitHub account, source checkout, compiler, or registry credentials.
+   `ReoNvr-v1.0.2-linux-amd64.zip` or `ReoNvr-v1.0.2-linux-arm64.zip`.
+   Version `v1.0.2` is the initial public release. Downloads from this public
+   repository need no GitHub account. Running the ZIP needs no source checkout,
+   compiler, or registry credentials. Read the accompanying license before use.
 2. Verify the downloaded ZIP against its accompanying `.sha256` file and extract
    it into a dedicated folder. The ZIP contains all three Docker images, Compose
    configuration, startup scripts, checksums, version metadata, and required

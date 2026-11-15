@@ -1,0 +1,102 @@
+ReoNvr Personal-Use, Attribution, Noncommercial License
+Version 1.0
+
+Copyright (c) 2026 Jebarson Jebamony (@Jebarson)
+Author: https://github.com/Jebarson
+Project: https://github.com/Jebarson/ReoNvr
+
+1. Scope
+
+This license applies to the original source code, documentation, and other
+material authored by Jebarson Jebamony in ReoNvr, and to the author's corresponding
+release binaries, including ReoNvr v1.0.2 (the initial release). "Software" means
+that material and any copies, modifications, or derivative works of it. Material
+owned by third parties is excluded and remains subject to its own licenses.
+
+2. Free Personal Use
+
+An individual may use, run, study, copy, and modify the Software without paying
+the author, solely for that individual's personal, private, noncommercial
+purposes. An individual may also fork the source and redistribute original or
+modified copies at no charge, solely for noncommercial purposes and subject to
+all conditions below. No permission is granted beyond the rights stated here.
+
+"Personal use" means use by a natural person for their own private activities,
+such as a home camera archive or personal learning. It excludes use in business,
+employment, professional services, organizational operations, or on behalf of
+any company or other organization.
+
+3. Required Attribution
+
+Every copy, fork, redistribution, and derivative work must preserve this license
+and the author's copyright notice. Copying or incorporating any portion of the
+Software into another project also requires attribution to the author.
+
+Source forks and projects containing copied or modified code must prominently
+include the following credit in their README or equivalent primary documentation:
+
+    Based on ReoNvr by Jebarson Jebamony (@Jebarson).
+    https://github.com/Jebarson/ReoNvr
+
+Binary redistributions must include this license and the same credit in
+accompanying documentation or a reasonably accessible credits or notices screen.
+Public distribution pages must also display the credit and project link.
+Do not remove or obscure existing author notices. Clearly identify material
+modifications and do not represent a modified version as the author's original
+release or imply the author's endorsement.
+
+4. Commercial and Company Use Prohibited
+
+The Software may not be used, copied, modified, forked, incorporated, hosted,
+or redistributed for commercial purposes. It may not be used by, for, or on
+behalf of any company, business, employer, or other organization, including
+internal operations, surveillance, testing, development, or services.
+
+These prohibitions apply even when the Software, a derivative work, a product,
+or a service is distributed or provided free of charge. Giving credit does not
+permit commercial or company use. A company may not use the Software for itself
+or have an employee, contractor, or individual use it on the company's behalf.
+
+Commercial purposes include business or professional activity, sale or rental,
+paid services or support, incorporation into a commercial offering, and use
+to obtain commercial advantage or monetary compensation, directly or indirectly.
+Free distribution in support of a business, including advertising-supported or
+business-sponsored offerings, is prohibited.
+
+5. Redistribution and Derivative Works
+
+Permitted noncommercial copies and modifications must carry this license and
+remain subject to its personal-use, attribution, commercial-use, and company-use
+restrictions. You may not grant recipients broader rights to the Software,
+remove these restrictions, or relicense the author's material under other terms.
+Your own separate material and independently licensed third-party material are
+not relicensed by this provision.
+
+6. Third-Party Rights
+
+This license does not replace, restrict, or grant rights under third-party
+licenses. Dependencies, bundled tools, and other third-party material retain
+their own copyright notices, licenses, and obligations. In particular, the
+bundled proprietary Reolink executables and archive remain governed by their
+own EULA and notices. Permission under this license does not grant permission
+to redistribute or otherwise use third-party material contrary to those terms.
+Mandatory legal rights and independently applicable platform permissions are
+unaffected. Public visibility alone does not grant commercial-use rights.
+
+7. Termination and Reserved Rights
+
+Permissions under this license terminate automatically if you violate its
+conditions. On termination, stop exercising the rights granted by this license.
+The author reserves all rights not expressly granted, including patent and
+trademark rights. This license does not revoke rights already independently
+granted under another applicable license.
+
+8. No Warranty or Liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, TITLE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW,
+THE AUTHOR IS NOT LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM THE SOFTWARE OR ITS USE, WHETHER IN CONTRACT, TORT, OR OTHERWISE.
+
+This is a custom source-available license, not an open-source license.

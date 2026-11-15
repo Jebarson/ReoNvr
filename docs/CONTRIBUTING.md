@@ -101,11 +101,12 @@ administrator can import it under **Settings > Rules > Rulesets** after checking
 for an existing equivalent ruleset. Do not add bypass permissions for publishers;
 the policy permits new tags but freezes existing version tags.
 
-**Tag enforcement is currently plan-blocked:** the ruleset API returns HTTP 403
-for this private repository. When enabled, the policy check fails closed instead
-of publishing without that protection. Do not change visibility or billing to
-bypass the gate.
-On a supported plan, the checker must also be able to see the complete bypass
+**The tag-policy prerequisite remains intentionally suspended:** the workflow
+defaults `REQUIRE_TAG_POLICY` to `false`. Public visibility does not itself make
+tags immutable. Remote tag/revision checks remain unconditional; do not change
+the variable until an equivalent immutable-tag ruleset is installed and verified.
+Future activation remains a separate administrator decision in GitHub's UI.
+When enabled, the checker must also be able to see the complete bypass
 list. If `GITHUB_TOKEN` cannot read it, configure repository secret
 `RELEASE_POLICY_TOKEN` with a credential allowed to inspect ruleset administration
 for this repository; publication itself still uses the standard contents-write
@@ -122,9 +123,12 @@ unmodified upstream Reolink archive with its EULA and notices. Review that EULA
 for the intended distribution: it permits no-charge unmodified-archive sharing
 with notices, while commercial bundling requires Reolink's written consent.
 Do not describe the proprietary executables as Apache-licensed source code.
-The repository is currently private, so GitHub release downloads require access.
-Do not change its visibility without an explicit decision to expose source and
-history. Do not create an actual release as part of testing this workflow.
+The repository and release downloads are public by the owner's explicit decision.
+The author's original code and corresponding binaries use the custom
+[personal-use license](../LICENSE), including attribution and prohibitions on
+commercial and company use. Third-party licenses remain separate. The initial
+public release is `v1.0.2`; its license is provided separately with the unchanged
+ZIPs. Do not create an actual release as part of testing this workflow.
 
 ## Main-Branch Approval Policy
 
@@ -132,13 +136,14 @@ The repository CODEOWNERS policy names `@Jebarson` for every file. The intended
 protection requires one approving code-owner review, dismisses stale approvals,
 requires the **CI** check and resolved conversations, applies to administrators,
 and prevents force-pushes/deletion. GitHub does not allow authors to approve
-their own pull requests; plan authorship and reviews accordingly rather than
-substituting an automated approval for the owner's review.
+their own pull requests. With only `@Jebarson` as code owner and no administrator
+bypass, a pull request authored by `@Jebarson` cannot satisfy this review rule.
+Plan authorship accordingly; changing that behavior requires an explicit owner
+decision to change the policy, not an automated substitute for owner approval.
 
-**Enforcement is currently blocked by the account plan:** GitHub returns HTTP
-403 for branch protection on this private repository and requires GitHub Pro
-or a public repository. CODEOWNERS alone does not enforce approval. After the
-plan supports protection, an administrator can run:
+Public repositories support this protection without the earlier private-plan
+restriction. CODEOWNERS alone does not enforce approval. An administrator can
+apply the checked-in policy using:
 
 ```powershell
 .\tools\protect-main.ps1
