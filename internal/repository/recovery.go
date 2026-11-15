@@ -323,7 +323,9 @@ func (store *Store) ListVerifiedCoverage(ctx context.Context, cameraID string, s
 		AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
 		'$._reonvrEstimatedClock'), 0) != 1
 		AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
-		'$._reonvrSidecarPending'), 0) != 1`
+		'$._reonvrSidecarPending'), 0) != 1
+		AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
+		'$._reonvrCoveragePending'), 0) != 1`
 	if capture {
 		query = `SELECT Coverage.StartAtUtc, Coverage.EndAtUtc FROM CaptureCoverage Coverage WHERE Coverage.CameraId = ? AND Coverage.Stream = ?`
 	}
@@ -587,9 +589,6 @@ func (store *Store) UpdateProvisionalRecoveryGap(ctx context.Context, gap domain
 
 func updateProvisionalRecoveryGapTx(ctx context.Context, tx *sql.Tx, gap domain.RecoveryGap, searchedUntil time.Time, missing float64, now time.Time) error {
 	next := now.Add(10 * time.Minute)
-	if gap.ClockAmbiguous {
-		next = now.Add(24 * time.Hour)
-	}
 	var start, end string
 	if err := tx.QueryRowContext(ctx, `SELECT StartAtUtc, EndAtUtc FROM RecoveryGaps WHERE Id = ?`, gap.ID).Scan(&start, &end); err != nil {
 		return err
@@ -597,6 +596,9 @@ func updateProvisionalRecoveryGapTx(ctx context.Context, tx *sql.Tx, gap domain.
 	limit, err := time.Parse(time.RFC3339Nano, end)
 	if err != nil {
 		return err
+	}
+	if gap.ClockAmbiguous && !searchedUntil.Before(limit) {
+		next = now.Add(24 * time.Hour)
 	}
 	cursor := formatTime(&searchedUntil)
 	if !searchedUntil.Before(limit) {
@@ -739,17 +741,28 @@ func (store *Store) QueueRecoveryRecordings(ctx context.Context, gap domain.Reco
 func queueRecoveryRecordingsTx(ctx context.Context, tx *sql.Tx, gap domain.RecoveryGap, recordings []domain.Recording, now time.Time) error {
 	run := domain.IngestionRun{SearchClock: gap.SearchTimezone, SearchEndpoint: gap.SearchEndpoint,
 		ID: fmt.Sprintf("%s-%d", gap.ID, now.UnixNano()), CameraID: gap.CameraID, Kind: "Recovery", WindowStartUtc: gap.StartAtUtc, WindowEndUtc: gap.EndAtUtc, Status: "Complete", DiscoveredCount: len(recordings), StartedAtUtc: now, CompletedAtUtc: &now}
+	if run.SearchEndpoint == "" {
+		var host string
+		var port, channel int
+		if err := tx.QueryRowContext(ctx, `SELECT Host, Port, Channel FROM Cameras WHERE Id = ?`, gap.CameraID).Scan(&host, &port, &channel); err != nil {
+			return err
+		}
+		run.SearchEndpoint = reolink.CameraEndpointIdentity(host, port, channel)
+	}
 	if err := saveReconciliationTx(ctx, tx, run, recordings, now); err != nil {
 		return err
 	}
 	for _, recording := range recordings {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO RecoveryGapRecordings (GapId, RecordingId) VALUES (?, ?)`, gap.ID, recording.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO RecoveryGapRecordings (GapId, RecordingId)
+			SELECT ?, Id FROM Recordings WHERE Id = ? AND (Source != 'CameraStorage' OR
+			json_extract(CASE WHEN json_valid(RawMetadataJson) THEN RawMetadataJson ELSE '{}' END, '$._reonvrEndpoint') = ?)`, gap.ID, recording.ID, run.SearchEndpoint); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE Recordings SET State = 'Queued' WHERE Id = ? AND State = 'Complete'
+				AND (Source != 'CameraStorage' OR json_extract(CASE WHEN json_valid(RawMetadataJson) THEN RawMetadataJson ELSE '{}' END, '$._reonvrEndpoint') = ?)
 				AND NOT EXISTS (SELECT 1 FROM RecordingCoverage WHERE RecordingId = Recordings.Id)
 				AND COALESCE(json_extract(CASE WHEN json_valid(RawMetadataJson) THEN RawMetadataJson ELSE '{}' END,
-				'$._reonvrSidecarPending'), 0) != 1`, recording.ID); err != nil {
+				'$._reonvrSidecarPending'), 0) != 1`, recording.ID, run.SearchEndpoint); err != nil {
 			return err
 		}
 	}

@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -66,12 +67,28 @@ type sidecarRepairStore struct {
 	recordings []domain.Recording
 	repaired   map[string]bool
 	deferred   map[string]bool
+	onComplete func()
 }
 
 func (store *sidecarRepairStore) ListSidecarRepairs(context.Context, int) ([]domain.Recording, error) {
 	return store.recordings, nil
 }
+func (store *sidecarRepairStore) GetRecording(_ context.Context, id string) (domain.Recording, error) {
+	for _, recording := range store.recordings {
+		if recording.ID == id {
+			return recording, nil
+		}
+	}
+	return domain.Recording{}, errors.New("recording not found")
+}
 func (store *sidecarRepairStore) CompleteSidecarRepair(_ context.Context, recording domain.Recording, _ []domain.TimeRange) (bool, error) {
+	current, err := store.GetRecording(context.Background(), recording.ID)
+	if err != nil || !bytes.Equal(current.RawMetadata, recording.RawMetadata) {
+		return false, errors.New("database snapshot no longer matches")
+	}
+	if store.onComplete != nil {
+		store.onComplete()
+	}
 	store.repaired[recording.ID] = true
 	return true, nil
 }
@@ -90,7 +107,7 @@ func TestSidecarRepairFailureDoesNotStarveOtherFiles(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, "blocked.mp4.json"), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	store := &sidecarRepairStore{recordings: []domain.Recording{{ID: "blocked", LocalPath: "blocked.mp4"}, {ID: "ready", LocalPath: "ready.mp4"}},
+	store := &sidecarRepairStore{recordings: []domain.Recording{{ID: "blocked", LocalPath: "blocked.mp4", State: domain.RecordingComplete}, {ID: "ready", LocalPath: "ready.mp4", State: domain.RecordingComplete}},
 		repaired: make(map[string]bool), deferred: make(map[string]bool)}
 	service := NewDownloadService(store, nil, serviceCipher{}, root)
 	if err := service.RepairSidecars(context.Background()); err == nil {
@@ -114,6 +131,127 @@ func TestSidecarRepairFailureDoesNotStarveOtherFiles(t *testing.T) {
 		if err != nil || string(payload) != "video" {
 			t.Fatal("metadata repair modified media bytes")
 		}
+	}
+}
+
+func TestSidecarRepairSkipsUnneededMediaReads(t *testing.T) {
+	for _, check := range []string{"metadata-only", "stored-hash", "coverage"} {
+		t.Run(check, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "retained.mp4")
+			if err := os.WriteFile(path, []byte("video"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(path, 0o600)
+			if file, err := os.Open(path); err == nil {
+				file.Close()
+				t.Skip("requires an unprivileged filesystem user")
+			}
+			recording := domain.Recording{ID: "retained", LocalPath: "retained.mp4", State: domain.RecordingComplete}
+			if check == "stored-hash" {
+				recording.Sha256 = fmt.Sprintf("%x", sha256.Sum256([]byte("video")))
+			}
+			if check == "coverage" {
+				recording.RawMetadata = []byte(`{"_reonvrCoveragePending":true}`)
+			}
+			store := &sidecarRepairStore{recordings: []domain.Recording{recording}, repaired: make(map[string]bool), deferred: make(map[string]bool)}
+			service := NewDownloadService(store, nil, serviceCipher{}, root)
+			service.SetMediaInspector(recoveryInspection{duration: time.Minute})
+			err := service.RepairSidecars(context.Background())
+			if check == "metadata-only" {
+				if err != nil || !store.repaired[recording.ID] {
+					t.Fatalf("metadata-only repair unnecessarily read media: %v", err)
+				}
+			} else if err == nil || store.repaired[recording.ID] || !store.deferred[recording.ID] {
+				t.Fatal("required media verification was bypassed")
+			}
+		})
+	}
+}
+
+func TestSidecarRepairRechecksSnapshotAfterUnlockedInspection(t *testing.T) {
+	for _, change := range []string{"unchanged", "json-order", "json-format", "json-changed", "deleted", "snapshot", "media", "media-same-stat", "hash-mismatch"} {
+		t.Run(change, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "retained.mp4")
+			if err := os.WriteFile(path, []byte("video"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+".json", []byte("original-sidecar"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			start := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+			store := &sidecarRepairStore{recordings: []domain.Recording{{ID: "retained", LocalPath: "retained.mp4", State: domain.RecordingComplete,
+				StartAtUtc: start, EndAtUtc: start.Add(time.Minute), RawMetadata: []byte(`{"_reonvrSidecarPending":true,"_reonvrCoveragePending":true}`)}},
+				repaired: make(map[string]bool), deferred: make(map[string]bool)}
+			if change == "hash-mismatch" {
+				store.recordings[0].Sha256 = fmt.Sprintf("%x", sha256.Sum256([]byte("expected video")))
+			}
+			retention := NewRetentionService(nil, root)
+			store.onComplete = func() {
+				if retention.mu.TryLock() {
+					retention.mu.Unlock()
+					t.Fatal("publication acknowledgement did not hold the retention lock")
+				}
+			}
+			service := NewDownloadService(store, nil, serviceCipher{}, root)
+			service.SetCapacityGuard(retention)
+			service.SetMediaInspector(mediaInspectorFunc(func(ctx context.Context, _ string) (VideoInspection, error) {
+				if change == "hash-mismatch" {
+					t.Fatal("corrupt retained media reached inspection")
+				}
+				if !retention.mu.TryLock() {
+					t.Fatal("inspection holds the shared archive lock")
+				}
+				retention.mu.Unlock()
+				if err := retention.WithArchiveMutation(func() error {
+					switch change {
+					case "deleted":
+						store.recordings[0].State = domain.RecordingDeleted
+						return errors.Join(os.Remove(path), os.Remove(path+".json"))
+					case "snapshot":
+						store.recordings[0].StartAtUtc = start.Add(time.Hour)
+					case "json-order":
+						store.recordings[0].RawMetadata = []byte(`{"_reonvrCoveragePending":true,"_reonvrSidecarPending":true}`)
+					case "json-format":
+						store.recordings[0].RawMetadata = []byte(`{ "_reonvrSidecarPending": true, "_reonvrCoveragePending": true }`)
+					case "json-changed":
+						store.recordings[0].RawMetadata = []byte(`{"_reonvrSidecarPending":true,"_reonvrCoveragePending":false}`)
+					case "media":
+						return os.WriteFile(path, []byte("replacement-video"), 0o640)
+					case "media-same-stat":
+						previous, err := os.Stat(path)
+						if err != nil {
+							return err
+						}
+						if err := os.WriteFile(path, []byte("other"), 0o640); err != nil {
+							return err
+						}
+						return os.Chtimes(path, previous.ModTime(), previous.ModTime())
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return recoveryInspection{duration: time.Minute}.InspectVideo(ctx, "")
+			}))
+			err := service.RepairSidecars(context.Background())
+			unchanged := change == "unchanged" || change == "json-order" || change == "json-format"
+			if (err == nil) != unchanged || store.repaired["retained"] != unchanged {
+				t.Fatalf("changed retained media was acknowledged or unchanged repair failed: %v", err)
+			}
+			payload, err := os.ReadFile(path + ".json")
+			if change == "deleted" {
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("repair recreated a deleted sidecar")
+				}
+			} else if !unchanged && (err != nil || string(payload) != "original-sidecar") {
+				t.Fatal("stale inspection published sidecar metadata")
+			}
+		})
 	}
 }
 

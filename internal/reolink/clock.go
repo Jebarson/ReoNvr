@@ -72,7 +72,7 @@ func priorCameraClockCompatible(name string, baseOffset int, baseKnown bool, pay
 			return false
 		}
 	}
-	return !currentKnown || !cameraClockDiffers(payload, name, started, finished)
+	return !cameraClockDiffers(payload, name, started, finished)
 }
 
 func cameraClockDiffers(payload []byte, timezone string, started, finished time.Time) bool {
@@ -232,16 +232,34 @@ func parseRecordedCameraTime(name, value string) (time.Time, bool, error) {
 }
 
 func ValidateCameraTimeRange(name string, from, to time.Time) error {
-	if !from.Before(to) {
-		return errors.New("invalid camera recording time range")
-	}
-	if err := validateCameraSearchClock(name, from, to); err != nil {
-		return err
-	}
-	location, err := cameraLocation(name)
+	ranges, err := CameraSearchRanges(name, from, to)
 	if err != nil {
 		return err
 	}
+	if len(ranges) != 1 || !ranges[0][0].Equal(from) || !ranges[0][1].Equal(to) {
+		return errors.New("camera recording timestamps are ambiguous during the daylight-saving clock change")
+	}
+	return nil
+}
+
+// CameraSearchRanges returns ordered, non-overlapping native search bounds within
+// from and to, omitting repeated wall-time intervals at backward clock changes.
+// Each pair contains inclusive lower and upper instants; an upper bound preceding
+// an omitted interval is shortened by one nanosecond. A wholly omitted window
+// can return no bounds. Invalid clocks and unsupported ranges return an error.
+func CameraSearchRanges(name string, from, to time.Time) ([][2]time.Time, error) {
+	if !from.Before(to) {
+		return nil, errors.New("invalid camera recording time range")
+	}
+	if err := validateCameraSearchClock(name, from, to); err != nil {
+		return nil, err
+	}
+	location, err := cameraLocation(name)
+	if err != nil {
+		return nil, err
+	}
+	var ranges [][2]time.Time
+	safeFrom := from
 	for cursor, limit := from.Add(-24*time.Hour), to.Add(24*time.Hour); cursor.Before(limit); {
 		_, offset := cursor.In(location).Zone()
 		_, next := cursor.In(location).ZoneBounds()
@@ -251,11 +269,20 @@ func ValidateCameraTimeRange(name string, from, to time.Time) error {
 		_, nextOffset := next.In(location).Zone()
 		repeated := time.Duration(offset-nextOffset) * time.Second
 		if repeated > 0 && from.Before(next.Add(repeated)) && to.After(next.Add(-repeated)) {
-			return errors.New("camera recording timestamps are ambiguous during the daylight-saving clock change")
+			boundary := next.Add(-repeated).Add(-time.Nanosecond)
+			if safeFrom.Before(boundary) {
+				ranges = append(ranges, [2]time.Time{safeFrom, boundary})
+			}
+			if next.Add(repeated).After(safeFrom) {
+				safeFrom = next.Add(repeated)
+			}
 		}
 		cursor = next
 	}
-	return nil
+	if safeFrom.Before(to) {
+		ranges = append(ranges, [2]time.Time{safeFrom, to})
+	}
+	return ranges, nil
 }
 
 func cameraLocation(name string) (*time.Location, error) {

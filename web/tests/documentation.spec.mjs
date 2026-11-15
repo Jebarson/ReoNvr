@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { extname, resolve, sep } from 'node:path'
 import test from 'node:test'
 import { chromium } from 'playwright'
+import { parseSync, Visitor } from 'rolldown/utils'
 import { captureMaskedScreenshot, liveCameraScreenshotSelector } from './screenshot.mjs'
 
 const maskedSelector = '.cameraName small, .discoveryList small, input[name=host], input[name=username], input[name=password], .cameraSnapshot, img, video, canvas'
@@ -44,6 +45,51 @@ async function captureMasked(page, output, name, minimumMasks) {
   })
 }
 
+test('discovery scan cleanup matches its Promise shape', async () => {
+  const source = await readFile(new URL('./recovery.spec.mjs', import.meta.url), 'utf8')
+  const syntax = parseSync('recovery.spec.mjs', source)
+  const promises = new Set()
+  new Visitor({
+    VariableDeclarator(node) {
+      if (node.init?.type === 'NewExpression' && node.init.callee.name === 'Promise') promises.add(node.id.name)
+    },
+    MemberExpression(node) {
+      if (promises.has(node.object.name)) {
+        assert.ok(!['resolve', 'promise'].includes(node.property.name), 'Promise cleanup must use its captured resolver')
+      }
+    },
+  }).visit(syntax.program)
+})
+
+test('recovery screenshots cannot bypass verified masking', async () => {
+  for (const path of ['./recovery.spec.mjs', '../e2e/recovery.spec.mjs']) {
+    let source
+    try {
+      source = await readFile(new URL(path, import.meta.url), 'utf8')
+    } catch (error) {
+      if (path.startsWith('../e2e/') && error.code === 'ENOENT') continue
+      throw error
+    }
+    const syntax = parseSync(path, source)
+    assert.deepEqual(syntax.errors, [])
+    let verifiedCaptures = 0
+    let screenshotCalls = 0
+    new Visitor({
+      CallExpression(node) {
+        const callee = node.callee
+        assert.ok(!(callee.type === 'MemberExpression' && (callee.property.name === 'screenshot' || callee.property.value === 'screenshot')), `${path} contains an unverified screenshot call`)
+        if (callee.type === 'Identifier' && callee.name === 'captureMaskedScreenshot') verifiedCaptures += 1
+        if (callee.type === 'Identifier' && callee.name === 'screenshot') {
+          assert.equal(node.arguments[0]?.name, 'page')
+          screenshotCalls += 1
+        }
+      },
+    }).visit(syntax.program)
+    assert.equal(verifiedCaptures, 1, `${path} must use the verified capture helper`)
+    assert.equal(screenshotCalls, 6, `${path} must mask every recovery capture`)
+  }
+})
+
 test('live screenshot masks hide camera inputs, selectors and unconfigured discoveries', { timeout: 30000 }, async () => {
   const browser = await chromium.launch({ channel: 'chromium', headless: true })
   try {
@@ -55,11 +101,15 @@ test('live screenshot masks hide camera inputs, selectors and unconfigured disco
     await captureMaskedScreenshot(page, { fullPage: true, mask: [controls, page.getByRole('region', { name: 'Detected cameras', exact: true })] })
     const temporary = await mkdtemp(resolve(tmpdir(), 'reonvr-privacy-'))
     try {
-      const output = resolve(temporary, 'rejected.png')
+      const accepted = resolve(temporary, 'fresh', 'nested', 'capture.png')
+      const image = await captureMaskedScreenshot(page, { path: accepted, fullPage: true, mask: [controls] })
+      assert.deepEqual(await readFile(accepted), image)
+      const output = resolve(temporary, 'rejected', 'capture.png')
       const screenshot = page.screenshot.bind(page)
       page.screenshot = (options) => screenshot({ ...options, mask: [] })
       await assert.rejects(captureMaskedScreenshot(page, { path: output, fullPage: true, mask: [controls] }), /solid opaque pixels/)
       await assert.rejects(readFile(output), { code: 'ENOENT' })
+      await assert.rejects(stat(resolve(temporary, 'rejected')), { code: 'ENOENT' })
     } finally {
       await rm(temporary, { recursive: true, force: true })
     }

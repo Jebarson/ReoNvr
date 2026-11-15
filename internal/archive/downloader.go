@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -64,15 +66,13 @@ func NewDownloadService(store DownloadStore, downloader NativeDownloader, cipher
 func (service *DownloadService) RepairSidecars(ctx context.Context) error {
 	service.metadataMu.Lock()
 	defer service.metadataMu.Unlock()
-	if guard, ok := service.capacity.(interface{ WithArchiveMutation(func() error) error }); ok {
-		return guard.WithArchiveMutation(func() error { return service.repairSidecars(ctx) })
-	}
 	return service.repairSidecars(ctx)
 }
 
 func (service *DownloadService) repairSidecars(ctx context.Context) error {
 	store, ok := service.store.(interface {
 		ListSidecarRepairs(context.Context, int) ([]domain.Recording, error)
+		GetRecording(context.Context, string) (domain.Recording, error)
 		CompleteSidecarRepair(context.Context, domain.Recording, []domain.TimeRange) (bool, error)
 		DeferSidecarRepair(context.Context, string, time.Time) error
 	})
@@ -99,11 +99,19 @@ func (service *DownloadService) repairSidecars(ctx context.Context) error {
 		_ = json.Unmarshal(recording.RawMetadata, &metadata)
 		var coverage []domain.TimeRange
 		var repairErr error
+		var original os.FileInfo
+		var originalHash string
 		path := filepath.FromSlash(recording.LocalPath)
 		if !filepath.IsLocal(path) {
 			repairErr = errors.New("sidecar repair path is outside the archive")
 		} else {
-			_, repairErr = root.Stat(path)
+			original, repairErr = root.Stat(path)
+		}
+		if repairErr == nil && (recording.Sha256 != "" || metadata.CoveragePending) {
+			originalHash, repairErr = retainedMediaHash(ctx, root, path)
+			if repairErr == nil && recording.Sha256 != "" && originalHash != recording.Sha256 {
+				repairErr = errors.New("retained media does not match its verified hash")
+			}
 		}
 		if metadata.CoveragePending && repairErr == nil {
 			if service.inspector == nil {
@@ -116,15 +124,51 @@ func (service *DownloadService) repairSidecars(ctx context.Context) error {
 				}
 			}
 		}
+		if metadata.CoveragePending && repairErr == nil {
+			freshHash, hashErr := retainedMediaHash(ctx, root, path)
+			repairErr = hashErr
+			if hashErr == nil && freshHash != originalHash {
+				repairErr = errors.New("retained media changed during inspection; retry required")
+			}
+		}
 		err := repairErr
 		if err == nil {
-			err = repairRecordingSidecar(root, recording)
-		}
-		if err == nil {
-			completed, completeErr := store.CompleteSidecarRepair(ctx, recording, coverage)
-			err = completeErr
-			if err == nil && !completed {
-				err = errors.New("sidecar metadata changed during repair; retry required")
+			publish := func() error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				current, err := store.GetRecording(ctx, recording.ID)
+				if err != nil {
+					return err
+				}
+				if current.State != domain.RecordingComplete || current.LocalPath != recording.LocalPath || current.Sha256 != recording.Sha256 ||
+					!current.StartAtUtc.Equal(recording.StartAtUtc) || !current.EndAtUtc.Equal(recording.EndAtUtc) || !equivalentRecordingMetadata(current.RawMetadata, recording.RawMetadata) {
+					return errors.New("sidecar metadata changed during inspection; retry required")
+				}
+				recording.RawMetadata = current.RawMetadata
+				fresh, err := root.Stat(path)
+				if err != nil {
+					return err
+				}
+				if !os.SameFile(original, fresh) || original.Size() != fresh.Size() || !original.ModTime().Equal(fresh.ModTime()) {
+					return errors.New("retained media changed during inspection; retry required")
+				}
+				if err := repairRecordingSidecar(root, recording); err != nil {
+					return err
+				}
+				completed, err := store.CompleteSidecarRepair(ctx, recording, coverage)
+				if err != nil {
+					return err
+				}
+				if !completed {
+					return errors.New("sidecar metadata changed during repair; retry required")
+				}
+				return nil
+			}
+			if guard, ok := service.capacity.(interface{ WithArchiveMutation(func() error) error }); ok {
+				err = guard.WithArchiveMutation(publish)
+			} else {
+				err = publish()
 			}
 		}
 		if err != nil {
@@ -132,6 +176,46 @@ func (service *DownloadService) repairSidecars(ctx context.Context) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func equivalentRecordingMetadata(first, second []byte) bool {
+	if bytes.Equal(first, second) {
+		return true
+	}
+	var values [2]any
+	for index, payload := range [][]byte{first, second} {
+		if !json.Valid(payload) {
+			return false
+		}
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.UseNumber()
+		if decoder.Decode(&values[index]) != nil {
+			return false
+		}
+	}
+	return reflect.DeepEqual(values[0], values[1])
+}
+
+func retainedMediaHash(ctx context.Context, root *os.Root, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	file, err := root.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	stop := context.AfterFunc(ctx, func() { file.Close() })
+	defer stop()
+	hash := sha256.New()
+	_, err = io.Copy(hash, file)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func repairRecordingSidecar(root *os.Root, recording domain.Recording) error {

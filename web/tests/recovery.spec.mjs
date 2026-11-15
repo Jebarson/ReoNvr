@@ -93,7 +93,8 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
     const page = await context.newPage()
     const errors = []
     const writes = []
-    const firstScan = Promise.withResolvers()
+    let releaseFirstScan
+    const firstScan = new Promise((resolve) => { releaseFirstScan = resolve })
     let attempts = 0
     page.on('pageerror', (error) => errors.push(error.message))
     page.on('request', (request) => {
@@ -103,7 +104,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
     await page.route((url) => url.pathname === '/api/cameras/discover', async (route) => {
       attempts += 1
       if (attempts === 1) {
-        await firstScan.promise
+        await firstScan
         await route.fulfill({ json: [
           { host: cameras[0].host, port: cameras[0].port, name: 'Existing camera', registered: true },
           { host: discoveryHost, port: 9001, name: 'Garden camera', registered: false },
@@ -120,7 +121,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       await detect.click()
       await page.getByRole('status').filter({ hasText: 'Scanning local network...' }).waitFor()
       assert.equal(await detect.isDisabled(), true)
-      firstScan.resolve()
+      releaseFirstScan()
       const results = page.getByRole('region', { name: 'Detected cameras', exact: true })
       await results.getByText('Garden camera', { exact: true }).waitFor()
       assert.equal(await results.getByText('Already added', { exact: true }).count(), 1)
@@ -149,7 +150,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 
       assert.deepEqual(writes, [])
       assert.deepEqual(errors, [])
     } finally {
-      firstScan.resolve()
+      releaseFirstScan()
       await context.close()
     }
   })

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 
 export const liveCameraScreenshotSelector = 'input:not([type=checkbox]):not([type=radio]), select, img, video'
 
@@ -26,6 +27,9 @@ export async function captureMaskedScreenshot(page, options) {
     })
   }, { screenshot: image.toString('base64'), regions: areas })
   assert.equal(opaque, true, 'Screenshot redactions must be solid opaque pixels')
-  if (path) await writeFile(path, image)
+  if (path) {
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, image)
+  }
   return image
 }

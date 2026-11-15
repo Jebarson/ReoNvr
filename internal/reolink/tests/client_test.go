@@ -254,15 +254,18 @@ func TestConnectionTestRefreshesConflictingPriorClock(test *testing.T) {
 		test.Fatal(err)
 	}
 	for _, fixture := range []struct {
-		name     string
-		prior    string
-		base     int
-		observed int
-		readTime bool
-		preserve bool
+		name        string
+		prior       string
+		base        int
+		observed    int
+		readTime    bool
+		preserve    bool
+		implausible bool
 	}{
 		{name: "fresh estimate", prior: priorEstimate, base: -8 * 3600, observed: -8 * 3600, readTime: true},
 		{name: "conflicting current time", prior: "UTC", base: 0, observed: 3600, readTime: true},
+		{name: "camera one day fast", prior: "UTC", observed: 24 * 3600, readTime: true, implausible: true},
+		{name: "camera one day slow", prior: "UTC", observed: -24 * 3600, readTime: true, implausible: true},
 		{name: "conflicting base offset", prior: "UTC", base: 3600, observed: 3600},
 		{name: "changed estimated base without current time", prior: trackedEstimate, base: 3600, observed: 3600},
 		{name: "no readable observation", prior: priorEstimate, base: -8 * 3600, observed: -7 * 3600, preserve: true},
@@ -283,7 +286,11 @@ func TestConnectionTestRefreshesConflictingPriorClock(test *testing.T) {
 				responses["config get system-general"] = string(payload)
 			}
 			result, err := NewClient(&fixtureRunner{responses: responses}, time.Second).Test(context.Background(), Connection{Host: testconfig.Host(1), Port: 9000, Timezone: fixture.prior, Username: testconfig.Username(), Password: testconfig.Password()})
-			if err != nil || result.TimezoneOffsetSeconds != fixture.observed || (result.Timezone == fixture.prior) != fixture.preserve {
+			expectedOffset := fixture.observed
+			if fixture.implausible {
+				expectedOffset = fixture.base
+			}
+			if err != nil || result.TimezoneOffsetSeconds != expectedOffset || (result.Timezone == fixture.prior) != fixture.preserve {
 				test.Fatalf("readable clock observations were ignored: offset=%d preserved=%t err=%v", result.TimezoneOffsetSeconds, result.Timezone == fixture.prior, err)
 			}
 			if !fixture.preserve && !CameraClockEstimated(result.Timezone) {

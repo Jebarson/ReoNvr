@@ -1110,6 +1110,7 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 		{name: "deleted tombstone", state: "Deleted", timezone: "UTC", verified: true},
 		{name: "active download", state: "Downloading", timezone: "UTC", verified: true},
 		{name: "active verification", state: "Verifying", timezone: "UTC", verified: true},
+		{name: "active retry", state: "RetryWait", timezone: "UTC", verified: true},
 		{name: "invalid wall time", state: "Complete", timezone: "UTC", raw: `{"startTime":"missing","endTime":"missing","_reonvrEstimatedClock":true}`},
 		{name: "repeated DST hour", state: "Complete", timezone: "America/Los_Angeles", raw: `{"startTime":"2026-11-01T01:30:00","endTime":"2026-11-01T01:31:00","_reonvrEstimatedClock":true}`},
 		{name: "spring gap", state: "Complete", timezone: "America/Los_Angeles", raw: `{"startTime":"2026-03-08T02:30:00","endTime":"2026-03-08T02:31:00","_reonvrEstimatedClock":true}`},
@@ -1189,7 +1190,7 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 				}
 				return
 			}
-			if fixture.state == "Downloading" || fixture.state == "Verifying" {
+			if fixture.state == "Downloading" || fixture.state == "Verifying" || fixture.state == "RetryWait" {
 				rescan, err := store.GetRecording(ctx, "estimate-recording")
 				if err != nil {
 					t.Fatal(err)
@@ -1227,6 +1228,188 @@ func TestUpdateCameraProbeRevalidatesOnlyStableUnambiguousEstimates(t *testing.T
 				domain.TimeRange{StartAtUtc: start.Add(-365 * 24 * time.Hour), EndAtUtc: end.Add(365 * 24 * time.Hour)}, false)
 			if err != nil || metadata.Estimated == fixture.verified || (len(coverage) == 1) != fixture.verified {
 				t.Fatalf("unsafe estimate promoted or stable estimate not revalidated: estimated=%t coverage=%d err=%v", metadata.Estimated, len(coverage), err)
+			}
+		})
+	}
+}
+
+func TestNativeProducerCollisionsDoNotBlockCompatibleBatch(t *testing.T) {
+	for _, mode := range []string{"regular", "recovery"} {
+		for _, producer := range []string{"legacy", "different"} {
+			t.Run(mode+"/"+producer, func(t *testing.T) {
+				ctx := context.Background()
+				store, err := Open(ctx, filepath.Join(t.TempDir(), "legacy-batch.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+				camera := domain.Camera{ID: "legacy-batch", Name: "Legacy", Host: testconfig.Host(2), Port: 9000,
+					Timezone: "UTC", Enabled: true, ArchiveEnabled: true, RecoveryEnabled: true, ArchiveStream: domain.StreamMain,
+					RecordingSource: domain.RecordingSourceRtsp, RecordingMode: domain.RecordingModeContinuous, CreatedAtUtc: start, UpdatedAtUtc: start}
+				if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+					t.Fatal(err)
+				}
+				existing := domain.Recording{ID: "existing-clip", CameraID: camera.ID, NativeName: "existing.mp4", Source: domain.RecordingSourceCameraStorage,
+					Stream: domain.StreamMain, State: domain.RecordingComplete, StartAtUtc: start, EndAtUtc: start.Add(time.Minute),
+					RawMetadata: json.RawMessage(`{"startTime":"2026-11-11T10:00:00Z","endTime":"2026-11-11T10:01:00Z"}`), DiscoveredAtUtc: start, UpdatedAtUtc: start}
+				if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "old-run", CameraID: camera.ID, Status: "Complete", StartedAtUtc: start}, []domain.Recording{existing}, start); err != nil {
+					t.Fatal(err)
+				}
+				query := `UPDATE Recordings SET RawMetadataJson = json_remove(RawMetadataJson, '$._reonvrEndpoint') WHERE Id = ?`
+				if producer == "different" {
+					query = `UPDATE Recordings SET RawMetadataJson = json_set(RawMetadataJson, '$._reonvrEndpoint', 'another-device') WHERE Id = ?`
+				}
+				if _, err := store.db.ExecContext(ctx, query, existing.ID); err != nil {
+					t.Fatal(err)
+				}
+				original, err := store.GetRecording(ctx, existing.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fresh := existing
+				fresh.ID, fresh.NativeName, fresh.State = "fresh-clip", "fresh.mp4", domain.RecordingQueued
+				now := start.Add(time.Hour)
+				batch := []domain.Recording{existing, fresh}
+				if mode == "regular" {
+					err = store.SaveReconciliation(ctx, domain.IngestionRun{ID: "fresh-run", CameraID: camera.ID, Status: "Complete", StartedAtUtc: now}, batch, now)
+				} else {
+					if err := store.SyncRecordingIntent(ctx, camera, true, start); err != nil {
+						t.Fatal(err)
+					}
+					periods, periodErr := store.ListRecoveryPeriods(ctx, camera.ID, now)
+					if periodErr != nil || len(periods) != 1 {
+						t.Fatal("missing recovery period")
+					}
+					gap := domain.RecoveryGap{ID: "legacy-gap", PeriodID: periods[0].ID, CameraID: camera.ID, Stream: camera.ArchiveStream,
+						TimeRange: domain.TimeRange{StartAtUtc: start, EndAtUtc: now}, SearchTimezone: camera.Timezone,
+						SearchEndpoint: reolink.CameraEndpointIdentity(camera.Host, camera.Port, camera.Channel)}
+					if err := store.SaveRecoveryScan(ctx, gap.PeriodID, now, []domain.RecoveryGap{gap}); err != nil {
+						t.Fatal(err)
+					}
+					err = store.QueueRecoveryRecordings(ctx, gap, batch, now)
+					if err == nil {
+						var links int
+						if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM RecoveryGapRecordings WHERE GapId = ? AND RecordingId = ?`, gap.ID, existing.ID).Scan(&links); err != nil || links != 0 {
+							t.Fatal("recovery linked a skipped producer collision")
+						}
+						if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM RecoveryGapRecordings WHERE GapId = ? AND RecordingId = ?`, gap.ID, fresh.ID).Scan(&links); err != nil || links != 1 {
+							t.Fatal("recovery did not link the accepted compatible recording")
+						}
+					}
+				}
+				if err != nil {
+					t.Fatalf("producer collision aborted compatible batch: %v", err)
+				}
+				loaded, err := store.GetRecording(ctx, existing.ID)
+				if err != nil || loaded.State != original.State || !bytes.Equal(loaded.RawMetadata, original.RawMetadata) {
+					t.Fatal("producer collision rewrote or requeued old footage")
+				}
+				if loaded, err := store.GetRecording(ctx, fresh.ID); err != nil || loaded.State != domain.RecordingQueued {
+					t.Fatal("compatible new recording was discarded")
+				}
+				watermark, err := store.GetSearchWatermark(ctx, camera.ID)
+				if err != nil || watermark == nil || !watermark.Equal(now) {
+					t.Fatal("compatible batch did not advance its watermark")
+				}
+			})
+		}
+	}
+}
+
+func TestDeletedPendingCoverageRemainsUnverified(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "pending-tombstone.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	start := time.Date(2026, 11, 11, 10, 0, 0, 0, time.UTC)
+	camera := domain.Camera{ID: "pending-tombstone", Name: "Pending", Host: testconfig.Host(2), Port: 9000,
+		Timezone: "UTC", ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceCameraStorage,
+		RecordingMode: domain.RecordingModeContinuous, CreatedAtUtc: start, UpdatedAtUtc: start}
+	if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	span := domain.TimeRange{StartAtUtc: start, EndAtUtc: start.Add(time.Minute)}
+	recording := domain.Recording{ID: "pending-tombstone-clip", CameraID: camera.ID, NativeName: "pending.mp4", Source: domain.RecordingSourceCameraStorage,
+		Stream: domain.StreamMain, State: domain.RecordingComplete, StartAtUtc: span.StartAtUtc, EndAtUtc: span.EndAtUtc,
+		RawMetadata:     json.RawMessage(`{"startTime":"2026-11-11T10:00:00Z","endTime":"2026-11-11T10:01:00Z","_reonvrSidecarPending":true,"_reonvrCoveragePending":true}`),
+		DiscoveredAtUtc: start, UpdatedAtUtc: start}
+	if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "pending-run", CameraID: camera.ID, Status: "Complete", StartedAtUtc: start}, []domain.Recording{recording}, start); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRecordingCoverage(ctx, recording.ID, []domain.TimeRange{span}); err != nil {
+		t.Fatal(err)
+	}
+	coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, span, false)
+	if err != nil || len(coverage) != 0 {
+		t.Fatal("pending repair was already counted as verified")
+	}
+	if err := store.MarkRecordingDeleted(ctx, recording.ID, start.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	coverage, err = store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, span, false)
+	if err != nil || len(coverage) != 0 {
+		t.Fatal("unreinspected tombstone coverage became verified after retention")
+	}
+}
+
+func TestEstimatedRescanPreservesFinalizedRecording(t *testing.T) {
+	for _, state := range []string{"Complete", "Deleted"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open(ctx, filepath.Join(t.TempDir(), "finalized-rescan.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			start := time.Date(2026, 11, 11, 0, 30, 0, 0, time.UTC)
+			camera := domain.Camera{ID: "finalized", Name: "Finalized", Host: testconfig.Host(2), Port: 9000,
+				Timezone: "UTC", ArchiveStream: domain.StreamMain, RecordingSource: domain.RecordingSourceCameraStorage,
+				RecordingMode: domain.RecordingModeContinuous, CreatedAtUtc: start, UpdatedAtUtc: start}
+			if err := store.CreateCamera(ctx, camera, domain.EncryptedCredential{Username: testconfig.Username(), Ciphertext: []byte("cipher"), Nonce: []byte("nonce"), KeyVersion: 1}, nil); err != nil {
+				t.Fatal(err)
+			}
+			recording := domain.Recording{ID: "finalized-clip", CameraID: camera.ID, NativeName: "finalized.mp4", Source: domain.RecordingSourceCameraStorage,
+				Stream: domain.StreamMain, State: domain.RecordingDiscovered, StartAtUtc: start, EndAtUtc: start.Add(time.Minute),
+				RawMetadata: json.RawMessage(`{"startTime":"2026-11-11T00:30:00","endTime":"2026-11-11T00:31:00"}`), DiscoveredAtUtc: start, UpdatedAtUtc: start}
+			if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "original-run", CameraID: camera.ID, Status: "Complete", StartedAtUtc: start}, []domain.Recording{recording}, start); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE Recordings SET State = ? WHERE Id = ?`, state, recording.ID); err != nil {
+				t.Fatal(err)
+			}
+			original, err := store.GetRecording(ctx, recording.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			partial := domain.TimeRange{StartAtUtc: start.Add(10 * time.Second), EndAtUtc: start.Add(30 * time.Second)}
+			if err := store.SaveRecordingCoverage(ctx, recording.ID, []domain.TimeRange{partial}); err != nil {
+				t.Fatal(err)
+			}
+			configuration, err := json.Marshal(reolink.TimezoneConfiguration{BaseOffsetSeconds: 3600, Estimated: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			camera.Timezone = "Camera/" + base64.RawURLEncoding.EncodeToString(configuration)
+			if err := store.UpdateCamera(ctx, camera, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			recording.State = domain.RecordingQueued
+			if err := store.SaveReconciliation(ctx, domain.IngestionRun{ID: "estimated-run", CameraID: camera.ID, Status: "Complete", StartedAtUtc: start}, []domain.Recording{recording}, start); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := store.GetRecording(ctx, recording.ID)
+			if err != nil || loaded.State != original.State || !loaded.StartAtUtc.Equal(original.StartAtUtc) || !loaded.EndAtUtc.Equal(original.EndAtUtc) || !bytes.Equal(loaded.RawMetadata, original.RawMetadata) {
+				t.Fatal("estimated rescan overwrote finalized timestamps or provenance")
+			}
+			if err := store.UpdateCameraProbe(ctx, camera.ID, "Fixture", "test", "UTC", domain.CameraCapabilities{}, "Online", start.Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			coverage, err := store.ListVerifiedCoverage(ctx, camera.ID, camera.ArchiveStream, domain.TimeRange{StartAtUtc: start, EndAtUtc: start.Add(time.Minute)}, false)
+			if err != nil || len(coverage) != 1 || !coverage[0].StartAtUtc.Equal(partial.StartAtUtc) || !coverage[0].EndAtUtc.Equal(partial.EndAtUtc) {
+				t.Fatal("estimated rescan changed finalized partial coverage")
 			}
 		})
 	}
