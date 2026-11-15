@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { writeFile } from 'node:fs/promises'
 
 export const liveCameraScreenshotSelector = 'input:not([type=checkbox]):not([type=radio]), select, img, video'
 
@@ -8,7 +9,8 @@ export async function captureMaskedScreenshot(page, options) {
     const bounds = element.getBoundingClientRect()
     return { x: bounds.x + scrollX, y: bounds.y + scrollY, width: bounds.width, height: bounds.height }
   }).filter((bounds) => bounds.width > 0 && bounds.height > 0))))).flat()
-  const image = await page.screenshot({ ...options, maskColor: '#202020' })
+  const { path, ...captureOptions } = options
+  const image = await page.screenshot({ ...captureOptions, maskColor: '#202020' })
   const opaque = await page.evaluate(async ({ screenshot, regions }) => {
     const bitmap = new Image()
     bitmap.src = `data:image/png;base64,${screenshot}`
@@ -24,5 +26,6 @@ export async function captureMaskedScreenshot(page, options) {
     })
   }, { screenshot: image.toString('base64'), regions: areas })
   assert.equal(opaque, true, 'Screenshot redactions must be solid opaque pixels')
+  if (path) await writeFile(path, image)
   return image
 }

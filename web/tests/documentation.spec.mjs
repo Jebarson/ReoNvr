@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { extname, resolve, sep } from 'node:path'
 import test from 'node:test'
 import { chromium } from 'playwright'
@@ -52,6 +53,16 @@ test('live screenshot masks hide camera inputs, selectors and unconfigured disco
     const controls = page.locator(liveCameraScreenshotSelector)
     assert.equal(await controls.count(), 5, 'Every private form and camera select control must be masked')
     await captureMaskedScreenshot(page, { fullPage: true, mask: [controls, page.getByRole('region', { name: 'Detected cameras', exact: true })] })
+    const temporary = await mkdtemp(resolve(tmpdir(), 'reonvr-privacy-'))
+    try {
+      const output = resolve(temporary, 'rejected.png')
+      const screenshot = page.screenshot.bind(page)
+      page.screenshot = (options) => screenshot({ ...options, mask: [] })
+      await assert.rejects(captureMaskedScreenshot(page, { path: output, fullPage: true, mask: [controls] }), /solid opaque pixels/)
+      await assert.rejects(readFile(output), { code: 'ENOENT' })
+    } finally {
+      await rm(temporary, { recursive: true, force: true })
+    }
   } finally {
     await browser.close()
   }

@@ -42,6 +42,12 @@ func NewRetentionService(store RetentionStore, archiveRoot string) *RetentionSer
 	return &RetentionService{store: store, archiveRoot: archiveRoot, freeBytes: archiveFreeBytes, now: time.Now}
 }
 
+func (service *RetentionService) WithArchiveMutation(run func() error) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return run()
+}
+
 func (service *RetentionService) EnsureCapacity(ctx context.Context, requiredBytes int64) error {
 	if requiredBytes < 0 {
 		return errors.New("required archive capacity cannot be negative")

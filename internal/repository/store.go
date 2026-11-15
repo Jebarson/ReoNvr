@@ -145,7 +145,10 @@ func (store *Store) initialize(ctx context.Context) error {
 	if err := store.migrateRecovery(ctx); err != nil {
 		return err
 	}
-	return store.migrateRecoveryRetries(ctx)
+	if err := store.migrateRecoveryRetries(ctx); err != nil {
+		return err
+	}
+	return store.migrateRecoveryAmbiguity(ctx)
 }
 
 func (store *Store) migrateActiveCameraUniqueness(ctx context.Context) error {
@@ -610,6 +613,13 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 		revalidated bool
 	}
 	updates := make([]recordingTime, 0)
+	var host string
+	var port, channel int
+	if err := tx.QueryRowContext(ctx, `SELECT Host, Port, Channel FROM Cameras WHERE Id = ?`, cameraID).Scan(&host, &port, &channel); err != nil {
+		rows.Close()
+		return err
+	}
+	endpoint := reolink.CameraEndpointIdentity(host, port, channel)
 	for rows.Next() {
 		var id, rawMetadata, previousStart, state, localPath string
 		if err := rows.Scan(&id, &rawMetadata, &previousStart, &state, &localPath); err != nil {
@@ -620,8 +630,12 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 			StartTime string `json:"startTime"`
 			EndTime   string `json:"endTime"`
 			Estimated bool   `json:"_reonvrEstimatedClock"`
+			Endpoint  string `json:"_reonvrEndpoint"`
 		}
 		if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
+			continue
+		}
+		if metadata.Endpoint != endpoint {
 			continue
 		}
 		if metadata.Estimated && estimatedClock && state != string(domain.RecordingDiscovered) {
@@ -648,6 +662,7 @@ func reinterpretDiscoveredRecordingTimes(ctx context.Context, tx *sql.Tx, camera
 				delete(values, "_reonvrEstimatedClock")
 				if state == string(domain.RecordingComplete) && localPath != "" {
 					values["_reonvrSidecarPending"] = json.RawMessage("true")
+					values["_reonvrCoveragePending"] = json.RawMessage("true")
 				}
 			}
 			encoded, err := json.Marshal(values)
@@ -1105,9 +1120,54 @@ func (store *Store) SaveReconciliation(ctx context.Context, run domain.Ingestion
 }
 
 func saveReconciliationTx(ctx context.Context, tx *sql.Tx, run domain.IngestionRun, recordings []domain.Recording, watermark time.Time) error {
+	var timezone, host string
+	var port, channel int
+	if err := tx.QueryRowContext(ctx, `SELECT Timezone, Host, Port, Channel FROM Cameras WHERE Id = ? AND RetiredAtUtc IS NULL`, run.CameraID).Scan(&timezone, &host, &port, &channel); err != nil {
+		return err
+	}
+	endpoint := reolink.CameraEndpointIdentity(host, port, channel)
+	searchedClock, searchedEndpoint := run.SearchClock, run.SearchEndpoint
+	if searchedClock == "" {
+		searchedClock = timezone
+	}
+	if searchedEndpoint == "" {
+		searchedEndpoint = endpoint
+	}
+	if searchedClock != timezone || searchedEndpoint != endpoint {
+		return errors.New("camera clock or endpoint changed during native search; retry required")
+	}
 	for _, recording := range recordings {
 		if recording.Source == "" {
 			recording.Source = domain.RecordingSourceCameraStorage
+		}
+		if recording.Source == domain.RecordingSourceCameraStorage {
+			var previousEndpoint sql.NullString
+			err := tx.QueryRowContext(ctx, `SELECT json_extract(CASE WHEN json_valid(RawMetadataJson) THEN RawMetadataJson ELSE '{}' END, '$._reonvrEndpoint')
+				FROM Recordings WHERE CameraId = ? AND NativeName = ? AND Source = 'CameraStorage'`, recording.CameraID, recording.NativeName).Scan(&previousEndpoint)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil && (!previousEndpoint.Valid || previousEndpoint.String != searchedEndpoint) {
+				return errors.New("stored native recording belongs to an unverified or different endpoint; use a separate camera registration")
+			}
+			var metadata map[string]json.RawMessage
+			if err := json.Unmarshal(recording.RawMetadata, &metadata); err != nil || metadata == nil {
+				metadata = make(map[string]json.RawMessage)
+			}
+			start, end, timeErr := reolink.CameraRecordingTimes(searchedClock, recording.RawMetadata)
+			if timeErr == nil {
+				recording.StartAtUtc, recording.EndAtUtc = start, end
+			}
+			if reolink.CameraClockEstimated(searchedClock) || timeErr != nil || searchedClock != timezone || searchedEndpoint != endpoint {
+				metadata["_reonvrEstimatedClock"] = json.RawMessage("true")
+			}
+			metadata["_reonvrSearchClock"], _ = json.Marshal(searchedClock)
+			metadata["_reonvrEndpoint"], _ = json.Marshal(searchedEndpoint)
+			encoded, err := json.Marshal(metadata)
+			if err != nil {
+				return err
+			}
+			recording.RawMetadata = encoded
 		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO Recordings (
 				Id, CameraId, NativeName, Source, Stream, Codec, StartAtUtc, EndAtUtc, SizeBytes,
@@ -1121,6 +1181,8 @@ func saveReconciliationTx(ctx context.Context, tx *sql.Tx, run domain.IngestionR
 					ELSE Recordings.State END,
 				RawMetadataJson = excluded.RawMetadataJson, UpdatedAtUtc = excluded.UpdatedAtUtc
 				WHERE Recordings.State NOT IN ('Downloading', 'Verifying')
+				AND NOT (Recordings.State IN ('Complete', 'Deleted') AND
+				COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END, '$._reonvrEstimatedClock'), 0) = 1)
 				AND COALESCE(json_extract(CASE WHEN json_valid(Recordings.RawMetadataJson) THEN Recordings.RawMetadataJson ELSE '{}' END,
 				'$._reonvrSidecarPending'), 0) != 1`,
 			recording.ID, recording.CameraID, recording.NativeName, recording.Source, recording.Stream, nullableString(recording.Codec),
@@ -1151,11 +1213,11 @@ func saveReconciliationTx(ctx context.Context, tx *sql.Tx, run domain.IngestionR
 	formattedWatermark := formatTime(&watermark)
 	result, err := tx.ExecContext(ctx, `UPDATE Cameras SET
 		LastSearchWatermarkAtUtc = CASE
-			WHEN LastSearchWatermarkAtUtc IS NULL OR julianday(LastSearchWatermarkAtUtc) < julianday(?) THEN ?
+			WHEN ? = 'Complete' AND (LastSearchWatermarkAtUtc IS NULL OR julianday(LastSearchWatermarkAtUtc) < julianday(?)) THEN ?
 			ELSE LastSearchWatermarkAtUtc END,
 		UpdatedAtUtc = CASE WHEN julianday(UpdatedAtUtc) < julianday(?) THEN ? ELSE UpdatedAtUtc END
 		WHERE Id = ? AND RetiredAtUtc IS NULL`,
-		formattedWatermark, formattedWatermark, formattedWatermark, formattedWatermark, run.CameraID)
+		run.Status, formattedWatermark, formattedWatermark, formattedWatermark, formattedWatermark, run.CameraID)
 	if err != nil {
 		return fmt.Errorf("update search watermark: %w", err)
 	}

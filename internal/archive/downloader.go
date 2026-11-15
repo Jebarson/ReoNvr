@@ -62,16 +62,23 @@ func NewDownloadService(store DownloadStore, downloader NativeDownloader, cipher
 }
 
 func (service *DownloadService) RepairSidecars(ctx context.Context) error {
+	service.metadataMu.Lock()
+	defer service.metadataMu.Unlock()
+	if guard, ok := service.capacity.(interface{ WithArchiveMutation(func() error) error }); ok {
+		return guard.WithArchiveMutation(func() error { return service.repairSidecars(ctx) })
+	}
+	return service.repairSidecars(ctx)
+}
+
+func (service *DownloadService) repairSidecars(ctx context.Context) error {
 	store, ok := service.store.(interface {
 		ListSidecarRepairs(context.Context, int) ([]domain.Recording, error)
-		CompleteSidecarRepair(context.Context, domain.Recording) (bool, error)
+		CompleteSidecarRepair(context.Context, domain.Recording, []domain.TimeRange) (bool, error)
 		DeferSidecarRepair(context.Context, string, time.Time) error
 	})
 	if !ok {
 		return nil
 	}
-	service.metadataMu.Lock()
-	defer service.metadataMu.Unlock()
 	recordings, err := store.ListSidecarRepairs(ctx, 4)
 	if err != nil || len(recordings) == 0 {
 		return err
@@ -86,9 +93,35 @@ func (service *DownloadService) RepairSidecars(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
-		err := repairRecordingSidecar(root, recording)
+		var metadata struct {
+			CoveragePending bool `json:"_reonvrCoveragePending"`
+		}
+		_ = json.Unmarshal(recording.RawMetadata, &metadata)
+		var coverage []domain.TimeRange
+		var repairErr error
+		path := filepath.FromSlash(recording.LocalPath)
+		if !filepath.IsLocal(path) {
+			repairErr = errors.New("sidecar repair path is outside the archive")
+		} else {
+			_, repairErr = root.Stat(path)
+		}
+		if metadata.CoveragePending && repairErr == nil {
+			if service.inspector == nil {
+				repairErr = errors.New("media inspection is required before corrected coverage can be verified")
+			} else {
+				inspection, inspectErr := service.inspector.InspectVideo(ctx, filepath.Join(service.archiveRoot, filepath.FromSlash(recording.LocalPath)))
+				repairErr = inspectErr
+				if inspectErr == nil {
+					coverage = append([]domain.TimeRange{}, absoluteCoverage(inspection, recording.StartAtUtc, recording.EndAtUtc)...)
+				}
+			}
+		}
+		err := repairErr
 		if err == nil {
-			completed, completeErr := store.CompleteSidecarRepair(ctx, recording)
+			err = repairRecordingSidecar(root, recording)
+		}
+		if err == nil {
+			completed, completeErr := store.CompleteSidecarRepair(ctx, recording, coverage)
 			err = completeErr
 			if err == nil && !completed {
 				err = errors.New("sidecar metadata changed during repair; retry required")

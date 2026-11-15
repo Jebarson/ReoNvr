@@ -1,6 +1,7 @@
 package reolink
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -147,6 +148,16 @@ func decodeCameraClock(name string) (TimezoneConfiguration, error) {
 		return configuration, errors.New("camera clock rules are unavailable")
 	}
 	return configuration, nil
+}
+
+func CameraEndpointIdentity(host string, port, channel int) string {
+	payload, _ := json.Marshal(struct {
+		Host    string
+		Port    int
+		Channel int
+	}{strings.ToLower(strings.TrimSpace(host)), port, channel})
+	digest := sha256.Sum256(payload)
+	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
 
 func CameraLocation(name string) (*time.Location, error) {

@@ -129,6 +129,7 @@ func (service *EventService) FinalizeNext(ctx context.Context) error {
 	}
 	completed := now
 	run := domain.IngestionRun{
+		SearchClock: camera.Timezone, SearchEndpoint: reolink.CameraEndpointIdentity(camera.Host, camera.Port, camera.Channel),
 		ID: runID, CameraID: camera.ID, Kind: "EventFinalization",
 		WindowStartUtc: windowStart, WindowEndUtc: windowEnd, Status: "Complete",
 		DiscoveredCount: len(recordings), StartedAtUtc: now, CompletedAtUtc: &completed,

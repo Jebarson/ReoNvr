@@ -71,7 +71,7 @@ type sidecarRepairStore struct {
 func (store *sidecarRepairStore) ListSidecarRepairs(context.Context, int) ([]domain.Recording, error) {
 	return store.recordings, nil
 }
-func (store *sidecarRepairStore) CompleteSidecarRepair(_ context.Context, recording domain.Recording) (bool, error) {
+func (store *sidecarRepairStore) CompleteSidecarRepair(_ context.Context, recording domain.Recording, _ []domain.TimeRange) (bool, error) {
 	store.repaired[recording.ID] = true
 	return true, nil
 }

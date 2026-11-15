@@ -179,6 +179,7 @@ func (service *Service) reconcileWindow(ctx context.Context, camera domain.Camer
 		return 0, err
 	}
 	run := domain.IngestionRun{
+		SearchClock: connection.Timezone, SearchEndpoint: reolink.CameraEndpointIdentity(connection.Host, connection.Port, connection.Channel),
 		ID: runID, CameraID: camera.ID, Kind: kind, WindowStartUtc: from,
 		WindowEndUtc: to, Status: "Complete", DiscoveredCount: len(recordings),
 		StartedAtUtc: now, CompletedAtUtc: &completed,
